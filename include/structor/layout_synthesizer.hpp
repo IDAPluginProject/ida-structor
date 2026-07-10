@@ -46,6 +46,10 @@ struct SynthesisResult {
     qvector<AccessConflict> conflicts;
     std::optional<UnifiedAccessPattern> unified_pattern;
 
+    SynthError error = SynthError::Success;
+    qstring error_message;
+    std::optional<ResourceLimitViolation> resource_limit;
+
 
     // Synthesis metadata
     bool used_z3 = false;
@@ -73,7 +77,7 @@ struct SynthesisResult {
 
     /// Check if synthesis was successful
     [[nodiscard]] bool success() const noexcept {
-        return !structure.fields.empty();
+        return error == SynthError::Success && !structure.fields.empty();
     }
 
     /// Check if any fields were created
@@ -110,8 +114,24 @@ struct SynthesisResult {
 struct LayoutSynthConfig {
     // Z3 configuration
     unsigned z3_timeout_ms = 10000;
-    unsigned z3_memory_mb = 512;
+    unsigned z3_memory_mb = 0; // 0 is explicit unlimited; Optimize has no local memory cap
     bool use_z3 = true;
+    bool enable_maxsmt = true;
+    bool enable_unsat_core = true;
+    bool relax_on_unsat = true;
+    uint32_t max_relaxation_iterations = 5;
+
+    // Hard operational limits. A violation terminates synthesis and is not
+    // eligible for an unbounded heuristic fallback.
+    uint32_t max_accesses = 10000;
+    uint32_t max_candidates = 1000;
+    uint32_t max_fields = 4096;
+    // Optional inference cap: an aggregate array candidate above this count is
+    // omitted while mandatory scalar evidence remains available for recovery.
+    uint32_t max_array_elements = 1024;
+    uint32_t max_struct_size = 0x10000;
+    uint64_t max_constraint_pairs = 500000; // Pair + union-cardinality relation budget
+    std::uint8_t min_confidence_percent = 20;
 
     // Cross-function analysis
     bool cross_function = true;
@@ -121,17 +141,19 @@ struct LayoutSynthConfig {
     bool emit_substructs = true;
 
     // Array detection
-    int min_array_elements = 3;
+    bool detect_arrays = true;
+    uint32_t min_array_elements = 3;
     bool detect_symbolic_arrays = true;
     uint32_t max_array_stride = 4096;
 
     // Union handling
     bool create_unions = true;
-    int max_union_alternatives = 8;
+    uint32_t max_union_alternatives = 8;
 
     // Alignment/packing
     bool infer_packing = true;
     uint32_t default_alignment = 8;
+    bool generate_comments = true;
 
     // Fallback behavior (tiered)
     bool relax_alignment_on_unsat = true;
@@ -148,10 +170,11 @@ struct LayoutSynthConfig {
     int weight_prefer_non_union = 2;
     int weight_prefer_arrays = 3;
     
-    // Type inference integration
-    bool use_type_inference = true;        // Use TypeInferenceEngine to improve field types
-    bool apply_inferred_types = true;      // Apply inferred types to decompiler after synthesis
-    z3::TypeInferenceConfig type_inference_config;  // Configuration for type inference
+    // Experimental type-inference adjunct. The production structure recovery
+    // path does not depend on it and never enables it implicitly.
+    bool use_type_inference = false;
+    bool apply_inferred_types = false;
+    z3::TypeInferenceConfig type_inference_config;
     z3::TypeApplicationConfig type_application_config;  // Configuration for type application
 };
 
@@ -198,7 +221,10 @@ public:
     /// Get mutable configuration
     [[nodiscard]] LayoutSynthConfig& mutable_config() noexcept { return config_; }
     
-    /// Synthesize with type inference - uses TypeInferenceEngine to get better types
+    /// Experimental adjunct. Both use_type_inference and
+    /// type_inference_config.enable_experimental_pipeline must be true;
+    /// otherwise the result fails with ExperimentalFeatureDisabled.
+    [[deprecated("experimental type-inference adjunct is disabled by default and is not part of production structure recovery")]]
     [[nodiscard]] SynthesisResult synthesize_with_type_inference(
         cfunc_t* cfunc,
         int var_idx,
@@ -231,7 +257,7 @@ private:
     };
 
     /// Primary synthesis using Z3 with Max-SMT
-    [[nodiscard]] std::optional<SynthesisResult> synthesize_z3(
+    [[nodiscard]] SynthesisResult synthesize_z3(
         const UnifiedAccessPattern& pattern
     );
 
@@ -241,7 +267,7 @@ private:
     );
 
     /// Tiered fallback strategy
-    [[nodiscard]] std::optional<SynthesisResult> try_relaxed_solve(
+    [[nodiscard]] SynthesisResult try_relaxed_solve(
         z3::LayoutConstraintBuilder& builder,
         const z3::Z3Result& initial_result,
         SynthesisResult& result

@@ -3,8 +3,34 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-cc=${CC:-clang}
-cxx=${CXX:-clang++}
+if [ "$(uname -s)" = "Darwin" ]; then
+    if ! command -v xcrun >/dev/null 2>&1; then
+        printf 'xcrun is required to locate the macOS SDK and compiler\n' >&2
+        exit 1
+    fi
+
+    # Upstream LLVM installations do not necessarily discover the active
+    # macOS SDK. Resolve both defaults through Xcode while still honoring
+    # explicit CC, CXX, and SDKROOT overrides.
+    cc=${CC:-$(xcrun --sdk macosx --find clang)}
+    cxx=${CXX:-$(xcrun --sdk macosx --find clang++)}
+    SDKROOT=${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}
+    if [ ! -d "$SDKROOT" ]; then
+        printf 'macOS SDK not found: %s\n' "$SDKROOT" >&2
+        exit 1
+    fi
+    export SDKROOT
+
+    # Exact ctree contracts must not drift whenever the active Xcode SDK
+    # increments its default deployment target.  Keep the established fixture
+    # ABI while permitting an explicit caller override for compatibility probes.
+    MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-16.0}
+    export MACOSX_DEPLOYMENT_TARGET
+else
+    cc=${CC:-clang}
+    cxx=${CXX:-clang++}
+fi
+
 cflags="-g -O0"
 cxxflags="-g -O0 -std=c++17"
 opt_cflags="-g -O2"
@@ -82,6 +108,7 @@ build_c "$root/test_substructure.c"
 build_c "$root/test_callgraph_return.c"
 build_c "$root/test_cross_conflict_union.c"
 build_c "$root/test_packed_struct.c"
+build_c "$root/test_packing_matrix.c"
 build_c "$root/test_packed_nested_array.c"
 build_c "$root/test_packed_union_overlap.c"
 build_c "$root/test_negative_offsets.c"
@@ -108,6 +135,7 @@ build_c "$root/test_global_subobject_chain.c"
 build_c "$root/test_global_pointer_singleton.c"
 build_c "$root/test_global_adjacent_objects.c"
 build_c "$root/test_global_ambiguous_scratch.c"
+build_c "$root/test_global_union_overlay.c"
 build_c "$root/test_vtable_direct.c"
 build_missing_regarg
 build_cxx "$root/test_vtable.cpp"

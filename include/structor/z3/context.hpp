@@ -12,10 +12,10 @@ class TypeEncoder;
 
 /// Configuration for Z3 solver behavior
 struct Z3Config {
-    unsigned timeout_ms = 10000;          // 10 second default
-    bool produce_unsat_cores = true;      // Enable conflict extraction
-    bool produce_models = true;           // Enable model extraction
-    unsigned max_memory_mb = 1024;        // Memory limit
+    unsigned timeout_ms = 10000;          // Per-check limit; 0 means unlimited
+    bool produce_unsat_cores = true;      // Solver setting; Optimize always enables cores
+    bool produce_models = true;           // Solver setting; Optimize always enables models
+    unsigned max_memory_mb = 0;           // Solver-local MiB limit; 0 means unlimited
 
     // Architecture-dependent settings (queried from IDA)
     uint32_t pointer_size = 8;            // 4 or 8 bytes
@@ -23,6 +23,7 @@ struct Z3Config {
 
     // Synthesis limits
     uint32_t max_struct_size = 0x10000;   // Maximum struct size (64KB)
+    uint32_t max_candidates = 1000;       // Maximum candidate universe
     uint32_t max_fields = 4096;           // Maximum number of fields
     uint32_t max_array_elements = 1024;   // Maximum array elements to detect
 };
@@ -43,11 +44,13 @@ public:
     [[nodiscard]] ::z3::context& ctx() noexcept { return *ctx_; }
     [[nodiscard]] const ::z3::context& ctx() const noexcept { return *ctx_; }
 
-    /// Create a solver with configured timeout (via global params)
-    /// Uses assert_and_track for UNSAT core extraction
+    /// Create a solver with all supported resource/result controls applied
+    /// directly to the solver. No Z3 global parameters are modified.
     [[nodiscard]] ::z3::solver make_solver();
 
-    /// Create an optimizer for Max-SMT solving
+    /// Create an optimizer with its supported local controls applied. Bundled
+    /// Z3 exposes no optimizer-local memory limit, so a nonzero configured cap
+    /// is rejected rather than silently ignored.
     [[nodiscard]] ::z3::optimize make_optimizer();
 
     /// Common sorts used in struct synthesis (all use Int, not BitVec)
@@ -98,31 +101,14 @@ public:
     [[nodiscard]] static std::string get_unknown_reason(const ::z3::solver& s);
 
 private:
-    std::unique_ptr<::z3::context> ctx_;
+    // Keep the immutable configuration before objects constructed from it.
+    // Declaration order, not initializer-list spelling, controls construction.
     Z3Config config_;
+    std::unique_ptr<::z3::context> ctx_;
 
     /// Shared TypeEncoder - lazily initialized to avoid circular dependency
     std::unique_ptr<TypeEncoder> type_encoder_;
 
-    /// Apply global timeout params (more reliable than solver.set)
-    void apply_global_params();
-
-    /// Variable counter for unique naming
-    unsigned var_counter_ = 0;
-};
-
-/// RAII guard for temporarily modifying Z3 global parameters
-class Z3ParamGuard {
-public:
-    Z3ParamGuard(const char* param, unsigned value);
-    ~Z3ParamGuard();
-
-    Z3ParamGuard(const Z3ParamGuard&) = delete;
-    Z3ParamGuard& operator=(const Z3ParamGuard&) = delete;
-
-private:
-    std::string param_;
-    unsigned old_value_;
 };
 
 /// Helper to measure Z3 solving time

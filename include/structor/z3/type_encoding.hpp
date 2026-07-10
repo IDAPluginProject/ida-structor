@@ -94,6 +94,20 @@ enum class TypeConfidence : int {
     Absolute = 100 // User-specified or API-documented
 };
 
+/// Public 0..100 threshold projection for Z3 candidate confidence.  The enum's
+/// underlying values are solver weights, not percentages, so the mapping is
+/// intentionally explicit.
+[[nodiscard]] inline constexpr std::uint8_t type_confidence_percent(
+    TypeConfidence confidence) noexcept {
+    switch (confidence) {
+        case TypeConfidence::Low:      return 25;
+        case TypeConfidence::Medium:   return 50;
+        case TypeConfidence::High:     return 75;
+        case TypeConfidence::Absolute: return 100;
+        default:                       return 0;
+    }
+}
+
 /// Encode IDA types to Z3 and back
 class TypeEncoder {
 public:

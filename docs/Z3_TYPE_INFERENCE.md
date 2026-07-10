@@ -7,7 +7,22 @@ This document is a research/design note, not a description of the default public
 ### What is true today
 
 - Structor does contain substantial Z3 infrastructure and standalone tests around type encoding, layout constraints, array detection, cross-function analysis, and type-lattice behavior.
-- The repository also contains design work for richer type inference than the baseline public structure-synthesis workflow depends on.
+- The production structure-layout solver does not depend on `z3::TypeInferenceEngine`.
+- `z3::TypeInferenceEngine` is an experimental, per-function local-variable adjunct. It is disabled by default and requires explicit `TypeInferenceConfig::enable_experimental_pipeline=true` opt-in.
+- `LayoutSynthesizer::synthesize_with_type_inference` additionally requires `LayoutSynthConfig::use_type_inference=true`; applying secondary inferred types defaults to disabled.
+- Solver `unknown` is a failure and no partial model is exposed as successful type evidence.
+
+### Not implemented in the adjunct
+
+- memory-location type result generation
+- return-type or parameter-type result generation
+- interprocedural fixed-point type inference
+- allocation-site provenance for pointer/integer discrimination
+- automatic polymorphic-function detection
+- substitution/instantiation of polymorphic type parameters
+- confidence derivation from constraint provenance
+
+The corresponding sections below are design material, not operational claims.
 
 ### How to read this document
 
@@ -15,7 +30,9 @@ This document is a research/design note, not a description of the default public
 - a record of constraint ideas and formalization strategies
 - a source of direction for future or partial implementations
 
-Do not treat every algorithm or quantitative claim below as fully productized current behavior.
+Quantitative claims and algorithms below have unknown production validity unless
+they are independently linked to an implemented/tested component in the current
+source tree.
 
 ## Constraint Generation Strategy
 

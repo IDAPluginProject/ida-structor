@@ -143,6 +143,13 @@ struct UnifiedAccessPattern {
     sval_t global_min_offset = 0;
     sval_t global_max_offset = 0;
 
+    // Exclusive object boundary inferred from rejected frame-scratch evidence.
+    // This is deliberately distinct from global_max_offset: the latter may be
+    // recomputed from retained accesses, while this boundary must survive until
+    // synthesis materializes the corresponding tail padding.
+    std::optional<sval_t> inferred_object_end;
+    ea_t inferred_object_end_source = BADADDR;
+
     bool has_vtable = false;
     sval_t vtable_offset = 0;
 
@@ -157,7 +164,7 @@ struct UnifiedAccessPattern {
 
     /// Get total size estimate (max_offset - min_offset)
     [[nodiscard]] sval_t estimated_size() const noexcept {
-        return global_max_offset - global_min_offset;
+        return checked_sval_sub(global_max_offset, global_min_offset).value_or(0);
     }
 
     /// Get unique access locations (by offset + size)

@@ -11,8 +11,10 @@ namespace structor {
 /// Detects and synthesizes vtable structures from access patterns
 class VTableDetector {
 public:
-    explicit VTableDetector(const SynthOptions& opts = Config::instance().options())
-        : options_(opts) {}
+    explicit VTableDetector(
+        const SynthOptions& opts = Config::instance().options()) {
+        (void)opts;
+    }
 
     /// Detect vtable patterns in access pattern and create vtable structure
     [[nodiscard]] std::optional<SynthVTable> detect(const AccessPattern& pattern, cfunc_t* cfunc);
@@ -30,9 +32,10 @@ private:
     public:
         VTableCallVisitor(cfunc_t* cfunc, int var_idx, sval_t vtable_offset)
             : ctree_visitor_t(CV_PARENTS)
-            , cfunc_(cfunc)
             , var_idx_(var_idx)
-            , vtable_offset_(vtable_offset) {}
+            , vtable_offset_(vtable_offset) {
+            (void)cfunc;
+        }
 
         int idaapi visit_expr(cexpr_t* expr) override;
 
@@ -45,7 +48,6 @@ private:
         [[nodiscard]] const qvector<CallInfo>& calls() const noexcept { return calls_; }
 
     private:
-        cfunc_t* cfunc_;
         int var_idx_;
         sval_t vtable_offset_;
         qvector<CallInfo> calls_;
@@ -55,8 +57,6 @@ private:
     void merge_vtable_slots(SynthVTable& dst, const SynthVTable& src);
     void generate_slot_names(SynthVTable& vtable);
     void infer_slot_signatures(SynthVTable& vtable, cfunc_t* cfunc);
-
-    const SynthOptions& options_;
 };
 
 // ============================================================================
@@ -109,7 +109,9 @@ inline int VTableDetector::VTableCallVisitor::visit_expr(cexpr_t* expr) {
     // Check if offset matches expected vtable offset
     if (arith.offset != vtable_offset_) return 0;
 
-    // Found a vtable call!
+    // Found a vtable call. A non-integral or negative byte offset is not a
+    // callable slot and must not be truncated into an index.
+    if (!is_valid_vtable_slot_offset(slot_offset)) return 0;
     CallInfo info;
     info.call_ea = expr->ea;
     info.slot_idx = slot_offset / get_ptr_size();
@@ -268,9 +270,19 @@ inline tinfo_t VTableDetector::recover_slot_signature(ea_t call_site, cfunc_t* c
 
     cexpr_t* call = finder.found_call;
 
+    if (call->x && !call->x->type.empty()) {
+        tinfo_t callee_type = call->x->type;
+        if (callee_type.is_funcptr()) {
+            return callee_type;
+        }
+        if (callee_type.is_func() && result.create_ptr(callee_type)) {
+            return result;
+        }
+    }
+
     // Build function type from arguments
     func_type_data_t ftd;
-    ftd.set_cc(CM_CC_FASTCALL);  // Default to fastcall for virtual functions
+    ftd.set_cc(CM_CC_UNKNOWN);
 
     // Return type - try to infer from usage
     ftd.rettype.create_simple_type(BTF_VOID);

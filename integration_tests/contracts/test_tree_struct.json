@@ -16,7 +16,7 @@
         "success": true,
         "error": "Success",
         "error_message": "",
-        "fields_created": 7,
+        "fields_created": 6,
         "vtable_slots": 0,
         "propagated_to": [
           "_main",
@@ -29,14 +29,16 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_result",
-          "size": 40,
-          "alignment": 1,
+          "size": 32,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_sum_children",
           "source_var": "result",
-          "field_count": 7,
-          "non_padding_field_count": 5,
+          "field_count": 6,
+          "non_padding_field_count": 4,
           "provenance": [],
           "fields": [
             {
@@ -72,36 +74,62 @@
               "union_members": []
             },
             {
-              "name": "ptr_8",
+              "name": "union_8",
               "offset": 8,
               "size": 8,
-              "semantic": "ptr",
-              "type": "void *",
+              "semantic": "unknown",
+              "type": "unsigned __int64",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u64_8",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "unsigned __int64"
+                },
+                {
+                  "name": "ptr_8",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "void *"
+                }
+              ]
             },
             {
-              "name": "ptr_10",
+              "name": "union_10",
               "offset": 16,
               "size": 8,
-              "semantic": "ptr",
-              "type": "void *",
+              "semantic": "unknown",
+              "type": "unsigned __int64",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u64_10",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "unsigned __int64"
+                },
+                {
+                  "name": "ptr_10",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "void *"
+                }
+              ]
             },
             {
               "name": "u8_18",
@@ -122,27 +150,11 @@
             {
               "name": "__pad_19",
               "offset": 25,
-              "size": 11,
+              "size": 7,
               "semantic": "padding",
-              "type": "char[11]",
+              "type": "char[7]",
               "confidence": "medium",
               "is_padding": true,
-              "is_array": false,
-              "array_count": 1,
-              "is_union_candidate": false,
-              "is_bitfield": false,
-              "bit_offset": 0,
-              "bit_size": 0,
-              "union_members": []
-            },
-            {
-              "name": "u32_24",
-              "offset": 36,
-              "size": 4,
-              "semantic": "uint",
-              "type": "unsigned __int32",
-              "confidence": "medium",
-              "is_padding": false,
               "is_array": false,
               "array_count": 1,
               "is_union_candidate": false,
@@ -155,7 +167,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> sum_children\nauto_result *__fastcall sum_children(auto_result *result) {\n    sink ^= result->u32_0;\n    sink ^= (__int64)result->ptr_8;\n    sink ^= (__int64)result->ptr_10;\n    sink ^= result->u8_18;\n    return result;\n}\n<<<\n\n>>> walk_two_levels\nauto_result *__fastcall walk_two_levels(auto_result *result) {\n    sink ^= *(unsigned int *)result->ptr_8;\n    sink ^= *(unsigned int *)result->ptr_10;\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> sum_children\nauto_result *__fastcall sum_children(auto_result *result) {\n    sink ^= result->u32_0;\n    sink ^= result->union_8.u64_8;\n    sink ^= result->union_10.u64_10;\n    sink ^= result->u8_18;\n    return result;\n}\n<<<\n\n>>> walk_two_levels\nauto_result *__fastcall walk_two_levels(auto_result *result) {\n    sink ^= *(unsigned int *)result->union_8.u64_8;\n    sink ^= *(unsigned int *)result->union_10.u64_10;\n    return result;\n}\n<<<\n"
     }
   ]
 }

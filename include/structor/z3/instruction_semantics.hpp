@@ -138,14 +138,12 @@ struct InstructionSemanticsConfig {
     bool extract_from_arithmetic = true;     // Analyze arithmetic for int/float
     bool extract_from_memory_ops = true;     // Analyze pointer dereferences
     bool extract_from_calls = true;          // Use function signatures
-    bool track_ssa_versions = true;          // Flow-sensitive analysis
     bool generate_soft_constraints = true;   // Generate preference constraints
     
     // Soft constraint weights
     int weight_from_decompiler = 10;         // Type from Hex-Rays
     int weight_from_signature = 20;          // Type from function signature
     int weight_signed_preference = 5;        // Prefer signed over unsigned
-    int weight_pointer_for_mem_base = 15;    // Memory base -> likely pointer
     int weight_int_for_small_const = 5;      // Small constant comparison -> int
 };
 
@@ -353,12 +351,6 @@ public:
         const qvector<cexpr_t*>& usage_sites
     ) const;
     
-    /// Check if variable comes from malloc/allocation
-    [[nodiscard]] bool from_allocation(
-        TypeVariable var,
-        cfunc_t* cfunc
-    ) const;
-    
     /// Check if variable is used in arithmetic with large constants
     [[nodiscard]] bool arithmetic_with_large_const(
         TypeVariable var,
@@ -369,7 +361,6 @@ public:
     struct Weights {
         int memory_base_is_pointer = 15;
         int small_const_compare_is_int = 10;
-        int from_malloc_is_pointer = 20;
         int large_const_arithmetic_is_int = 8;
     };
     void set_weights(const Weights& w) { weights_ = w; }

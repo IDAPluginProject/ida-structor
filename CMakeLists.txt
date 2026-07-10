@@ -1,10 +1,56 @@
 cmake_minimum_required(VERSION 3.20)
-project(structor VERSION 1.0.0 LANGUAGES CXX)
+
+# Toolchain-affecting defaults must be established before project() enables a
+# compiler. The deployment target remains caller-configurable; the static MSVC
+# runtime is verified after compiler detection.
+if(CMAKE_HOST_APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR
+       CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING
+            "Minimum supported macOS version" FORCE)
+    endif()
+endif()
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+set(CMAKE_MSVC_RUNTIME_LIBRARY
+    "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    CACHE STRING "MSVC runtime linkage")
+
+project(structor VERSION 2.2.0 LANGUAGES CXX)
+
+if(MSVC AND NOT CMAKE_MSVC_RUNTIME_LIBRARY STREQUAL
+        "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    message(FATAL_ERROR
+        "Structor production builds require the static MSVC runtime")
+endif()
+
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/structor/synth_types.hpp"
+    STRUCTOR_SYNTH_TYPES_HEADER)
+string(REGEX MATCH
+    "PLUGIN_VERSION = \"([0-9]+\\.[0-9]+\\.[0-9]+)\""
+    STRUCTOR_PLUGIN_VERSION_MATCH
+    "${STRUCTOR_SYNTH_TYPES_HEADER}")
+if(NOT STRUCTOR_PLUGIN_VERSION_MATCH OR
+   NOT "${CMAKE_MATCH_1}" STREQUAL "${PROJECT_VERSION}")
+    message(FATAL_ERROR
+        "Runtime PLUGIN_VERSION '${CMAKE_MATCH_1}' must equal CMake project version '${PROJECT_VERSION}'")
+endif()
+
+option(BUILD_TESTS "Build unit tests" OFF)
+option(STRUCTOR_ENABLE_LIVE_TEST_HOOKS
+    "Compile fault-injection hooks required by licensed live integration tests"
+    OFF)
+if(STRUCTOR_ENABLE_LIVE_TEST_HOOKS AND NOT BUILD_TESTS)
+    message(FATAL_ERROR
+        "STRUCTOR_ENABLE_LIVE_TEST_HOOKS requires BUILD_TESTS=ON")
+endif()
 
 find_package(Threads REQUIRED)
 include(FetchContent)
-set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
-    "Do not re-check FetchContent remotes on every build" FORCE)
+option(FETCHCONTENT_UPDATES_DISCONNECTED
+    "Do not contact remotes while populating pinned FetchContent dependencies"
+    OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,7 +59,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Build type
-if(NOT CMAKE_BUILD_TYPE)
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
@@ -26,53 +72,46 @@ endif()
 option(Z3_USE_CUSTOM "Use custom Z3 library instead of bundled static Z3" OFF)
 set(Z3_CUSTOM_INCLUDE_DIR "" CACHE PATH "Custom Z3 include directory")
 set(Z3_CUSTOM_LIBRARY "" CACHE FILEPATH "Custom Z3 library path")
-set(Z3_CUSTOM_IMPLIB "" CACHE FILEPATH "Custom Z3 import library path (Windows only)")
+set(Z3_CUSTOM_IMPLIB "" CACHE FILEPATH
+    "Unsupported legacy dynamic Z3 import-library path")
 
-if(Z3_USE_CUSTOM AND Z3_CUSTOM_INCLUDE_DIR AND Z3_CUSTOM_LIBRARY)
+if(Z3_USE_CUSTOM)
+    if(NOT Z3_CUSTOM_INCLUDE_DIR OR NOT IS_DIRECTORY "${Z3_CUSTOM_INCLUDE_DIR}")
+        message(FATAL_ERROR
+            "Z3_USE_CUSTOM=ON requires an existing Z3_CUSTOM_INCLUDE_DIR")
+    endif()
+    if(NOT Z3_CUSTOM_LIBRARY OR NOT EXISTS "${Z3_CUSTOM_LIBRARY}")
+        message(FATAL_ERROR
+            "Z3_USE_CUSTOM=ON requires an existing static Z3_CUSTOM_LIBRARY")
+    endif()
+    if(Z3_CUSTOM_IMPLIB)
+        message(FATAL_ERROR
+            "Dynamic custom Z3 import libraries are unsupported; provide one static Z3_CUSTOM_LIBRARY")
+    endif()
+    if(WIN32)
+        if(NOT Z3_CUSTOM_LIBRARY MATCHES "\\.[Ll][Ii][Bb]$")
+            message(FATAL_ERROR "Custom Windows Z3 must be a static .lib archive")
+        endif()
+    elseif(NOT Z3_CUSTOM_LIBRARY MATCHES "\\.[Aa]$")
+        message(FATAL_ERROR "Custom Unix Z3 must be a static .a archive")
+    endif()
+
     message(STATUS "Using custom Z3: ${Z3_CUSTOM_LIBRARY}")
     set(Z3_CUSTOM TRUE)
 
-    # Create imported target for custom Z3
-    add_library(z3_custom SHARED IMPORTED)
-    if(WIN32)
-        # On Windows, we need the import library (.lib) for linking
-        if(Z3_CUSTOM_IMPLIB)
-            set_target_properties(z3_custom PROPERTIES
-                IMPORTED_LOCATION "${Z3_CUSTOM_LIBRARY}"
-                IMPORTED_IMPLIB "${Z3_CUSTOM_IMPLIB}"
-                INTERFACE_INCLUDE_DIRECTORIES "${Z3_CUSTOM_INCLUDE_DIR}"
-            )
-        else()
-            # Try to find .lib next to .dll or in lib/ directory
-            get_filename_component(Z3_LIB_DIR "${Z3_CUSTOM_LIBRARY}" DIRECTORY)
-            get_filename_component(Z3_LIB_DIR_PARENT "${Z3_LIB_DIR}" DIRECTORY)
-            find_file(Z3_IMPLIB_FOUND
-                NAMES libz3.lib z3.lib
-                PATHS "${Z3_LIB_DIR}" "${Z3_LIB_DIR_PARENT}/lib"
-                NO_DEFAULT_PATH
-            )
-            if(Z3_IMPLIB_FOUND)
-                message(STATUS "Found Z3 import library: ${Z3_IMPLIB_FOUND}")
-                set_target_properties(z3_custom PROPERTIES
-                    IMPORTED_LOCATION "${Z3_CUSTOM_LIBRARY}"
-                    IMPORTED_IMPLIB "${Z3_IMPLIB_FOUND}"
-                    INTERFACE_INCLUDE_DIRECTORIES "${Z3_CUSTOM_INCLUDE_DIR}"
-                )
-            else()
-                message(FATAL_ERROR "Z3_CUSTOM_IMPLIB not set and could not find import library (.lib) for Z3")
-            endif()
-        endif()
-    else()
-        set_target_properties(z3_custom PROPERTIES
-            IMPORTED_LOCATION "${Z3_CUSTOM_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${Z3_CUSTOM_INCLUDE_DIR}"
-        )
+    set(STRUCTOR_Z3_INCLUDE_DIRS "${Z3_CUSTOM_INCLUDE_DIR}")
+    if(IS_DIRECTORY "${Z3_CUSTOM_INCLUDE_DIR}/c++")
+        list(APPEND STRUCTOR_Z3_INCLUDE_DIRS "${Z3_CUSTOM_INCLUDE_DIR}/c++")
     endif()
+    add_library(z3_custom STATIC IMPORTED GLOBAL)
+    set_target_properties(z3_custom PROPERTIES
+        IMPORTED_LOCATION "${Z3_CUSTOM_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${STRUCTOR_Z3_INCLUDE_DIRS}"
+    )
 
     add_library(structor_z3 INTERFACE)
     target_link_libraries(structor_z3 INTERFACE z3_custom)
-    target_include_directories(structor_z3 INTERFACE "${Z3_CUSTOM_INCLUDE_DIR}")
-    set(STRUCTOR_Z3_INCLUDE_DIRS "${Z3_CUSTOM_INCLUDE_DIR}")
+    target_include_directories(structor_z3 INTERFACE ${STRUCTOR_Z3_INCLUDE_DIRS})
 else()
     set(Z3_CUSTOM FALSE)
     message(STATUS "Building bundled static Z3 from source")
@@ -81,8 +120,7 @@ else()
     FetchContent_Declare(
         z3
         GIT_REPOSITORY https://github.com/Z3Prover/z3.git
-        GIT_TAG        z3-4.15.4
-        GIT_SHALLOW    TRUE
+        GIT_TAG        745087e237e669d709ae35694728a0c479e572b3
     )
 
     # Z3 build options - produce a static library that is linked into Structor.
@@ -122,13 +160,6 @@ if(CMAKE_CXX_FLAGS MATCHES "-fno-exceptions")
     message(FATAL_ERROR "Z3 C++ API requires exceptions. Remove -fno-exceptions.")
 endif()
 
-# macOS deployment target (12.0 = Monterey, matches IDA SDK requirement)
-if(APPLE)
-    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
-        set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version" FORCE)
-    endif()
-endif()
-
 option(STRUCTOR_BUILD_PLUGIN "Build the standalone Structor IDA plugin wrapper" ON)
 
 # IDA SDK configuration
@@ -137,12 +168,6 @@ if(NOT DEFINED IDA_SDK_DIR)
         set(IDA_SDK_DIR $ENV{IDA_SDK_DIR})
     else()
         message(FATAL_ERROR "IDA_SDK_DIR must be set to the IDA SDK directory")
-    endif()
-endif()
-
-if(NOT DEFINED IDA_INSTALL_DIR)
-    if(DEFINED ENV{IDA_INSTALL_DIR})
-        set(IDA_INSTALL_DIR $ENV{IDA_INSTALL_DIR})
     endif()
 endif()
 
@@ -163,12 +188,11 @@ endif()
 
 # Architecture
 option(IDA_EA64 "Build for 64-bit IDA (ida64)" ON)
-if(IDA_EA64)
-    set(IDA_SUFFIX "64")
-    add_compile_definitions(__EA64__)
-else()
-    set(IDA_SUFFIX "")
+if(NOT IDA_EA64)
+    message(FATAL_ERROR
+        "IDA_EA64=OFF is unsupported by the bundled IDA SDK import-library layout")
 endif()
+set(IDA_SUFFIX "64")
 
 # IDA SDK paths
 set(IDA_INCLUDE_DIR "${IDA_SDK_DIR}/include")
@@ -179,20 +203,35 @@ message(STATUS "CMAKE_OSX_ARCHITECTURES: ${CMAKE_OSX_ARCHITECTURES}")
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
 
 if(APPLE)
-    # Check target architecture - CMAKE_OSX_ARCHITECTURES takes precedence
-    if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+    if(CMAKE_OSX_ARCHITECTURES)
+        list(LENGTH CMAKE_OSX_ARCHITECTURES STRUCTOR_MAC_ARCH_COUNT)
+        if(NOT STRUCTOR_MAC_ARCH_COUNT EQUAL 1)
+            message(FATAL_ERROR
+                "Universal/multi-architecture macOS builds are unsupported; configure exactly one of arm64 or x86_64")
+        endif()
+        if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+            set(IDA_ARCH "arm64")
+        elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+            set(IDA_ARCH "x64")
+        else()
+            message(FATAL_ERROR
+                "Unsupported macOS architecture: ${CMAKE_OSX_ARCHITECTURES}")
+        endif()
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
         set(IDA_ARCH "arm64")
-    elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
         set(IDA_ARCH "x64")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-        set(IDA_ARCH "arm64")
     else()
-        set(IDA_ARCH "x64")
+        message(FATAL_ERROR
+            "Cannot map macOS processor '${CMAKE_SYSTEM_PROCESSOR}' to an IDA SDK architecture")
     endif()
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
     set(IDA_ARCH "arm64")
-else()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|x64)$")
     set(IDA_ARCH "x64")
+else()
+    message(FATAL_ERROR
+        "Cannot map processor '${CMAKE_SYSTEM_PROCESSOR}' to an IDA SDK architecture")
 endif()
 
 message(STATUS "IDA_ARCH: ${IDA_ARCH}")
@@ -206,6 +245,11 @@ else()
 endif()
 
 # Find IDA libraries - on Mac they're libida.dylib, not libida64.dylib
+if(IDA_LIB AND NOT EXISTS "${IDA_LIB}")
+    message(STATUS "Discarding stale cached IDA library path: ${IDA_LIB}")
+    unset(IDA_LIB CACHE)
+    unset(IDA_LIB)
+endif()
 find_library(IDA_LIB NAMES ida libida PATHS ${IDA_LIB_DIR} NO_DEFAULT_PATH)
 
 # Hex-Rays doesn't ship as separate library on Mac - it's loaded dynamically
@@ -248,12 +292,10 @@ else()
         -Wno-sign-compare
         -fPIC
         -fvisibility=hidden
+        $<$<CONFIG:Debug>:-g>
+        $<$<CONFIG:Debug>:-O0>
+        $<$<CONFIG:Release>:-O3>
     )
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        add_compile_options(-g -O0)
-    else()
-        add_compile_options(-O3)
-    endif()
 endif()
 
 # Include directories (structor include only - IDA includes added per-target)
@@ -301,14 +343,18 @@ set(STRUCTOR_CORE_HEADERS
     include/structor/synth_types.hpp
     include/structor/config.hpp
     include/structor/host_integration.hpp
+    include/structor/host_lifecycle.hpp
     include/structor/access_collector.hpp
     include/structor/layout_synthesizer.hpp
     include/structor/vtable_detector.hpp
     include/structor/global_object_analyzer.hpp
+    include/structor/global_rewrite_index.hpp
+    include/structor/global_tinfo_transaction.hpp
     include/structor/type_propagator.hpp
     include/structor/type_matcher.hpp
     include/structor/pseudocode_rewriter.hpp
     include/structor/structure_persistence.hpp
+    include/structor/persistence_transaction.hpp
     include/structor/ui_integration.hpp
     include/structor/api.hpp
     include/structor/utils.hpp
@@ -320,6 +366,7 @@ set(STRUCTOR_CORE_HEADERS
     include/structor/z3/result.hpp
     include/structor/z3/field_candidates.hpp
     include/structor/z3/array_constraints.hpp
+    include/structor/z3/union_constraints.hpp
     include/structor/z3/layout_constraints.hpp
     include/structor/z3/test_ir.hpp
     include/structor/z3/type_lattice.hpp
@@ -347,11 +394,18 @@ set_target_properties(structor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(structor_core
     PUBLIC
         ${PROJECT_SOURCE_DIR}/include
-        ${IDA_INCLUDE_DIR}
         ${STRUCTOR_Z3_INCLUDE_DIRS}
 )
+target_include_directories(structor_core SYSTEM PUBLIC ${IDA_INCLUDE_DIR})
 
-target_compile_definitions(structor_core PUBLIC ${STRUCTOR_PUBLIC_COMPILE_DEFINITIONS})
+target_compile_definitions(structor_core
+    PUBLIC
+        ${STRUCTOR_PUBLIC_COMPILE_DEFINITIONS}
+)
+if(STRUCTOR_ENABLE_LIVE_TEST_HOOKS)
+    # Test hooks are never propagated to embedding consumers.
+    target_compile_definitions(structor_core PRIVATE STRUCTOR_LIVE_TEST_HOOKS=1)
+endif()
 
 if(IDA_LIB)
     target_link_libraries(structor_core PUBLIC ${IDA_LIB})
@@ -374,12 +428,17 @@ if(STRUCTOR_BUILD_PLUGIN)
 
     target_link_libraries(structor${IDA_SUFFIX} PRIVATE structor_core)
 
-    target_include_directories(structor${IDA_SUFFIX} PRIVATE ${IDA_INCLUDE_DIR})
+    target_include_directories(structor${IDA_SUFFIX} SYSTEM PRIVATE ${IDA_INCLUDE_DIR})
     target_compile_definitions(structor${IDA_SUFFIX} PRIVATE ${STRUCTOR_PUBLIC_COMPILE_DEFINITIONS})
+    if(STRUCTOR_ENABLE_LIVE_TEST_HOOKS)
+        target_compile_definitions(structor${IDA_SUFFIX} PRIVATE STRUCTOR_LIVE_TEST_HOOKS=1)
+    endif()
 
     if(APPLE)
         # IDA plugins resolve IDA/Hex-Rays host symbols from the loading process.
         target_link_options(structor${IDA_SUFFIX} PRIVATE -Wl,-undefined,dynamic_lookup)
+    elseif(MSVC)
+        target_link_options(structor${IDA_SUFFIX} PRIVATE /SUBSYSTEM:WINDOWS)
     endif()
 
     # Set plugin output name and properties
@@ -387,31 +446,30 @@ if(STRUCTOR_BUILD_PLUGIN)
         OUTPUT_NAME "structor"
         SUFFIX ${PLUGIN_EXT}
         PREFIX ""
+        SKIP_BUILD_RPATH ON
+        BUILD_RPATH ""
+        INSTALL_RPATH ""
+        INSTALL_RPATH_USE_LINK_PATH FALSE
     )
 
-    # Install target
-    if(IDA_INSTALL_DIR)
-        install(TARGETS structor${IDA_SUFFIX}
-            LIBRARY DESTINATION "${IDA_INSTALL_DIR}/plugins"
-            RUNTIME DESTINATION "${IDA_INSTALL_DIR}/plugins"
-        )
-        if(APPLE)
-            install(CODE
-                "set(_structor_installed_plugin \"${IDA_INSTALL_DIR}/plugins/structor${PLUGIN_EXT}\")\n"
-                "if(EXISTS \"\${_structor_installed_plugin}\")\n"
-                "  execute_process(COMMAND codesign -s - -f \"\${_structor_installed_plugin}\" RESULT_VARIABLE _structor_codesign_result)\n"
-                "  if(NOT _structor_codesign_result EQUAL 0)\n"
-                "    message(FATAL_ERROR \"Failed to codesign installed plugin: \${_structor_installed_plugin}\")\n"
-                "  endif()\n"
-                "  message(STATUS \"Codesigned installed plugin: \${_structor_installed_plugin}\")\n"
-                "endif()\n"
-            )
-        endif()
+    # A relative destination makes --prefix/DESTDIR staging deterministic and
+    # prevents packaging from writing into a developer's IDA installation.
+    set(STRUCTOR_PLUGIN_INSTALL_DIR "plugins" CACHE STRING
+        "Relative directory below CMAKE_INSTALL_PREFIX for the IDA plugin")
+    if(IS_ABSOLUTE "${STRUCTOR_PLUGIN_INSTALL_DIR}")
+        message(FATAL_ERROR "STRUCTOR_PLUGIN_INSTALL_DIR must be relative")
     endif()
+    install(TARGETS structor${IDA_SUFFIX}
+        LIBRARY DESTINATION "${STRUCTOR_PLUGIN_INSTALL_DIR}" COMPONENT Runtime
+        RUNTIME DESTINATION "${STRUCTOR_PLUGIN_INSTALL_DIR}" COMPONENT Runtime
+    )
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
+        DESTINATION "share/structor"
+        COMPONENT Runtime
+    )
 endif()
 
 # Tests
-option(BUILD_TESTS "Build unit tests" OFF)
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(test)
@@ -426,5 +484,6 @@ message(STATUS "Structor Plugin Configuration:")
 message(STATUS "  IDA SDK: ${IDA_SDK_DIR}")
 message(STATUS "  Platform: ${IDA_PLATFORM}")
 message(STATUS "  64-bit build: ${IDA_EA64}")
+message(STATUS "  Live test hooks: ${STRUCTOR_ENABLE_LIVE_TEST_HOOKS}")
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "")

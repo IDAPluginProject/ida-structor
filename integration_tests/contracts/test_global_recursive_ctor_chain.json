@@ -21,6 +21,8 @@
         "fields_created": 5,
         "vtable_slots": 0,
         "propagated_to": [
+          "_child_ctor",
+          "_leaf_ctor",
           "_root_ctor"
         ],
         "failed_sites": [],
@@ -29,10 +31,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_g_root",
-          "size": 60,
-          "alignment": 1,
+          "size": 64,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_root_ctor",
           "source_var": "_g_root",
           "field_count": 5,
@@ -127,7 +131,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> install_root\n__int64 install_root() {\n    return root_ctor(a1: &g_root);\n}\n<<<\n\n>>> root_ctor\n__int64 __fastcall root_ctor(auto_g_root *a1) {\n    __int64 result; // x0\n\n    a1->u32_0 = 1380929364;\n    result = child_ctor(a1: (__int64)&a1->child);\n    *(unsigned __int64 *)((char *)&a1->u64_30 + 4) = 0x123456789ABCDEFLL;\n    a1[1].u32_0 = 9;\n    return result;\n}\n<<<\n\n>>> child_ctor\n__int64 __fastcall child_ctor(__int64 a1) {\n    __int64 result; // x0\n\n    *(_DWORD *)a1 = 1128810828;\n    result = leaf_ctor(a1: a1 + 8);\n    *(_QWORD *)(a1 + 32) = 0xAAAABBBBCCCCDDDDLL;\n    return result;\n}\n<<<\n\n>>> leaf_ctor\n__int64 __fastcall leaf_ctor(__int64 result) {\n    *(_DWORD *)result = 3;\n    *(_DWORD *)(result + 4) = 7;\n    *(_QWORD *)(result + 8) = 0x1111222233334444LL;\n    return result;\n}\n<<<\n\n>>> use_root\nvoid use_root() {\n    sink ^= (unsigned int)g_root;\n    sink ^= (unsigned int)dword_100008008;\n    sink ^= (unsigned int)dword_100008010;\n    sink ^= (unsigned int)dword_100008014;\n    sink ^= qword_100008018;\n    sink ^= qword_100008028;\n    sink ^= qword_100008030;\n    sink ^= (unsigned int)dword_100008038;\n}\n<<<\n"
+      "golden_pseudocode": ">>> install_root\n__int64 install_root() {\n    return root_ctor(a1: &g_root);\n}\n<<<\n\n>>> root_ctor\n__int64 __fastcall root_ctor(auto_g_root *a1) {\n    __int64 result; // x0\n    auto_child *p_child; // [xsp-20h] [xbp-30h]\n\n    a1->u32_0 = 1380929364;\n    p_child = &a1->child;\n    a1->child.u32_0 = 1128810828;\n    result = leaf_ctor(result: &a1->child.leaf);\n    p_child->u64_20 = 0xAAAABBBBCCCCDDDDLL;\n    a1->u64_30 = 0x123456789ABCDEFLL;\n    a1->u32_38 = 9;\n    return result;\n}\n<<<\n\n>>> child_ctor\n__int64 __fastcall child_ctor(auto_child *a1) {\n    __int64 result; // x0\n\n    a1->u32_0 = 1128810828;\n    result = leaf_ctor(result: &a1->leaf);\n    a1->u64_20 = 0xAAAABBBBCCCCDDDDLL;\n    return result;\n}\n<<<\n\n>>> leaf_ctor\nauto_leaf *__fastcall leaf_ctor(auto_leaf *result) {\n    result->u32_0 = 3;\n    result->u32_4 = 7;\n    result->u64_8 = 0x1111222233334444LL;\n    return result;\n}\n<<<\n\n>>> use_root\nvoid use_root() {\n    sink ^= (unsigned int)g_root;\n    sink ^= (unsigned int)dword_100008008;\n    sink ^= (unsigned int)dword_100008010;\n    sink ^= (unsigned int)dword_100008014;\n    sink ^= qword_100008018;\n    sink ^= qword_100008028;\n    sink ^= qword_100008030;\n    sink ^= (unsigned int)dword_100008038;\n}\n<<<\n"
     }
   ]
 }

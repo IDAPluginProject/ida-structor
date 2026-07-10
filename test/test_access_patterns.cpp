@@ -37,14 +37,67 @@ TEST_F(AccessPatternTest, AccessTypeMerging) {
     read_access.offset = 0x10;
     read_access.size = 4;
     read_access.access_type = AccessType::Read;
+    read_access.add_observed_constant(0x11);
 
     FieldAccess write_access;
     write_access.offset = 0x10;
     write_access.size = 4;
     write_access.access_type = AccessType::Write;
+    write_access.add_observed_constant(0x22);
+    write_access.is_zero_init = true;
+    write_access.is_call_argument = true;
 
-    // When merging read and write at same location, should become ReadWrite
-    // This is tested indirectly through the collector
+    ASSERT_TRUE(field_access_evidence_compatible(read_access, write_access));
+    merge_field_access_evidence(read_access, write_access);
+
+    EXPECT_EQ(read_access.access_type, AccessType::ReadWrite);
+    ASSERT_EQ(read_access.observed_constants.size(), 2U);
+    EXPECT_EQ(read_access.observed_constants[0], 0x11U);
+    EXPECT_EQ(read_access.observed_constants[1], 0x22U);
+    EXPECT_TRUE(read_access.is_zero_init);
+    EXPECT_TRUE(read_access.is_call_argument);
+}
+
+TEST_F(AccessPatternTest, CompatibleIntegerEvidencePreservesOneInterpretation) {
+    FieldAccess signed_access;
+    signed_access.offset = 8;
+    signed_access.size = 4;
+    signed_access.semantic_type = SemanticType::Integer;
+
+    FieldAccess unsigned_access = signed_access;
+    unsigned_access.semantic_type = SemanticType::UnsignedInteger;
+
+    EXPECT_TRUE(field_access_evidence_compatible(signed_access, unsigned_access));
+}
+
+TEST_F(AccessPatternTest, IncompatibleStorageInterpretationsRemainDistinct) {
+    FieldAccess integer_access;
+    integer_access.offset = 8;
+    integer_access.size = 4;
+    integer_access.semantic_type = SemanticType::UnsignedInteger;
+
+    FieldAccess floating_access = integer_access;
+    floating_access.semantic_type = SemanticType::Float;
+
+    FieldAccess pointer_width_integer = integer_access;
+    pointer_width_integer.size = 8;
+
+    FieldAccess pointer_access = pointer_width_integer;
+    pointer_access.semantic_type = SemanticType::Pointer;
+
+    EXPECT_FALSE(field_access_evidence_compatible(integer_access, floating_access));
+    EXPECT_FALSE(field_access_evidence_compatible(pointer_width_integer, pointer_access));
+}
+
+TEST_F(AccessPatternTest, UnknownEvidenceDoesNotCreateArtificialConflict) {
+    FieldAccess unknown_access;
+    unknown_access.offset = 8;
+    unknown_access.size = 4;
+
+    FieldAccess floating_access = unknown_access;
+    floating_access.semantic_type = SemanticType::Float;
+
+    EXPECT_TRUE(field_access_evidence_compatible(unknown_access, floating_access));
 }
 
 TEST_F(AccessPatternTest, AccessPatternMinMax) {

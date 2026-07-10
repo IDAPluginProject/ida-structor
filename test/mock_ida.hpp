@@ -194,6 +194,20 @@ public:
 
     bool get_type_by_tid(tid_t tid) { struct_tid_ = tid; return tid != BADADDR; }
     bool get_named_type(void*, const char* name) { return name != nullptr; }
+    bool equals_to(const tinfo_t& other) const {
+        if (type_flags_ != other.type_flags_ || is_ptr_ != other.is_ptr_ ||
+            is_func_ != other.is_func_ || is_struct_ != other.is_struct_ ||
+            is_array_ != other.is_array_ || is_union_ != other.is_union_ ||
+            array_count_ != other.array_count_ ||
+            struct_tid_ != other.struct_tid_) {
+            return false;
+        }
+        if (static_cast<bool>(pointed_type_) !=
+            static_cast<bool>(other.pointed_type_)) {
+            return false;
+        }
+        return !pointed_type_ || pointed_type_->equals_to(*other.pointed_type_);
+    }
 
     void print(qstring* out) const {
         if (!out) return;
@@ -391,7 +405,18 @@ inline const cexpr_t* citem_t::cexpr() const { return static_cast<const cexpr_t*
 
 struct cinsn_t : public citem_t {};
 
-struct lvar_t {
+struct lvar_locator_t {
+    int mock_id = -1;
+    ea_t defea = BADADDR;
+
+    bool operator==(const lvar_locator_t&) const = default;
+    bool operator<(const lvar_locator_t& other) const {
+        return mock_id < other.mock_id ||
+            (mock_id == other.mock_id && defea < other.defea);
+    }
+};
+
+struct lvar_t : public lvar_locator_t {
     qstring name;
     bool is_arg = false;
 
@@ -403,7 +428,24 @@ private:
     tinfo_t type_;
 };
 
-struct lvars_t : public qvector<lvar_t> {};
+struct lvars_t : public qvector<lvar_t> {
+    lvar_t* find(const lvar_locator_t& locator) {
+        for (auto& var : *this) {
+            if (static_cast<const lvar_locator_t&>(var) == locator) {
+                return &var;
+            }
+        }
+        return nullptr;
+    }
+    const lvar_t* find(const lvar_locator_t& locator) const {
+        for (const auto& var : *this) {
+            if (static_cast<const lvar_locator_t&>(var) == locator) {
+                return &var;
+            }
+        }
+        return nullptr;
+    }
+};
 
 struct cfunc_t {
     ea_t entry_ea = BADADDR;
@@ -590,8 +632,21 @@ struct action_desc_t {};
 
 #define ACTION_DESC_LITERAL(name, label, handler, hotkey, tooltip, icon) action_desc_t{}
 
-inline bool register_action(const action_desc_t&) { return true; }
-inline void unregister_action(const char*) {}
+inline bool mock_register_action_result = true;
+inline bool mock_unregister_action_result = true;
+inline int mock_registered_action_count = 0;
+inline bool register_action(const action_desc_t&) {
+    if (!mock_register_action_result) return false;
+    ++mock_registered_action_count;
+    return true;
+}
+inline bool unregister_action(const char*) {
+    if (!mock_unregister_action_result || mock_registered_action_count <= 0) {
+        return false;
+    }
+    --mock_registered_action_count;
+    return true;
+}
 inline bool attach_action_to_popup(void*, void*, const char*) { return true; }
 
 // Widget/view types
@@ -616,8 +671,23 @@ inline void* get_current_widget() { return nullptr; }
 // Hexrays callbacks
 enum hexrays_event_t { hxe_populating_popup, hxe_double_click };
 
-inline bool install_hexrays_callback(void* (*)(void*, hexrays_event_t, va_list), void*) { return true; }
-inline void remove_hexrays_callback(void* (*)(void*, hexrays_event_t, va_list), void*) {}
+using hexrays_cb_t = ssize_t idaapi(void*, hexrays_event_t, va_list);
+inline bool mock_install_hexrays_callback_result = true;
+inline int mock_remove_hexrays_callback_result = 1;
+inline int mock_installed_hexrays_callback_count = 0;
+inline bool install_hexrays_callback(hexrays_cb_t*, void*) {
+    if (!mock_install_hexrays_callback_result) return false;
+    ++mock_installed_hexrays_callback_count;
+    return true;
+}
+inline int remove_hexrays_callback(hexrays_cb_t*, void*) {
+    if (mock_remove_hexrays_callback_result <= 0 ||
+        mock_installed_hexrays_callback_count <= 0) {
+        return mock_remove_hexrays_callback_result;
+    }
+    --mock_installed_hexrays_callback_count;
+    return mock_remove_hexrays_callback_result;
+}
 
 // User comments
 struct treeloc_t {

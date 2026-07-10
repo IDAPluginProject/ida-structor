@@ -2,6 +2,7 @@
 
 #include <z3++.h>
 #include <optional>
+#include <limits>
 #include "structor/synth_types.hpp"
 #include "structor/z3/context.hpp"
 #include "structor/z3/type_encoding.hpp"
@@ -37,24 +38,45 @@ struct ArrayCandidate {
     }
 
     /// Calculate total array size in bytes
+    [[nodiscard]] std::optional<uint32_t> checked_total_size() const noexcept {
+        if (stride == 0 || element_count == 0) {
+            return std::nullopt;
+        }
+        return checked_u32_product(stride, element_count);
+    }
+
     [[nodiscard]] uint32_t total_size() const noexcept {
-        return stride * element_count;
+        return checked_total_size().value_or(std::numeric_limits<uint32_t>::max());
+    }
+
+    [[nodiscard]] std::optional<sval_t> checked_end_offset() const noexcept {
+        const auto total = checked_total_size();
+        if (!total) {
+            return std::nullopt;
+        }
+        return checked_interval_end(base_offset, *total);
     }
 
     /// Check if an offset falls within this array
     [[nodiscard]] bool contains_offset(sval_t offset) const noexcept {
-        return offset >= base_offset &&
-               offset < base_offset + static_cast<sval_t>(total_size());
+        const auto end = checked_end_offset();
+        return end.has_value() && offset >= base_offset && offset < *end;
     }
 
     /// Get the element index for an offset
     [[nodiscard]] std::optional<uint32_t> get_element_index(sval_t offset) const noexcept {
-        if (!contains_offset(offset)) return std::nullopt;
-        sval_t relative = offset - base_offset;
-        if (relative % stride != static_cast<sval_t>(inner_access_offset)) {
+        if (stride == 0 || !contains_offset(offset)) return std::nullopt;
+        const auto relative = checked_interval_span(base_offset, offset);
+        if (!relative ||
+            *relative % stride != static_cast<std::uint64_t>(inner_access_offset)) {
             return std::nullopt;  // Not at the expected inner offset
         }
-        return static_cast<uint32_t>(relative / stride);
+        const std::uint64_t index = *relative / stride;
+        if (index >= element_count ||
+            index > std::numeric_limits<std::uint32_t>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<uint32_t>(index);
     }
 
     /// Generate description string
@@ -73,7 +95,7 @@ struct ArrayCandidate {
 
 /// Configuration for array detection
 struct ArrayDetectionConfig {
-    int min_elements = 3;                    // Minimum elements to form an array
+    uint32_t min_elements = 3;               // Minimum elements to form an array
     int max_gap_ratio = 2;                   // Max allowed gap as multiple of stride
     bool require_consistent_types = true;    // All elements must have same type
     bool detect_arrays_of_structs = true;    // When stride > access_size, create element struct
@@ -81,6 +103,23 @@ struct ArrayDetectionConfig {
     uint32_t max_stride = 4096;              // Maximum allowed stride
     uint32_t max_elements = 10000;           // Maximum array elements to consider
 };
+
+/// Construct the production array-detection configuration from the synthesis
+/// controls without silently reverting symbolic/stride bounds to defaults.
+[[nodiscard]] inline ArrayDetectionConfig
+make_array_detection_config(
+    uint32_t min_elements,
+    uint32_t max_elements,
+    bool use_symbolic_indices,
+    uint32_t max_stride) noexcept
+{
+    ArrayDetectionConfig result;
+    result.min_elements = min_elements;
+    result.max_elements = max_elements;
+    result.use_symbolic_indices = use_symbolic_indices;
+    result.max_stride = max_stride;
+    return result;
+}
 
 /// Builds Z3 constraints for array pattern detection
 class ArrayConstraintBuilder {

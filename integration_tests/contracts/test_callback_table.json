@@ -31,10 +31,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_invoke_slot0",
-          "size": 59,
-          "alignment": 1,
+          "size": 64,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_invoke_slot0",
           "source_var": "a1",
           "field_count": 9,

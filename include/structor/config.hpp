@@ -1,9 +1,18 @@
 #pragma once
 
 #include "synth_types.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <system_error>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace structor {
 
@@ -95,9 +104,17 @@ struct Z3Options {
     bool            enable_unsat_core;  // Extract UNSAT core for debugging
     bool            detect_arrays;      // Enable array detection via Z3
     std::uint32_t   min_array_elements; // Minimum elements to consider as array
+    bool            detect_symbolic_arrays; // Include affine symbolic-index evidence
+    std::uint32_t   max_array_stride;   // Maximum inferred array stride in bytes
     bool            cross_function;     // Enable cross-function analysis
+    std::uint32_t   max_accesses;       // Maximum evidence observations per synthesis
     std::uint32_t   max_candidates;     // Maximum field candidates to consider
+    std::uint32_t   max_fields;         // Maximum materialized root fields (padding included)
+    std::uint32_t   max_array_elements; // Maximum elements in one recovered array
+    std::uint32_t   max_structure_size; // Maximum rebased object span in bytes
+    std::uint64_t   max_constraint_pairs; // Maximum pair + union-cardinality relations
     bool            allow_unions;       // Allow union type creation for conflicts
+    std::uint32_t   max_union_alternatives; // Maximum selected members per union
     std::uint8_t    min_confidence;     // Minimum confidence threshold (0-100)
     bool            relax_on_unsat;     // Relax constraints if UNSAT
     std::uint32_t   max_relax_iterations;  // Maximum relaxation iterations
@@ -107,14 +124,22 @@ struct Z3Options {
     Z3Options()
         : mode(Z3SynthesisMode::Preferred)
         , timeout_ms(5000)
-        , memory_limit_mb(256)
+        , memory_limit_mb(0)
         , enable_maxsmt(true)
         , enable_unsat_core(true)
         , detect_arrays(true)
         , min_array_elements(3)
+        , detect_symbolic_arrays(true)
+        , max_array_stride(4096)
         , cross_function(true)
+        , max_accesses(10000)
         , max_candidates(1000)
+        , max_fields(4096)
+        , max_array_elements(1024)
+        , max_structure_size(0x10000)
+        , max_constraint_pairs(500000)
         , allow_unions(true)
+        , max_union_alternatives(8)
         , min_confidence(20)
         , relax_on_unsat(true)
         , max_relax_iterations(5)
@@ -170,6 +195,88 @@ struct SynthOptions {
         , z3() {}
 };
 
+/// Stable validation categories for public/configuration option entry points.
+enum class SynthOptionsValidationError : std::uint8_t {
+    None = 0,
+    InvalidAlignment,
+    InvalidSynthesisThreshold,
+    InvalidPropagationDepth,
+    InvalidZ3Mode,
+    InvalidHardLimit,
+    InvalidArrayBounds,
+    InvalidConfidence,
+    InvalidWeight,
+};
+
+[[nodiscard]] inline SynthOptionsValidationError validate_synth_options(
+    const SynthOptions& options) noexcept
+{
+    if (!is_valid_abi_alignment(static_cast<std::int64_t>(options.alignment))) {
+        return SynthOptionsValidationError::InvalidAlignment;
+    }
+    if (options.min_accesses <= 0) {
+        return SynthOptionsValidationError::InvalidSynthesisThreshold;
+    }
+    if (options.max_propagation_depth < 0) {
+        return SynthOptionsValidationError::InvalidPropagationDepth;
+    }
+    switch (options.z3.mode) {
+        case Z3SynthesisMode::Disabled:
+        case Z3SynthesisMode::Preferred:
+        case Z3SynthesisMode::Required:
+            break;
+        default:
+            return SynthOptionsValidationError::InvalidZ3Mode;
+    }
+    if (options.z3.max_accesses == 0 || options.z3.max_candidates == 0 ||
+        options.z3.max_fields == 0 || options.z3.max_array_elements == 0 ||
+        options.z3.max_structure_size == 0 ||
+        options.z3.max_constraint_pairs == 0 ||
+        options.z3.max_union_alternatives == 0) {
+        return SynthOptionsValidationError::InvalidHardLimit;
+    }
+    if (options.z3.min_array_elements == 0 ||
+        options.z3.max_array_stride == 0 ||
+        options.z3.min_array_elements > options.z3.max_array_elements) {
+        return SynthOptionsValidationError::InvalidArrayBounds;
+    }
+    if (options.z3.min_confidence > 100) {
+        return SynthOptionsValidationError::InvalidConfidence;
+    }
+    if (options.z3.weight_minimize_padding < 0 ||
+        options.z3.weight_prefer_non_union < 0) {
+        return SynthOptionsValidationError::InvalidWeight;
+    }
+    return SynthOptionsValidationError::None;
+}
+
+[[nodiscard]] inline const char* synth_options_validation_error_str(
+    SynthOptionsValidationError error) noexcept
+{
+    switch (error) {
+        case SynthOptionsValidationError::None:
+            return "";
+        case SynthOptionsValidationError::InvalidAlignment:
+            return "ABI alignment must be a non-zero power of two representable by SynthOptions::alignment";
+        case SynthOptionsValidationError::InvalidSynthesisThreshold:
+            return "minimum access count must be positive";
+        case SynthOptionsValidationError::InvalidPropagationDepth:
+            return "maximum propagation depth must be non-negative";
+        case SynthOptionsValidationError::InvalidZ3Mode:
+            return "Z3 synthesis mode is invalid";
+        case SynthOptionsValidationError::InvalidHardLimit:
+            return "synthesis hard limits must be non-zero";
+        case SynthOptionsValidationError::InvalidArrayBounds:
+            return "array bounds require min elements in [1, max_array_elements] and a non-zero maximum stride";
+        case SynthOptionsValidationError::InvalidConfidence:
+            return "minimum confidence must be in [0,100]";
+        case SynthOptionsValidationError::InvalidWeight:
+            return "synthesis objective weights must be non-negative";
+        default:
+            return "Unknown synthesis option validation error";
+    }
+}
+
 /// Configuration manager for the plugin
 class Config {
 public:
@@ -182,7 +289,7 @@ public:
     bool load();
 
     /// Save configuration to IDB netnode
-    bool save();
+    bool save() noexcept;
 
     /// Reset to defaults
     void reset();
@@ -196,6 +303,16 @@ public:
     [[nodiscard]] SynthOptions& mutable_options() noexcept {
         dirty_ = true;
         return options_;
+    }
+
+    /// Atomically replace options after central validation.
+    [[nodiscard]] bool set_options(const SynthOptions& options) {
+        if (validate_synth_options(options) != SynthOptionsValidationError::None) {
+            return false;
+        }
+        options_ = options;
+        dirty_ = true;
+        return true;
     }
 
     /// Check if configuration has unsaved changes
@@ -246,8 +363,49 @@ private:
 
     static bool parse_bool(const std::string& s) {
         std::string lower = s;
-        for (auto& c : lower) c = static_cast<char>(std::tolower(c));
-        return lower == "true" || lower == "1" || lower == "yes";
+        for (auto& c : lower) {
+            c = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (lower == "true" || lower == "1" || lower == "yes") {
+            return true;
+        }
+        if (lower == "false" || lower == "0" || lower == "no") {
+            return false;
+        }
+        throw std::invalid_argument("invalid boolean configuration value");
+    }
+
+    static std::uint64_t parse_u64(const std::string& value) {
+        if (value.empty() || value.front() == '-') {
+            throw std::invalid_argument("expected unsigned integer");
+        }
+        size_t consumed = 0;
+        const unsigned long long parsed = std::stoull(value, &consumed, 10);
+        if (consumed != value.size()) {
+            throw std::invalid_argument("trailing characters in unsigned integer");
+        }
+        return static_cast<std::uint64_t>(parsed);
+    }
+
+    static std::uint32_t parse_u32(const std::string& value, bool allow_zero = true) {
+        const std::uint64_t parsed = parse_u64(value);
+        if (parsed > std::numeric_limits<std::uint32_t>::max() ||
+            (!allow_zero && parsed == 0)) {
+            throw std::out_of_range("unsigned 32-bit configuration value out of range");
+        }
+        return static_cast<std::uint32_t>(parsed);
+    }
+
+    static int parse_int(const std::string& value) {
+        size_t consumed = 0;
+        const long long parsed = std::stoll(value, &consumed, 10);
+        if (consumed != value.size() ||
+            parsed < std::numeric_limits<int>::min() ||
+            parsed > std::numeric_limits<int>::max()) {
+            throw std::out_of_range("signed configuration value out of range");
+        }
+        return static_cast<int>(parsed);
     }
 
     SynthOptions options_;
@@ -260,14 +418,38 @@ private:
 
 inline bool Config::load() {
     auto path = config_path();
-    if (path.empty()) return true;
+    if (path.empty()) return false;
 
     std::ifstream file(path);
     if (!file.is_open()) {
-        // No config file, create one with defaults
-        save();
-        return true;
+        std::error_code status_error;
+        const bool existing_path =
+            std::filesystem::exists(path, status_error);
+        const bool structurally_missing =
+            !status_error ||
+            status_error == std::errc::no_such_file_or_directory ||
+            status_error == std::errc::not_a_directory;
+        if (existing_path || !structurally_missing) {
+            // An existing but unreadable configuration is not equivalent to a
+            // first run and must not be overwritten with defaults.
+            return false;
+        }
+
+        // Missing config file: report whether the default configuration was
+        // actually persisted instead of silently accepting a failed write.
+        dirty_ = true;
+        return save();
     }
+
+    // Loading is transactional: a malformed or semantically invalid file
+    // must not leave a prefix of its assignments visible to later synthesis.
+    const SynthOptions previous_options = options_;
+    const bool previous_dirty = dirty_;
+    const auto fail_load = [&]() {
+        options_ = previous_options;
+        dirty_ = previous_dirty;
+        return false;
+    };
 
     std::string line;
     while (std::getline(file, line)) {
@@ -291,7 +473,9 @@ inline bool Config::load() {
             value = trim(value.substr(0, comment_pos));
         }
 
-        // Map keys to options
+        // Map keys to options. Numeric parsing is strict: overflow, negative
+        // unsigned values, trailing text, and zero hard caps reject the file.
+        try {
         if (key == "hotkey") {
             options_.hotkey = value.c_str();
         } else if (key == "auto_propagate") {
@@ -299,21 +483,21 @@ inline bool Config::load() {
         } else if (key == "vtable_detection") {
             options_.vtable_detection = parse_bool(value);
         } else if (key == "min_accesses") {
-            options_.min_accesses = std::stoi(value);
+            options_.min_accesses = parse_int(value);
         } else if (key == "alignment") {
-            options_.alignment = std::stoi(value);
+            options_.alignment = parse_int(value);
         } else if (key == "interactive_mode") {
             options_.interactive_mode = parse_bool(value);
         } else if (key == "highlight_changes") {
             options_.highlight_changes = parse_bool(value);
         } else if (key == "highlight_duration_ms") {
-            options_.highlight_duration_ms = std::stoi(value);
+            options_.highlight_duration_ms = parse_int(value);
         } else if (key == "auto_open_struct") {
             options_.auto_open_struct = parse_bool(value);
         } else if (key == "generate_comments") {
             options_.generate_comments = parse_bool(value);
         } else if (key == "max_propagation_depth") {
-            options_.max_propagation_depth = std::stoi(value);
+            options_.max_propagation_depth = parse_int(value);
         } else if (key == "propagate_to_callers") {
             options_.propagate_to_callers = parse_bool(value);
         } else if (key == "propagate_to_callees") {
@@ -333,11 +517,12 @@ inline bool Config::load() {
         else if (key == "z3_mode") {
             if (value == "disabled") options_.z3.mode = Z3SynthesisMode::Disabled;
             else if (value == "required") options_.z3.mode = Z3SynthesisMode::Required;
-            else options_.z3.mode = Z3SynthesisMode::Preferred;
+            else if (value == "preferred") options_.z3.mode = Z3SynthesisMode::Preferred;
+            else throw std::invalid_argument("invalid Z3 synthesis mode");
         } else if (key == "z3_timeout_ms") {
-            options_.z3.timeout_ms = static_cast<std::uint32_t>(std::stoul(value));
+            options_.z3.timeout_ms = parse_u32(value);
         } else if (key == "z3_memory_limit_mb") {
-            options_.z3.memory_limit_mb = static_cast<std::uint32_t>(std::stoul(value));
+            options_.z3.memory_limit_mb = parse_u32(value);
         } else if (key == "z3_enable_maxsmt") {
             options_.z3.enable_maxsmt = parse_bool(value);
         } else if (key == "z3_enable_unsat_core") {
@@ -345,41 +530,117 @@ inline bool Config::load() {
         } else if (key == "z3_detect_arrays") {
             options_.z3.detect_arrays = parse_bool(value);
         } else if (key == "z3_min_array_elements") {
-            options_.z3.min_array_elements = static_cast<std::uint32_t>(std::stoul(value));
+            options_.z3.min_array_elements = parse_u32(value, false);
+        } else if (key == "z3_detect_symbolic_arrays") {
+            options_.z3.detect_symbolic_arrays = parse_bool(value);
+        } else if (key == "z3_max_array_stride") {
+            options_.z3.max_array_stride = parse_u32(value, false);
         } else if (key == "z3_cross_function") {
             options_.z3.cross_function = parse_bool(value);
+        } else if (key == "z3_max_accesses") {
+            options_.z3.max_accesses = parse_u32(value, false);
         } else if (key == "z3_max_candidates") {
-            options_.z3.max_candidates = static_cast<std::uint32_t>(std::stoul(value));
+            options_.z3.max_candidates = parse_u32(value, false);
+        } else if (key == "z3_max_fields") {
+            options_.z3.max_fields = parse_u32(value, false);
+        } else if (key == "z3_max_array_elements") {
+            options_.z3.max_array_elements = parse_u32(value, false);
+        } else if (key == "z3_max_structure_size") {
+            options_.z3.max_structure_size = parse_u32(value, false);
+        } else if (key == "z3_max_constraint_pairs") {
+            options_.z3.max_constraint_pairs = parse_u64(value);
+            if (options_.z3.max_constraint_pairs == 0) {
+                throw std::out_of_range("constraint-relation limit must be non-zero");
+            }
         } else if (key == "z3_allow_unions") {
             options_.z3.allow_unions = parse_bool(value);
+        } else if (key == "z3_max_union_alternatives") {
+            options_.z3.max_union_alternatives = parse_u32(value, false);
         } else if (key == "z3_min_confidence") {
-            options_.z3.min_confidence = static_cast<std::uint8_t>(std::stoul(value));
+            const std::uint32_t confidence = parse_u32(value);
+            if (confidence > 100) {
+                throw std::out_of_range("confidence must be in [0,100]");
+            }
+            options_.z3.min_confidence = static_cast<std::uint8_t>(confidence);
         } else if (key == "z3_relax_on_unsat") {
             options_.z3.relax_on_unsat = parse_bool(value);
         } else if (key == "z3_max_relax_iterations") {
-            options_.z3.max_relax_iterations = static_cast<std::uint32_t>(std::stoul(value));
+            options_.z3.max_relax_iterations = parse_u32(value);
         } else if (key == "z3_weight_minimize_padding") {
-            options_.z3.weight_minimize_padding = std::stoi(value);
+            options_.z3.weight_minimize_padding = parse_int(value);
         } else if (key == "z3_weight_prefer_non_union") {
-            options_.z3.weight_prefer_non_union = std::stoi(value);
+            options_.z3.weight_prefer_non_union = parse_int(value);
         }
+        } catch (const std::exception&) {
+            return fail_load();
+        }
+    }
+
+    if (file.bad() ||
+        validate_synth_options(options_) != SynthOptionsValidationError::None) {
+        return fail_load();
     }
 
     dirty_ = false;
     return true;
 }
 
-inline bool Config::save() {
-    auto path = config_path();
-    if (path.empty()) return false;
+inline bool Config::save() noexcept {
+    std::filesystem::path temporary_path;
+    const auto discard_temporary = [&temporary_path]() noexcept {
+        if (temporary_path.empty()) {
+            return;
+        }
+        try {
+            std::error_code ignored;
+            std::filesystem::remove(temporary_path, ignored);
+        } catch (...) {
+            // Cleanup is best-effort and must not escape save().
+        }
+    };
 
-    // Ensure directory exists
-    std::filesystem::create_directories(path.parent_path());
+    try {
+        if (validate_synth_options(options_) !=
+            SynthOptionsValidationError::None) {
+            return false;
+        }
 
-    std::ofstream file(path);
-    if (!file.is_open()) {
-        return false;
-    }
+        const auto path = config_path();
+        if (path.empty()) {
+            return false;
+        }
+
+        std::error_code filesystem_error;
+        std::filesystem::create_directories(
+            path.parent_path(), filesystem_error);
+        if (filesystem_error) {
+            return false;
+        }
+
+        // Write in the destination directory and rename only after the stream
+        // has flushed and closed successfully. On POSIX filesystems this is an
+        // atomic replacement; failure leaves the previous configuration file
+        // untouched. The clock, process address-space identity, and local
+        // sequence prevent independent plugin processes from sharing a
+        // temporary pathname during concurrent saves.
+        static std::atomic<std::uint64_t> temporary_sequence{0};
+        const auto clock_nonce = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto instance_nonce = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(this));
+        const std::uint64_t temporary_nonce =
+            clock_nonce ^ instance_nonce ^
+            temporary_sequence.fetch_add(1, std::memory_order_relaxed);
+        std::filesystem::path candidate_temporary_path = path;
+        candidate_temporary_path +=
+            ".tmp." + std::to_string(temporary_nonce);
+        temporary_path = std::move(candidate_temporary_path);
+        std::ofstream file(
+            temporary_path, std::ios::out | std::ios::trunc);
+        if (!file.is_open()) {
+            discard_temporary();
+            return false;
+        }
 
     file << "# Structor Configuration\n";
     file << "# See https://github.com/AnomalyCo/structor for documentation\n\n";
@@ -430,17 +691,77 @@ inline bool Config::save() {
     file << "z3_enable_unsat_core=" << (options_.z3.enable_unsat_core ? "true" : "false") << "\n";
     file << "z3_detect_arrays=" << (options_.z3.detect_arrays ? "true" : "false") << "\n";
     file << "z3_min_array_elements=" << options_.z3.min_array_elements << "\n";
+    file << "z3_detect_symbolic_arrays=" << (options_.z3.detect_symbolic_arrays ? "true" : "false") << "\n";
+    file << "z3_max_array_stride=" << options_.z3.max_array_stride << "\n";
     file << "z3_cross_function=" << (options_.z3.cross_function ? "true" : "false") << "\n";
+    file << "z3_max_accesses=" << options_.z3.max_accesses << "\n";
     file << "z3_max_candidates=" << options_.z3.max_candidates << "\n";
+    file << "z3_max_fields=" << options_.z3.max_fields << "\n";
+    file << "z3_max_array_elements=" << options_.z3.max_array_elements << "\n";
+    file << "z3_max_structure_size=" << options_.z3.max_structure_size << "\n";
+    file << "z3_max_constraint_pairs=" << options_.z3.max_constraint_pairs << "\n";
     file << "z3_allow_unions=" << (options_.z3.allow_unions ? "true" : "false") << "\n";
+    file << "z3_max_union_alternatives=" << options_.z3.max_union_alternatives << "\n";
     file << "z3_min_confidence=" << static_cast<int>(options_.z3.min_confidence) << "\n";
     file << "z3_relax_on_unsat=" << (options_.z3.relax_on_unsat ? "true" : "false") << "\n";
     file << "z3_max_relax_iterations=" << options_.z3.max_relax_iterations << "\n";
     file << "z3_weight_minimize_padding=" << options_.z3.weight_minimize_padding << "\n";
     file << "z3_weight_prefer_non_union=" << options_.z3.weight_prefer_non_union << "\n";
 
-    dirty_ = false;
-    return true;
+        file.flush();
+        if (!file.good()) {
+            file.close();
+            discard_temporary();
+            return false;
+        }
+        file.close();
+        if (file.fail()) {
+            discard_temporary();
+            return false;
+        }
+
+        std::error_code destination_error;
+        const bool destination_exists =
+            std::filesystem::exists(path, destination_error);
+        if (destination_error) {
+            discard_temporary();
+            return false;
+        }
+        if (destination_exists &&
+            !std::filesystem::is_regular_file(path, destination_error)) {
+            discard_temporary();
+            return false;
+        }
+        if (destination_error) {
+            discard_temporary();
+            return false;
+        }
+
+#ifdef _WIN32
+        // MoveFileExW performs a single replace operation in the destination
+        // directory; there is no interval in which the prior configuration is
+        // renamed away. WRITE_THROUGH requests completion before success.
+        if (!MoveFileExW(
+                temporary_path.c_str(), path.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            filesystem_error = std::error_code(
+                static_cast<int>(GetLastError()), std::system_category());
+        }
+#else
+        std::filesystem::rename(
+            temporary_path, path, filesystem_error);
+#endif
+        if (filesystem_error) {
+            discard_temporary();
+            return false;
+        }
+
+        dirty_ = false;
+        return true;
+    } catch (...) {
+        discard_temporary();
+        return false;
+    }
 }
 
 inline void Config::reset() {

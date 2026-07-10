@@ -31,10 +31,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
-          "name": "entry_point_command",
+          "name": "auto_get_local_cache_void_cache",
           "size": 24,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "__ZN10LocalCacheC2Ej",
           "source_var": "get_local_cache(void)::cache",
           "field_count": 4,
@@ -111,7 +113,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> __Z16warm_local_cachev\n__int64 __fastcall warm_local_cache() {\n    __int64 result; // x0\n    entry_point_command *local_cache; // [xsp+8h] [xbp-8h]\n\n    local_cache = (entry_point_command *)get_local_cache();\n    result = LocalCache::touch(this: (LocalCache *)local_cache, a2: 3u);\n    sink ^= local_cache->cmd;\n    return result;\n}\n<<<\n\n>>> __Z16read_local_cachev\nentry_point_command *__fastcall read_local_cache() {\n    entry_point_command *result; // x0\n\n    result = (entry_point_command *)get_local_cache();\n    sink ^= result->cmdsize;\n    sink ^= result->entryoff;\n    sink ^= result->stacksize;\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> __Z16warm_local_cachev\nauto_get_local_cache_void_cache *__fastcall warm_local_cache() {\n    auto_get_local_cache_void_cache *result; // x0\n    auto_get_local_cache_void_cache *local_cache; // [xsp+8h] [xbp-8h]\n\n    local_cache = (auto_get_local_cache_void_cache *)get_local_cache();\n    result = (auto_get_local_cache_void_cache *)LocalCache::touch(this: local_cache, a2: 3u);\n    sink ^= local_cache->u32_0;\n    return result;\n}\n<<<\n\n>>> __Z16read_local_cachev\nauto_get_local_cache_void_cache *__fastcall read_local_cache() {\n    auto_get_local_cache_void_cache *result; // x0\n\n    result = get_local_cache();\n    sink ^= result->u32_4;\n    sink ^= result->u64_8;\n    sink ^= result->u64_10;\n    return result;\n}\n<<<\n"
     }
   ]
 }

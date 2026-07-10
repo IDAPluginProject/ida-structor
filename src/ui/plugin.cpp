@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -274,6 +277,25 @@ static void append_z3_json(std::string& out, const Z3SynthesisInfo& info) {
     out += '}';
 }
 
+static void append_resource_limit_json(
+    std::string& out,
+    const std::optional<ResourceLimitViolation>& violation) {
+    if (!violation) {
+        out += "null";
+        return;
+    }
+    out += '{';
+    out += "\"kind\":";
+    append_json_string(out, resource_limit_kind_str(violation->kind));
+    out += ",\"configured_limit\":" +
+        std::to_string(violation->configured_limit);
+    out += ",\"observed_value\":" +
+        std::to_string(violation->observed_value);
+    out += ",\"phase\":";
+    append_json_string(out, violation->phase);
+    out += '}';
+}
+
 static void append_vtable_json(std::string& out, const SynthVTable& vtable) {
     out += '{';
     out += "\"name\":";
@@ -307,6 +329,12 @@ static void append_synth_struct_json(std::string& out, const SynthStruct& synth)
     append_json_string(out, synth.name);
     out += ",\"size\":" + std::to_string(synth.size);
     out += ",\"alignment\":" + std::to_string(synth.alignment);
+    out += ",\"packing\":";
+    if (synth.packing) {
+        out += std::to_string(*synth.packing);
+    } else {
+        out += "null";
+    }
     out += ",\"source_func_ea\":" + std::to_string(static_cast<unsigned long long>(synth.source_func));
     out += ",\"source_func_name\":";
     append_json_string(out, render_func_name(synth.source_func));
@@ -354,6 +382,8 @@ static void append_synth_result_json(std::string& out, const SynthResult& result
     out += ",\"vtable_slots\":" + std::to_string(result.vtable_slots);
     out += ",\"z3\":";
     append_z3_json(out, result.z3_info);
+    out += ",\"resource_limit\":";
+    append_resource_limit_json(out, result.resource_limit);
     out += ",\"propagated_to\":";
     append_ea_list_json(out, result.propagated_to);
     out += ",\"failed_sites\":";
@@ -496,6 +526,10 @@ static void append_propagation_result_json(std::string& out, const PropagationRe
     out += '{';
     out += "\"success_count\":" + std::to_string(propagation.success_count);
     out += ",\"failure_count\":" + std::to_string(propagation.failure_count);
+    out += ",\"incomplete\":";
+    append_json_bool(out, propagation.incomplete);
+    out += ",\"error_message\":";
+    append_json_string(out, propagation.error_message);
     out += ",\"sites\":[";
     for (size_t i = 0; i < propagation.sites.size(); ++i) {
         if (i != 0) {
@@ -709,6 +743,9 @@ static void maybe_export_last_result(const SynthResult& result, const char* mode
     json += ",\"cross_func_merged\":" + std::to_string(result.z3_info.cross_func_merged);
     json += '}';
 
+    json += ",\"resource_limit\":";
+    append_resource_limit_json(json, result.resource_limit);
+
     json += ",\"propagated_to\":";
     append_ea_list_json(json, result.propagated_to);
     json += ",\"failed_sites\":";
@@ -724,6 +761,12 @@ static void maybe_export_last_result(const SynthResult& result, const char* mode
         append_json_string(json, synth.name);
         json += ",\"size\":" + std::to_string(synth.size);
         json += ",\"alignment\":" + std::to_string(synth.alignment);
+        json += ",\"packing\":";
+        if (synth.packing) {
+            json += std::to_string(*synth.packing);
+        } else {
+            json += "null";
+        }
         json += ",\"source_func_ea\":" + std::to_string(static_cast<unsigned long long>(synth.source_func));
         json += ",\"source_func_name\":";
         append_json_string(json, render_func_name(synth.source_func));
@@ -961,7 +1004,7 @@ static void export_api_json(const char* command, const std::string& payload) {
     maybe_export_api_json(json);
 }
 
-static bool run_pending_api_command(const qstring& command_text) {
+static bool run_pending_api_command_impl(const qstring& command_text) {
     std::vector<std::string> parts = split_command(command_text.c_str(), '|');
     if (parts.empty() || parts[0].empty()) {
         export_api_error("unknown", "Empty API command");
@@ -1259,6 +1302,81 @@ static bool run_pending_api_command(const qstring& command_text) {
         return synth.success();
     }
 
+#if defined(STRUCTOR_LIVE_TEST_HOOKS)
+    if (command == "fault_global_tinfo_rollback") {
+        qstring global_name;
+        ea_t global_ea = BADADDR;
+        if (!resolve_global_target(global_name, global_ea)) {
+            return false;
+        }
+
+        tinfo_t baseline;
+        baseline.create_simple_type(BTF_UINT64);
+        try {
+            (void)set_tinfo(global_ea, &baseline);
+        } catch (...) {
+        }
+
+        tinfo_t baseline_observed;
+        const bool baseline_ready =
+            get_tinfo(&baseline_observed, global_ea) &&
+            baseline_observed.equals_to(baseline);
+        if (!baseline_ready) {
+            export_api_error(command.c_str(), "Failed to establish rollback baseline type");
+            return false;
+        }
+
+        const ea_t item_head_before = get_item_head(global_ea);
+        const asize_t item_size_before = item_head_before == BADADDR
+            ? 0
+            : get_item_size(item_head_before);
+        const flags64_t address_flags_before = get_flags(global_ea);
+        const flags64_t head_flags_before = item_head_before == BADADDR
+            ? 0
+            : get_flags(item_head_before);
+
+        tinfo_t byte_type;
+        byte_type.create_simple_type(BTF_UINT8);
+        tinfo_t requested;
+        requested.create_ptr(byte_type);
+
+        const bool application_reported_success =
+            detail::apply_global_tinfo_transaction(
+                global_ea,
+                requested,
+                +[](const tinfo_t&, const tinfo_t&) -> bool {
+                    return false;
+                });
+
+        tinfo_t restored;
+        const bool tinfo_restored =
+            get_tinfo(&restored, global_ea) && restored.equals_to(baseline);
+        const ea_t item_head_after = get_item_head(global_ea);
+        const bool data_item_restored =
+            item_head_after == item_head_before &&
+            (item_head_after == BADADDR ||
+             get_item_size(item_head_after) == item_size_before) &&
+            get_flags(global_ea) == address_flags_before &&
+            (item_head_after == BADADDR ||
+             get_flags(item_head_after) == head_flags_before);
+        const bool success =
+            !application_reported_success &&
+            tinfo_restored &&
+            data_item_restored;
+
+        std::string payload = "\"success\":";
+        append_json_bool(payload, success);
+        payload += ",\"application_reported_success\":";
+        append_json_bool(payload, application_reported_success);
+        payload += ",\"tinfo_restored\":";
+        append_json_bool(payload, tinfo_restored);
+        payload += ",\"data_item_restored\":";
+        append_json_bool(payload, data_item_restored);
+        export_api_json(command.c_str(), payload);
+        return success;
+    }
+#endif
+
     if (command == "analyze_variable_type") {
         qstring func_name;
         ea_t func_ea = BADADDR;
@@ -1407,6 +1525,23 @@ static bool run_pending_api_command(const qstring& command_text) {
     return false;
 }
 
+static bool run_pending_api_command(const qstring& command_text) {
+    try {
+        return run_pending_api_command_impl(command_text);
+    } catch (const vd_failure_t& e) {
+        try { export_api_error("exception", e.desc()); } catch (...) {}
+        return false;
+    } catch (const std::exception& e) {
+        try { export_api_error("exception", e.what()); } catch (...) {}
+        return false;
+    } catch (...) {
+        try {
+            export_api_error("exception", "API command raised an unknown exception");
+        } catch (...) {}
+        return false;
+    }
+}
+
 } // namespace
 
 // Thread-local storage for last result info (must be defined before use)
@@ -1448,7 +1583,12 @@ static error_t idaapi idc_structor_synthesize_by_name(idc_value_t* argv, idc_val
     ea_t func_ea = argv[0].vtype == VT_INT64 ? argv[0].i64 : static_cast<ea_t>(argv[0].num);
     const char* var_name = argv[1].c_str();
 
-    SynthResult result = StructorAPI::instance().synthesize_structure(func_ea, var_name);
+    SynthOptions opts = Config::instance().options();
+    opts.interactive_mode = false;
+    opts.auto_open_struct = false;
+    opts.highlight_changes = false;
+    SynthResult result = StructorAPI::instance().synthesize_structure(
+        func_ea, var_name, MaterializationMode::PersistAndApply, &opts);
 
     // Store results for helper functions
     g_last_error = result.error_message;
@@ -1677,44 +1817,90 @@ static const char args_no_args[] = { 0 };
 static const char args_func_ea[] = { VT_INT64, 0 };
 static const char args_index[] = { VT_LONG, 0 };
 
+template <idc_func_t* Callback>
+static error_t idaapi guarded_idc_callback(
+    idc_value_t* argv,
+    idc_value_t* res) noexcept
+{
+    try {
+        return Callback(argv, res);
+    } catch (const vd_failure_t& e) {
+        try { g_last_error = e.desc(); } catch (...) {}
+    } catch (const std::exception& e) {
+        try { g_last_error = e.what(); } catch (...) {}
+    } catch (...) {
+        try { g_last_error = "IDC callback raised an unknown exception"; }
+        catch (...) {}
+    }
+    try {
+        if (res != nullptr) {
+            res->set_int64(BADADDR);
+        }
+    } catch (...) {}
+    return eOk;
+}
+
 static const ext_idcfunc_t idc_funcs[] = {
-    { "structor_synthesize", idc_structor_synthesize, args_synthesize, nullptr, 0, EXTFUN_BASE },
-    { "structor_synthesize_by_name", idc_structor_synthesize_by_name, args_synthesize_by_name, nullptr, 0, EXTFUN_BASE },
-    { "structor_synthesize_global", idc_structor_synthesize_global, args_global_synthesize, nullptr, 0, EXTFUN_BASE },
-    { "structor_synthesize_global_by_name", idc_structor_synthesize_global_by_name, args_global_synthesize_by_name, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_error", idc_structor_get_error, args_no_args, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_field_count", idc_structor_get_field_count, args_no_args, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_vtable_tid", idc_structor_get_vtable_tid, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_synthesize", guarded_idc_callback<idc_structor_synthesize>, args_synthesize, nullptr, 0, EXTFUN_BASE },
+    { "structor_synthesize_by_name", guarded_idc_callback<idc_structor_synthesize_by_name>, args_synthesize_by_name, nullptr, 0, EXTFUN_BASE },
+    { "structor_synthesize_global", guarded_idc_callback<idc_structor_synthesize_global>, args_global_synthesize, nullptr, 0, EXTFUN_BASE },
+    { "structor_synthesize_global_by_name", guarded_idc_callback<idc_structor_synthesize_global_by_name>, args_global_synthesize_by_name, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_error", guarded_idc_callback<idc_structor_get_error>, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_field_count", guarded_idc_callback<idc_structor_get_field_count>, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_vtable_tid", guarded_idc_callback<idc_structor_get_vtable_tid>, args_no_args, nullptr, 0, EXTFUN_BASE },
     // Type fixing functions
-    { "structor_fix_function_types", idc_structor_fix_function_types, args_func_ea, nullptr, 0, EXTFUN_BASE },
-    { "structor_fix_variable_type", idc_structor_fix_variable_type, args_synthesize, nullptr, 0, EXTFUN_BASE },
-    { "structor_fix_variable_by_name", idc_structor_fix_variable_by_name, args_synthesize_by_name, nullptr, 0, EXTFUN_BASE },
-    { "structor_analyze_function_types", idc_structor_analyze_function_types, args_func_ea, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_fix_count", idc_structor_get_fix_count, args_no_args, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_fixes_applied", idc_structor_get_fixes_applied, args_no_args, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_fixes_skipped", idc_structor_get_fixes_skipped, args_no_args, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_fix_warning_count", idc_structor_get_fix_warning_count, args_no_args, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_fix_warning", idc_structor_get_fix_warning, args_index, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_fix_diagnostic_count", idc_structor_get_fix_diagnostic_count, args_no_args, nullptr, 0, EXTFUN_BASE },
-    { "structor_get_fix_diagnostic", idc_structor_get_fix_diagnostic, args_index, nullptr, 0, EXTFUN_BASE },
+    { "structor_fix_function_types", guarded_idc_callback<idc_structor_fix_function_types>, args_func_ea, nullptr, 0, EXTFUN_BASE },
+    { "structor_fix_variable_type", guarded_idc_callback<idc_structor_fix_variable_type>, args_synthesize, nullptr, 0, EXTFUN_BASE },
+    { "structor_fix_variable_by_name", guarded_idc_callback<idc_structor_fix_variable_by_name>, args_synthesize_by_name, nullptr, 0, EXTFUN_BASE },
+    { "structor_analyze_function_types", guarded_idc_callback<idc_structor_analyze_function_types>, args_func_ea, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fix_count", guarded_idc_callback<idc_structor_get_fix_count>, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fixes_applied", guarded_idc_callback<idc_structor_get_fixes_applied>, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fixes_skipped", guarded_idc_callback<idc_structor_get_fixes_skipped>, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fix_warning_count", guarded_idc_callback<idc_structor_get_fix_warning_count>, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fix_warning", guarded_idc_callback<idc_structor_get_fix_warning>, args_index, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fix_diagnostic_count", guarded_idc_callback<idc_structor_get_fix_diagnostic_count>, args_no_args, nullptr, 0, EXTFUN_BASE },
+    { "structor_get_fix_diagnostic", guarded_idc_callback<idc_structor_get_fix_diagnostic>, args_index, nullptr, 0, EXTFUN_BASE },
 };
 
-static void register_idc_funcs() {
-    for (const auto& f : idc_funcs) {
-        add_idc_func(f);
+static constexpr std::size_t kIdcFuncCount =
+    sizeof(idc_funcs) / sizeof(idc_funcs[0]);
+static bool g_idc_func_registered[kIdcFuncCount] = {};
+
+static bool unregister_idc_funcs() {
+    bool removed = true;
+    for (std::size_t i = kIdcFuncCount; i > 0; --i) {
+        const std::size_t index = i - 1;
+        if (g_idc_func_registered[index] &&
+            del_idc_func(idc_funcs[index].name)) {
+            g_idc_func_registered[index] = false;
+        }
+        removed = !g_idc_func_registered[index] && removed;
     }
+    return removed;
 }
 
-static void unregister_idc_funcs() {
-    for (const auto& f : idc_funcs) {
-        del_idc_func(f.name);
+static bool register_idc_funcs() {
+    for (bool registered : g_idc_func_registered) {
+        if (registered) {
+            return false;
+        }
     }
+    for (std::size_t i = 0; i < kIdcFuncCount; ++i) {
+        if (!add_idc_func(idc_funcs[i])) {
+            (void)unregister_idc_funcs();
+            return false;
+        }
+        g_idc_func_registered[i] = true;
+    }
+    return true;
 }
 
-// Hex-Rays callback for automatic type fixing
-static ssize_t idaapi hexrays_callback(void* ud, hexrays_event_t event, va_list va);
+// IDC functions and UI actions are process-global host registrations. Keep
+// their lifetime independent of any one PLUGIN_MULTI database instance.
+static std::size_t g_shared_service_refcount = 0;
 
-/// Plugin descriptor - owns the action handler to ensure proper lifetime
+/// Per-database plugin instance. Process-global UI/IDC registrations are
+/// reference-counted separately.
 class StructorPlugin : public plugmod_t, public event_listener_t {
 public:
     StructorPlugin();
@@ -1722,16 +1908,17 @@ public:
 
     bool idaapi run(size_t arg) override;
     ssize_t idaapi on_event(ssize_t code, va_list va) override;
+    [[nodiscard]] bool initialized() const noexcept { return initialized_; }
 
 private:
     void cleanup();
     void run_pending_auto_synth();
 
-    SynthActionHandler action_handler_;  // Owned by plugin, passed to IDA
-    MatchExistingActionHandler match_action_handler_;
     HostIntegration host_integration_;
     bool initialized_ = false;
     bool cleaned_up_ = false;
+    bool ui_listener_hooked_ = false;
+    bool pending_shared_registration_ = false;
 
     // Pending auto-synthesis from env var
     ea_t pending_synth_ea_ = BADADDR;
@@ -1745,31 +1932,39 @@ private:
 };
 
 StructorPlugin::StructorPlugin() {
+    try {
     // Load configuration
-    Config::instance().load();
+    if (!Config::instance().load()) {
+        msg("Structor: configuration rejected; retaining the previous valid options\n");
+    }
 
-    // Register IDC functions
-    register_idc_funcs();
-
-    // Hook UI notifications to cleanup before widget destruction
-    hook_event_listener(HT_UI, this);
+    // Hook UI notifications to cleanup before widget destruction.
+    if (!hook_event_listener(HT_UI, this)) {
+        throw std::runtime_error("failed to install UI event listener");
+    }
+    ui_listener_hooked_ = true;
 
     // Install Hex-Rays callback for automatic type fixing/global rewrites
-    if (host_integration_.install_hexrays_hooks()) {
-        msg("Structor: Hex-Rays callback installed (auto_fix_types=%s)\n",
-            Config::instance().options().auto_fix_types ? "true" : "false");
-    } else {
-        msg("Structor: Failed to install Hex-Rays callback\n");
+    if (!host_integration_.install_hexrays_hooks()) {
+        throw std::runtime_error("failed to install Hex-Rays callback");
     }
+    msg("Structor: Hex-Rays callback installed (auto_fix_types=%s)\n",
+        Config::instance().options().auto_fix_types ? "true" : "false");
 
-    // Initialize UI - pass our action handler which we own
-    if (ui::initialize(&action_handler_, &match_action_handler_)) {
-        initialized_ = true;
-        msg("Structor %s: Plugin initialized (hotkey: %s)\n",
-            PLUGIN_VERSION, Config::instance().hotkey());
-    } else {
-        msg("Structor: Failed to initialize UI\n");
+    if (g_shared_service_refcount == 0) {
+        if (!register_idc_funcs()) {
+            throw std::runtime_error("failed to register IDC functions");
+        }
+        pending_shared_registration_ = true;
+        if (!ui::initialize()) {
+            throw std::runtime_error("failed to initialize UI");
+        }
     }
+    ++g_shared_service_refcount;
+    pending_shared_registration_ = false;
+    initialized_ = true;
+    msg("Structor %s: Plugin initialized (hotkey: %s)\n",
+        PLUGIN_VERSION, Config::instance().hotkey());
 
     const char* api_env = getenv(kApiCommandEnv);
     if (api_env && *api_env) {
@@ -1837,6 +2032,43 @@ StructorPlugin::StructorPlugin() {
         }
         run_pending_auto_synth();
     }
+    } catch (const vd_failure_t& e) {
+        msg("Structor: initialization failed: %s\n", e.desc().c_str());
+    } catch (const std::exception& e) {
+        msg("Structor: initialization failed: %s\n", e.what());
+    } catch (...) {
+        msg("Structor: initialization raised an unknown exception\n");
+    }
+
+    if (!initialized_) {
+        // Constructor failures must not leak callbacks or IDC registrations;
+        // a partially constructed plugmod_t has no destructor callback yet.
+        bool registrations_removed = true;
+        if (pending_shared_registration_ || g_shared_service_refcount == 0) {
+            try {
+                const bool ui_removed = ui::shutdown();
+                const bool idc_removed = unregister_idc_funcs();
+                registrations_removed = ui_removed && idc_removed;
+            } catch (...) {
+                registrations_removed = false;
+            }
+            pending_shared_registration_ = false;
+        }
+        try { host_integration_.shutdown(); } catch (...) {}
+        if (ui_listener_hooked_) {
+            try {
+                if (unhook_event_listener(HT_UI, this)) {
+                    ui_listener_hooked_ = false;
+                }
+            } catch (...) {}
+        }
+        cleaned_up_ = true;
+        if (!registrations_removed || ui_listener_hooked_) {
+            msg("Structor: CRITICAL: retained host registration after failed "
+                "initialization\n");
+            std::terminate();
+        }
+    }
 }
 
 void StructorPlugin::run_pending_auto_synth() {
@@ -1847,7 +2079,8 @@ void StructorPlugin::run_pending_auto_synth() {
         && pending_global_synth_name_.empty()) {
         return;
     }
-    auto_synth_done_ = true;
+    try {
+        auto_synth_done_ = true;
 
     // Wait for auto-analysis to complete
     auto_wait();
@@ -1912,18 +2145,42 @@ void StructorPlugin::run_pending_auto_synth() {
     g_last_vtable_tid = result.vtable_tid;
     maybe_export_last_result(result, "auto");
 
-    if (result.success()) {
-        msg("Structor: Auto-synthesis OK - tid=0x%llx fields=%d\n",
-            (unsigned long long)result.struct_tid, result.fields_created);
-    } else {
-        msg("Structor: Auto-synthesis FAILED - %s\n",
-            result.error_message.empty() ? synth_error_str(result.error) : result.error_message.c_str());
+        if (result.success()) {
+            msg("Structor: Auto-synthesis OK - tid=0x%llx fields=%d\n",
+                (unsigned long long)result.struct_tid, result.fields_created);
+        } else {
+            msg("Structor: Auto-synthesis FAILED - %s\n",
+                result.error_message.empty() ? synth_error_str(result.error) : result.error_message.c_str());
+        }
+    } catch (const vd_failure_t& e) {
+        g_last_error = e.desc();
+        g_last_field_count = 0;
+        g_last_vtable_tid = BADADDR;
+        msg("Structor: Auto-synthesis failed: %s\n", e.desc().c_str());
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        g_last_field_count = 0;
+        g_last_vtable_tid = BADADDR;
+        msg("Structor: Auto-synthesis failed: %s\n", e.what());
+    } catch (...) {
+        g_last_error = "Auto-synthesis raised an unknown exception";
+        g_last_field_count = 0;
+        g_last_vtable_tid = BADADDR;
+        msg("Structor: Auto-synthesis raised an unknown exception\n");
     }
 }
 
 StructorPlugin::~StructorPlugin() {
-    unhook_event_listener(HT_UI, this);
     cleanup();
+    if (ui_listener_hooked_) {
+        // A non-global event listener may already have been removed by the
+        // kernel during database close. The single-listener API reports false
+        // in that valid state, so use the documented idempotent all-databases
+        // removal operation instead of treating false as retained state.
+        remove_event_listener(this);
+        ui_listener_hooked_ = false;
+    }
+    term_hexrays_plugin();
 }
 
 void StructorPlugin::cleanup() {
@@ -1932,11 +2189,19 @@ void StructorPlugin::cleanup() {
 
     host_integration_.shutdown();
 
-    // Unregister IDC functions
-    unregister_idc_funcs();
-
     if (initialized_) {
-        ui::shutdown();
+        if (g_shared_service_refcount > 0) {
+            --g_shared_service_refcount;
+        }
+        if (g_shared_service_refcount == 0) {
+            const bool ui_removed = ui::shutdown();
+            const bool idc_removed = unregister_idc_funcs();
+            if (!ui_removed || !idc_removed) {
+                msg("Structor: CRITICAL: retained process-global host "
+                    "registration during shutdown\n");
+                std::terminate();
+            }
+        }
 
         // Save configuration if dirty
         if (Config::instance().is_dirty()) {
@@ -1947,62 +2212,100 @@ void StructorPlugin::cleanup() {
 }
 
 ssize_t StructorPlugin::on_event(ssize_t code, va_list /*va*/) {
-    switch (code) {
-        case ui_database_closed:
-            // Database closed - cleanup before Qt widgets are destroyed
-            cleanup();
-            break;
-        default:
-            break;
+    try {
+        switch (code) {
+            case ui_database_closed:
+                // Database closed - cleanup before Qt widgets are destroyed
+                cleanup();
+                break;
+            default:
+                break;
+        }
+    } catch (const std::exception& e) {
+        msg("Structor: UI event cleanup failed: %s\n", e.what());
+    } catch (...) {
+        msg("Structor: UI event cleanup raised an unknown exception\n");
     }
     return 0;
 }
 
 bool StructorPlugin::run(size_t arg) {
-    if (!initialized_) {
-        warning("Structor plugin not properly initialized");
-        return false;
-    }
+    try {
+        if (!initialized_) {
+            warning("Structor plugin not properly initialized");
+            return false;
+        }
 
-    // Get current vdui if in pseudocode view
-    TWidget* widget = get_current_widget();
-    vdui_t* vdui = get_widget_vdui(widget);
+        // Get current vdui if in pseudocode view
+        TWidget* widget = get_current_widget();
+        vdui_t* vdui = get_widget_vdui(widget);
 
-    if (!vdui) {
-        info("Structor: Please place cursor on a variable in the pseudocode view\n"
-             "and use %s or right-click -> '%s'",
-             Config::instance().hotkey(), ACTION_LABEL);
+        if (!vdui) {
+            info("Structor: Please place cursor on a variable in the pseudocode view\n"
+                 "and use %s or right-click -> '%s'",
+                 Config::instance().hotkey(), ACTION_LABEL);
+            return true;
+        }
+
+        SynthResult result = ui::execute_synthesis(vdui);
+
+        if (result.success()) {
+            if (Config::instance().interactive_mode()) {
+                ui::show_result_dialog(result);
+            }
+        } else {
+            qstring errmsg;
+            errmsg.sprnt("Structure synthesis failed: %s", synth_error_str(result.error));
+            if (!result.error_message.empty()) {
+                errmsg.cat_sprnt("\n%s", result.error_message.c_str());
+            }
+            warning("%s", errmsg.c_str());
+        }
+
         return true;
+    } catch (const vd_failure_t& e) {
+        warning("Structor: plugin action failed: %s", e.desc().c_str());
+    } catch (const std::exception& e) {
+        warning("Structor: plugin action failed: %s", e.what());
+    } catch (...) {
+        warning("Structor: plugin action raised an unknown exception");
     }
-
-    // Execute synthesis
-    SynthResult result = ui::execute_synthesis(vdui);
-
-    if (result.success()) {
-        if (Config::instance().interactive_mode()) {
-            ui::show_result_dialog(result);
-        }
-    } else {
-        qstring errmsg;
-        errmsg.sprnt("Structure synthesis failed: %s", synth_error_str(result.error));
-        if (!result.error_message.empty()) {
-            errmsg.cat_sprnt("\n%s", result.error_message.c_str());
-        }
-        warning("%s", errmsg.c_str());
-    }
-
-    return true;
+    return false;
 }
 
 // Plugin information
 static plugmod_t* idaapi init() {
-    // Check for Hex-Rays decompiler
-    if (!init_hexrays_plugin()) {
-        msg("Structor: Hex-Rays decompiler not found\n");
-        return nullptr;
-    }
+    bool hexrays_initialized = false;
+    try {
+        // Check for Hex-Rays decompiler
+        if (!init_hexrays_plugin()) {
+            msg("Structor: Hex-Rays decompiler not found\n");
+            return nullptr;
+        }
+        hexrays_initialized = true;
 
-    return new StructorPlugin();
+        std::unique_ptr<StructorPlugin> plugin =
+            std::make_unique<StructorPlugin>();
+        if (!plugin->initialized()) {
+            return nullptr;
+        }
+        plugmod_t* result = plugin.release();
+        hexrays_initialized = false;
+        return result;
+    } catch (const std::exception& e) {
+        if (hexrays_initialized) {
+            term_hexrays_plugin();
+            hexrays_initialized = false;
+        }
+        msg("Structor: plugin initialization failed: %s\n", e.what());
+    } catch (...) {
+        if (hexrays_initialized) {
+            term_hexrays_plugin();
+            hexrays_initialized = false;
+        }
+        msg("Structor: plugin initialization raised an unknown exception\n");
+    }
+    return nullptr;
 }
 
 } // namespace structor

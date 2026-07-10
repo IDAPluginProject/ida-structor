@@ -33,10 +33,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_result",
           "size": 24,
-          "alignment": 1,
+          "alignment": 4,
+          "packing": null,
           "source_func_name": "_inspect_header",
           "source_var": "result",
           "field_count": 9,
@@ -76,20 +78,33 @@
               "union_members": []
             },
             {
-              "name": "f32_8",
+              "name": "union_8",
               "offset": 8,
               "size": 4,
-              "semantic": "float",
-              "type": "float",
+              "semantic": "unknown",
+              "type": "unsigned __int32",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "unsigned __int32"
+                },
+                {
+                  "name": "f32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "float"
+                }
+              ]
             },
             {
               "name": "u16_C",
@@ -112,7 +127,7 @@
               "offset": 14,
               "size": 2,
               "semantic": "uint",
-              "type": "signed __int32",
+              "type": "unsigned __int16",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
@@ -128,7 +143,7 @@
               "offset": 14,
               "size": 2,
               "semantic": "uint",
-              "type": "signed __int32",
+              "type": "unsigned __int16",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
@@ -144,7 +159,7 @@
               "offset": 14,
               "size": 2,
               "semantic": "uint",
-              "type": "signed __int32",
+              "type": "unsigned __int16",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
@@ -191,7 +206,272 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> inspect_header\nauto_result *__fastcall inspect_header(auto_result *result) {\n    sink ^= result->u32_0;\n    sink ^= result->u32_4;\n    sink ^= LODWORD(result->f32_8);\n    sink ^= result->u16_C;\n    return result;\n}\n<<<\n\n>>> inspect_float_view\nfloat __fastcall inspect_float_view(auto_result *a1) {\n    float result; // s0\n\n    result = a1->f32_8;\n    sink ^= LODWORD(result);\n    return result;\n}\n<<<\n\n>>> inspect_bits\nauto_result *__fastcall inspect_bits(auto_result *result) {\n    auto_result_flags_E bf_E_0; // [xsp+Eh] [xbp-12h]\n\n    bf_E_0 = result->bf_E_0;\n    sink ^= bf_E_0 & 3;\n    sink ^= ((int)bf_E_0 >> 2) & 7;\n    sink ^= ((int)bf_E_0 >> 5) & 1;\n    return result;\n}\n<<<\n\n>>> inspect_bytes\nauto_result *__fastcall inspect_bytes(auto_result *result) {\n    sink ^= LOBYTE(result->bf_E_2);\n    sink ^= HIBYTE(result->bf_E_2);\n    sink ^= LOBYTE(result->bf_E_5);\n    sink ^= HIBYTE(result->bf_E_5);\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> inspect_header\nauto_result *__fastcall inspect_header(auto_result *result) {\n    sink ^= result->u32_0;\n    sink ^= result->u32_4;\n    sink ^= result->union_8.u32_8;\n    sink ^= result->u16_C;\n    return result;\n}\n<<<\n\n>>> inspect_float_view\nfloat __fastcall inspect_float_view(auto_result *a1) {\n    float result; // s0\n\n    result = a1->union_8.f32_8;\n    sink ^= LODWORD(result);\n    return result;\n}\n<<<\n\n>>> inspect_bits\nauto_result *__fastcall inspect_bits(auto_result *result) {\n    unsigned __int16 v1; // [xsp+Eh] [xbp-12h]\n\n    v1 = *((_WORD *)result + 7);\n    sink ^= v1 & 3;\n    sink ^= ((int)v1 >> 2) & 7;\n    sink ^= ((int)v1 >> 5) & 1;\n    return result;\n}\n<<<\n\n>>> inspect_bytes\nauto_result *__fastcall inspect_bytes(auto_result *result) {\n    sink ^= result->u8s_10[0];\n    sink ^= result->u8s_10[1];\n    sink ^= result->u8s_10[2];\n    sink ^= result->u8s_10[3];\n    return result;\n}\n<<<\n"
+    },
+    {
+      "name": "union_alternative_limit_failure",
+      "synth": {
+        "kind": "function",
+        "target": "inspect_header",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "inspect_header",
+        "inspect_float_view"
+      ],
+      "config": {
+        "z3_max_union_alternatives": 1
+      },
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "z3_status": "resource_limit",
+        "used_fallback": false,
+        "resource_limit_kind": "union_alternatives"
+      },
+      "golden_result": {
+        "success": false,
+        "error": "Synthesis resource limit exceeded",
+        "error_message": "mandatory storage interpretations exceed the per-union alternative limit",
+        "fields_created": 0,
+        "vtable_slots": 0,
+        "propagated_to": [],
+        "failed_sites": [],
+        "z3": {
+          "status": "resource_limit",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": {
+          "kind": "union_alternatives",
+          "configured_limit": 1,
+          "observed_value": 2,
+          "phase": "synthesis_preflight"
+        },
+        "structure": null
+      },
+      "golden_pseudocode": ">>> inspect_header\nunsigned int *__fastcall inspect_header(unsigned int *result) {\n    sink ^= *result;\n    sink ^= result[1];\n    sink ^= result[2];\n    sink ^= *((unsigned __int16 *)result + 6);\n    return result;\n}\n<<<\n\n>>> inspect_float_view\nfloat __fastcall inspect_float_view(__int64 a1) {\n    float result; // s0\n\n    result = *(float *)(a1 + 8);\n    sink ^= LODWORD(result);\n    return result;\n}\n<<<\n"
+    },
+    {
+      "name": "array_candidate_cap_preserves_scalar_evidence",
+      "synth": {
+        "kind": "function",
+        "target": "inspect_header",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "inspect_header",
+        "inspect_bytes"
+      ],
+      "config": {
+        "z3_min_array_elements": 2,
+        "z3_max_array_elements": 2
+      },
+      "expect": {
+        "success": true,
+        "z3_status": "success",
+        "used_fallback": false,
+        "max_array_count": 2,
+        "required_field_offsets": [
+          16,
+          17,
+          18,
+          19
+        ]
+      },
+      "golden_result": {
+        "success": true,
+        "error": "Success",
+        "error_message": "",
+        "fields_created": 9,
+        "vtable_slots": 0,
+        "propagated_to": [
+          "_inspect_bits",
+          "_inspect_bytes",
+          "_inspect_float_view",
+          "_inspect_header",
+          "_main"
+        ],
+        "failed_sites": [],
+        "z3": {
+          "status": "success",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": null,
+        "structure": {
+          "name": "auto_result",
+          "size": 24,
+          "alignment": 4,
+          "packing": null,
+          "source_func_name": "_inspect_header",
+          "source_var": "result",
+          "field_count": 9,
+          "non_padding_field_count": 9,
+          "provenance": [],
+          "fields": [
+            {
+              "name": "u32_0",
+              "offset": 0,
+              "size": 4,
+              "semantic": "uint",
+              "type": "unsigned __int32",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u32_4",
+              "offset": 4,
+              "size": 4,
+              "semantic": "uint",
+              "type": "unsigned __int32",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "union_8",
+              "offset": 8,
+              "size": 4,
+              "semantic": "unknown",
+              "type": "unsigned __int32",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": true,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": [
+                {
+                  "name": "u32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "unsigned __int32"
+                },
+                {
+                  "name": "f32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "float"
+                }
+              ]
+            },
+            {
+              "name": "u16s_c",
+              "offset": 12,
+              "size": 4,
+              "semantic": "array",
+              "type": "unsigned __int16[2]",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": true,
+              "array_count": 2,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u8_10",
+              "offset": 16,
+              "size": 1,
+              "semantic": "uint",
+              "type": "unsigned __int8",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u8_11",
+              "offset": 17,
+              "size": 1,
+              "semantic": "uint",
+              "type": "unsigned __int8",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u8_12",
+              "offset": 18,
+              "size": 1,
+              "semantic": "uint",
+              "type": "unsigned __int8",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u8_13",
+              "offset": 19,
+              "size": 1,
+              "semantic": "uint",
+              "type": "unsigned __int8",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u32_14",
+              "offset": 20,
+              "size": 4,
+              "semantic": "uint",
+              "type": "unsigned __int32",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            }
+          ],
+          "vtable": null
+        }
+      },
+      "golden_pseudocode": ">>> inspect_header\nauto_result *__fastcall inspect_header(auto_result *result) {\n    sink ^= result->u32_0;\n    sink ^= result->u32_4;\n    sink ^= result->union_8.u32_8;\n    sink ^= result->u16s_c[0];\n    return result;\n}\n<<<\n\n>>> inspect_bytes\nauto_result *__fastcall inspect_bytes(auto_result *result) {\n    sink ^= result->u8_10;\n    sink ^= result->u8_11;\n    sink ^= result->u8_12;\n    sink ^= result->u8_13;\n    return result;\n}\n<<<\n"
     }
   ]
 }

@@ -19,6 +19,10 @@
 #include <thread>
 #include <vector>
 #include <cstdint>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <type_traits>
 
 namespace structor {
 namespace algorithms {
@@ -186,8 +190,13 @@ struct Interval {
     
     Interval() : start(0), end(0), id(-1) {}
     Interval(int64_t s, int64_t e, int32_t i) : start(s), end(e), id(i) {}
+
+    [[nodiscard]] bool empty() const noexcept {
+        return start >= end;
+    }
     
     bool overlaps(const Interval& other) const noexcept {
+        if (empty() || other.empty()) return false;
         return start < other.end && other.start < end;
     }
 };
@@ -201,22 +210,25 @@ struct Interval {
  * Much faster than O(n²) pairwise comparison for large n with few overlaps.
  */
 inline std::vector<std::pair<int32_t, int32_t>> find_overlapping_pairs(
-    std::vector<Interval>& intervals)
+    const std::vector<Interval>& intervals)
 {
     std::vector<std::pair<int32_t, int32_t>> result;
     
     if (intervals.size() < 2) return result;
     
-    // Event types: 0 = start, 1 = end
+    // Events refer to interval indices rather than IDs. IDs are caller-facing
+    // labels and are not required for removing the exact active interval.
     struct Event {
         int64_t point;
-        int type;      // 0 = start, 1 = end
-        int32_t id;
+        bool is_start;
+        size_t interval_index;
         
         bool operator<(const Event& other) const noexcept {
             if (point != other.point) return point < other.point;
-            // Process starts before ends at same point (open interval semantics)
-            return type < other.type;
+            // Intervals are half-open [start, end), so an interval ending at a
+            // point must be removed before another interval starts there.
+            if (is_start != other.is_start) return !is_start;
+            return interval_index < other.interval_index;
         }
     };
     
@@ -224,31 +236,37 @@ inline std::vector<std::pair<int32_t, int32_t>> find_overlapping_pairs(
     std::vector<Event> events;
     events.reserve(intervals.size() * 2);
     
-    for (const auto& iv : intervals) {
-        events.push_back({iv.start, 0, iv.id});
-        events.push_back({iv.end, 1, iv.id});
+    for (size_t i = 0; i < intervals.size(); ++i) {
+        const auto& iv = intervals[i];
+        if (iv.empty()) {
+            continue;
+        }
+        events.push_back({iv.start, true, i});
+        events.push_back({iv.end, false, i});
     }
     
     // Sort events
     std::sort(events.begin(), events.end());
     
     // Sweep line - track active intervals
-    SmallVector<int32_t, 16> active;
+    SmallVector<size_t, 16> active;
     
     for (const auto& event : events) {
-        if (event.type == 0) {
+        if (event.is_start) {
             // Start event: report overlaps with all currently active
-            for (int32_t active_id : active) {
+            const int32_t event_id = intervals[event.interval_index].id;
+            for (size_t active_index : active) {
+                const int32_t active_id = intervals[active_index].id;
                 result.emplace_back(
-                    std::min(active_id, event.id),
-                    std::max(active_id, event.id)
+                    std::min(active_id, event_id),
+                    std::max(active_id, event_id)
                 );
             }
-            active.push_back(event.id);
+            active.push_back(event.interval_index);
         } else {
             // End event: remove from active
             for (size_t i = 0; i < active.size(); ++i) {
-                if (active[i] == event.id) {
+                if (active[i] == event.interval_index) {
                     // Swap with last and pop
                     active[i] = active.back();
                     active.pop_back();
@@ -258,7 +276,7 @@ inline std::vector<std::pair<int32_t, int32_t>> find_overlapping_pairs(
         }
     }
     
-    // Remove duplicates (can happen with touching intervals)
+    // Canonicalize result ordering for deterministic solver construction.
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     
@@ -281,14 +299,41 @@ std::vector<std::pair<int32_t, int32_t>> detect_overlaps(
     if (n < 2) {
         return {};
     }
+    if (n > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::length_error("candidate index exceeds int32_t");
+    }
     
     // For small n, O(n²) is faster due to lower constant factors
     if (n <= threshold) {
         std::vector<std::pair<int32_t, int32_t>> result;
         
         for (size_t i = 0; i < n; ++i) {
+            const int64_t i_start =
+                static_cast<int64_t>(candidates[i].offset);
+            const auto i_size =
+                static_cast<std::uint64_t>(candidates[i].size);
+            if (i_size == 0 || i_size > static_cast<std::uint64_t>(
+                    std::numeric_limits<int64_t>::max()) ||
+                i_start > std::numeric_limits<int64_t>::max() -
+                    static_cast<int64_t>(i_size)) {
+                continue;
+            }
+            const int64_t i_end =
+                i_start + static_cast<int64_t>(i_size);
             for (size_t j = i + 1; j < n; ++j) {
-                if (candidates[i].overlaps(candidates[j])) {
+                const int64_t j_start =
+                    static_cast<int64_t>(candidates[j].offset);
+                const auto j_size =
+                    static_cast<std::uint64_t>(candidates[j].size);
+                if (j_size == 0 || j_size > static_cast<std::uint64_t>(
+                        std::numeric_limits<int64_t>::max()) ||
+                    j_start > std::numeric_limits<int64_t>::max() -
+                        static_cast<int64_t>(j_size)) {
+                    continue;
+                }
+                const int64_t j_end =
+                    j_start + static_cast<int64_t>(j_size);
+                if (i_start < j_end && j_start < i_end) {
                     result.emplace_back(
                         static_cast<int32_t>(i),
                         static_cast<int32_t>(j)
@@ -305,9 +350,19 @@ std::vector<std::pair<int32_t, int32_t>> detect_overlaps(
     intervals.reserve(n);
     
     for (size_t i = 0; i < n; ++i) {
+        const int64_t offset = static_cast<int64_t>(candidates[i].offset);
+        const auto raw_size = static_cast<std::uint64_t>(candidates[i].size);
+        if (raw_size > static_cast<std::uint64_t>(
+                std::numeric_limits<int64_t>::max()) ||
+            offset > std::numeric_limits<int64_t>::max() -
+                static_cast<int64_t>(raw_size)) {
+            intervals.emplace_back(
+                offset, offset, static_cast<int32_t>(i));
+            continue;
+        }
         intervals.emplace_back(
-            candidates[i].offset,
-            candidates[i].offset + static_cast<int64_t>(candidates[i].size),
+            offset,
+            offset + static_cast<int64_t>(raw_size),
             static_cast<int32_t>(i)
         );
     }
@@ -415,41 +470,49 @@ std::vector<std::vector<int32_t>> compute_coverage_map(
     const CandidateContainer& candidates)
 {
     std::vector<std::vector<int32_t>> coverage(accesses.size());
-    
-    // Sort candidates by offset for better cache locality
-    std::vector<size_t> sorted_indices(candidates.size());
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        sorted_indices[i] = i;
+    if (candidates.size() >
+        static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::length_error("candidate index exceeds int32_t");
     }
-    
-    std::sort(sorted_indices.begin(), sorted_indices.end(),
-        [&candidates](size_t a, size_t b) {
-            return candidates[a].offset < candidates[b].offset;
-        });
-    
-    // For each access, find covering candidates
+
+    const auto checked_end = [](auto offset, auto raw_size) {
+        using Offset = std::decay_t<decltype(offset)>;
+        using Size = std::decay_t<decltype(raw_size)>;
+        static_assert(std::is_integral_v<Offset> && std::is_integral_v<Size>);
+        if constexpr (std::is_signed_v<Size>) {
+            if (raw_size < 0) {
+                return std::optional<Offset>{};
+            }
+        }
+        const auto size = static_cast<std::uintmax_t>(raw_size);
+        if (size > static_cast<std::uintmax_t>(
+                std::numeric_limits<Offset>::max())) {
+            return std::optional<Offset>{};
+        }
+        const Offset delta = static_cast<Offset>(size);
+        if (offset > std::numeric_limits<Offset>::max() - delta) {
+            return std::optional<Offset>{};
+        }
+        return std::optional<Offset>{static_cast<Offset>(offset + delta)};
+    };
+
+    // Linear scanning is intentional: candidates are not monotone by end
+    // offset when ordered by start, so a lower_bound on end can skip an early
+    // long interval. Complexity is O(A*C) time and O(A*C) output space.
     for (size_t ai = 0; ai < accesses.size(); ++ai) {
         const auto& access = accesses[ai];
-        auto access_start = access.offset;
-        auto access_end = access.offset + static_cast<decltype(access.offset)>(access.size);
-        
-        // Binary search to find first potentially covering candidate
-        auto it = std::lower_bound(sorted_indices.begin(), sorted_indices.end(),
-            access_start,
-            [&candidates](size_t idx, auto offset) {
-                return candidates[idx].offset + 
-                       static_cast<decltype(offset)>(candidates[idx].size) <= offset;
-            });
-        
-        // Check candidates that might cover this access
-        for (; it != sorted_indices.end(); ++it) {
-            const auto& cand = candidates[*it];
-            if (cand.offset >= access_end) break;  // Past the access
-            
-            // Check if candidate covers access
-            auto cand_end = cand.offset + static_cast<decltype(cand.offset)>(cand.size);
-            if (cand.offset <= access_start && cand_end >= access_end) {
-                coverage[ai].push_back(static_cast<int32_t>(*it));
+        const auto access_end = checked_end(access.offset, access.size);
+        if (!access_end.has_value() || access.size == 0) {
+            continue;
+        }
+        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+            const auto& cand = candidates[ci];
+            const auto cand_end = checked_end(cand.offset, cand.size);
+            if (!cand_end.has_value() || cand.size == 0) {
+                continue;
+            }
+            if (cand.offset <= access.offset && *cand_end >= *access_end) {
+                coverage[ai].push_back(static_cast<int32_t>(ci));
             }
         }
     }

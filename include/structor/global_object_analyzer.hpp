@@ -26,9 +26,11 @@ public:
     [[nodiscard]] GlobalObjectAnalysis analyze(ea_t root_ea);
 
 private:
-    const SynthOptions& options_;
+    SynthOptions options_;
 };
 
+/// Registry mutation and rewrite entry points are main-thread-only. Off-thread
+/// calls are rejected to keep callback-owned ctree state serialized.
 void register_global_rewrite_info(
     const GlobalObjectAnalysis& analysis,
     const SynthStruct& synth_struct,

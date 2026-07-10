@@ -18,16 +18,20 @@ namespace utils {
 // ============================================================================
 
 /// Get the cfunc_t for a function address
-[[nodiscard]] inline cfuncptr_t get_cfunc(ea_t func_ea) {
-    func_t* func = get_func(func_ea);
-    if (!func) {
+[[nodiscard]] inline cfuncptr_t get_cfunc(ea_t func_ea) noexcept {
+    try {
+        func_t* func = get_func(func_ea);
+        if (!func) {
+            cfuncptr_t empty{static_cast<cfunc_t*>(nullptr)};
+            return empty;
+        }
+
+        hexrays_failure_t hf;
+        return decompile(func, &hf, DECOMP_NO_WAIT);
+    } catch (...) {
         cfuncptr_t empty{static_cast<cfunc_t*>(nullptr)};
         return empty;
     }
-
-    hexrays_failure_t hf;
-    cfuncptr_t cfunc = decompile(func, &hf, DECOMP_NO_WAIT);
-    return cfunc;
 }
 
 /// Find a local variable by name in a function
@@ -161,7 +165,9 @@ struct PtrArithInfo {
 
         if (left.valid && !right.valid && expr->y->op == cot_num) {
             info = left;
-            sval_t num_val = expr->y->numval();
+            const auto converted = checked_sval_from_u64(expr->y->numval());
+            if (!converted.has_value()) return PtrArithInfo{};
+            sval_t num_val = *converted;
 
             // Check if left operand is a pointer type - if so, scale by element size
             if (expr->x->type.is_ptr()) {
@@ -169,17 +175,28 @@ struct PtrArithInfo {
                 if (!pointed.empty()) {
                     size_t elem_size = pointed.get_size();
                     if (elem_size != BADSIZE && elem_size > 0) {
-                        num_val *= elem_size;
+                        if (elem_size > static_cast<size_t>(
+                                std::numeric_limits<sval_t>::max())) {
+                            return PtrArithInfo{};
+                        }
+                        const auto scaled = checked_sval_mul(
+                            num_val, static_cast<sval_t>(elem_size));
+                        if (!scaled.has_value()) return PtrArithInfo{};
+                        num_val = *scaled;
                     }
                 }
             }
 
-            info.offset += num_val;
+            const auto combined = checked_sval_add(info.offset, num_val);
+            if (!combined.has_value()) return PtrArithInfo{};
+            info.offset = *combined;
             return info;
         }
         if (right.valid && !left.valid && expr->x->op == cot_num) {
             info = right;
-            sval_t num_val = expr->x->numval();
+            const auto converted = checked_sval_from_u64(expr->x->numval());
+            if (!converted.has_value()) return PtrArithInfo{};
+            sval_t num_val = *converted;
 
             // Check if right operand (the pointer) has a pointer type
             if (expr->y->type.is_ptr()) {
@@ -187,12 +204,21 @@ struct PtrArithInfo {
                 if (!pointed.empty()) {
                     size_t elem_size = pointed.get_size();
                     if (elem_size != BADSIZE && elem_size > 0) {
-                        num_val *= elem_size;
+                        if (elem_size > static_cast<size_t>(
+                                std::numeric_limits<sval_t>::max())) {
+                            return PtrArithInfo{};
+                        }
+                        const auto scaled = checked_sval_mul(
+                            num_val, static_cast<sval_t>(elem_size));
+                        if (!scaled.has_value()) return PtrArithInfo{};
+                        num_val = *scaled;
                     }
                 }
             }
 
-            info.offset += num_val;
+            const auto combined = checked_sval_add(info.offset, num_val);
+            if (!combined.has_value()) return PtrArithInfo{};
+            info.offset = *combined;
             return info;
         }
         if (left.valid && right.valid) {
@@ -207,7 +233,9 @@ struct PtrArithInfo {
         auto left = extract_ptr_arith(expr->x, depth + 1);
         if (left.valid && expr->y->op == cot_num) {
             info = left;
-            sval_t num_val = expr->y->numval();
+            const auto converted = checked_sval_from_u64(expr->y->numval());
+            if (!converted.has_value()) return PtrArithInfo{};
+            sval_t num_val = *converted;
 
             // Check if left operand is a pointer type - if so, scale by element size
             if (expr->x->type.is_ptr()) {
@@ -215,12 +243,21 @@ struct PtrArithInfo {
                 if (!pointed.empty()) {
                     size_t elem_size = pointed.get_size();
                     if (elem_size != BADSIZE && elem_size > 0) {
-                        num_val *= elem_size;
+                        if (elem_size > static_cast<size_t>(
+                                std::numeric_limits<sval_t>::max())) {
+                            return PtrArithInfo{};
+                        }
+                        const auto scaled = checked_sval_mul(
+                            num_val, static_cast<sval_t>(elem_size));
+                        if (!scaled.has_value()) return PtrArithInfo{};
+                        num_val = *scaled;
                     }
                 }
             }
 
-            info.offset -= num_val;
+            const auto combined = checked_sval_sub(info.offset, num_val);
+            if (!combined.has_value()) return PtrArithInfo{};
+            info.offset = *combined;
             return info;
         }
     }
@@ -233,9 +270,28 @@ struct PtrArithInfo {
             // Get element size from type
             tinfo_t elem_type = expr->x->type.get_pointed_object();
             if (!elem_type.empty()) {
-                info.offset += expr->y->numval() * elem_type.get_size();
+                const size_t elem_size = elem_type.get_size();
+                if (elem_size == BADSIZE ||
+                    elem_size > static_cast<size_t>(
+                        std::numeric_limits<sval_t>::max())) {
+                    return PtrArithInfo{};
+                }
+                const auto index = checked_sval_from_u64(expr->y->numval());
+                if (!index.has_value()) return PtrArithInfo{};
+                const auto scaled = checked_sval_mul(
+                    *index,
+                    static_cast<sval_t>(elem_size));
+                if (!scaled.has_value()) return PtrArithInfo{};
+                const auto combined = checked_sval_add(info.offset, *scaled);
+                if (!combined.has_value()) return PtrArithInfo{};
+                info.offset = *combined;
             } else {
-                info.offset += expr->y->numval();
+                const auto index = checked_sval_from_u64(expr->y->numval());
+                if (!index.has_value()) return PtrArithInfo{};
+                const auto combined = checked_sval_add(
+                    info.offset, *index);
+                if (!combined.has_value()) return PtrArithInfo{};
+                info.offset = *combined;
             }
             return info;
         }

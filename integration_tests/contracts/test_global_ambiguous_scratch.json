@@ -12,6 +12,11 @@
         "scramble_scratch",
         "checksum_scratch"
       ],
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "error_contains": "No global/static structure accesses found"
+      },
       "golden_result": {
         "success": false,
         "error": "No dereferences found for variable",
@@ -25,6 +30,7 @@
           "used_z3": false,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": null
       },
       "golden_pseudocode": ">>> fill_scratch\n__int64 __fastcall fill_scratch(__int64 result) {\n    unsigned int i; // [xsp+8h] [xbp-8h]\n\n    for ( i = 0; i < 0x40; ++i )\n        g_scratch[(5 * (_BYTE)i + (_BYTE)result) & 0x3F] = result + 3 * i;\n    return result;\n}\n<<<\n\n>>> scramble_scratch\n__int64 __fastcall scramble_scratch(__int64 result) {\n    _BYTE *v1; // x9\n    unsigned int i; // [xsp+8h] [xbp-8h]\n\n    for ( i = 0; i < 0x40; i += result ) {\n        v1 = &g_scratch[((unsigned __int8)i ^ (unsigned __int8)(7 * result)) & 0x3F];\n        *v1 ^= (_BYTE)i + (_BYTE)result;\n    }\n    return result;\n}\n<<<\n\n>>> checksum_scratch\nunsigned __int64 __fastcall checksum_scratch(int a1) {\n    unsigned int i; // [xsp+Ch] [xbp-14h]\n    unsigned __int64 v3; // [xsp+10h] [xbp-10h]\n\n    v3 = 0;\n    for ( i = 0; i < 0x40; i += a1 )\n        v3 = (unsigned __int8)g_scratch[(3 * (_BYTE)i + (_BYTE)a1) & 0x3F] ^ (2 * v3);\n    return v3;\n}\n<<<\n"

@@ -99,7 +99,10 @@ private:
     void deduplicate_accesses(AccessPattern& pattern);
     void detect_vtable_pattern(AccessPattern& pattern);
 
-    const SynthOptions& options_;
+    // Own the options snapshot. Public construction with SynthOptions{} must
+    // not retain a reference to a temporary, and collection must remain
+    // isolated from later global Config mutations.
+    SynthOptions options_;
 };
 
 } // namespace structor

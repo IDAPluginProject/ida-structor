@@ -27,10 +27,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_result",
-          "size": 68,
-          "alignment": 1,
+          "size": 72,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_use_pointer_field",
           "source_var": "result",
           "field_count": 4,
@@ -105,21 +107,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> use_pointer_field\nauto_result *__fastcall use_pointer_field(auto_result *result) {\n    unsigned __int64 u64_38; // [xsp+8h] [xbp-18h]\n\n    u64_38 = result->u64_38;\n    sink ^= result->u32_0;\n    sink ^= u64_38;\n    sink ^= result->u32_40;\n    sink ^= *(unsigned int *)(u64_38 + 128);\n    sink ^= *(unsigned int *)(u64_38 + 132);\n    return result;\n}\n<<<\n",
-      "expect": {
-        "forbid_fields": [
-          {
-            "offset": 184
-          },
-          {
-            "offset": 188
-          }
-        ],
-        "pseudocode_forbid": [
-          "u32_B8",
-          "u32_BC"
-        ]
-      }
+      "golden_pseudocode": ">>> use_pointer_field\nauto_result *__fastcall use_pointer_field(auto_result *result) {\n    unsigned __int64 u64_38; // [xsp+8h] [xbp-18h]\n\n    u64_38 = result->u64_38;\n    sink ^= result->u32_0;\n    sink ^= u64_38;\n    sink ^= result->u32_40;\n    sink ^= *(unsigned int *)(u64_38 + 128);\n    sink ^= *(unsigned int *)(u64_38 + 132);\n    return result;\n}\n<<<\n"
     }
   ]
 }

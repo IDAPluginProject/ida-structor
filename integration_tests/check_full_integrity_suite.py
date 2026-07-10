@@ -7,6 +7,9 @@ import time
 from pathlib import Path
 
 
+SUITE_TIMEOUT_SECONDS = 900
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -21,7 +24,8 @@ def run(cmd: list[str], *, cwd: Path, label: str) -> None:
     log(f"Suite: {label}")
     log(f"Command: {' '.join(cmd)}")
 
-    proc = subprocess.run(cmd, cwd=cwd, text=True)
+    proc = subprocess.run(
+        cmd, cwd=cwd, text=True, timeout=SUITE_TIMEOUT_SECONDS)
     elapsed = time.monotonic() - start
     if proc.returncode == 0:
         log(f"Suite result: PASS ({elapsed:.1f}s)")
@@ -64,23 +68,27 @@ def main() -> int:
 
     suites = [
         [
-            "python3",
+            sys.executable,
             "integration_tests/check_cmake_embed_consumer.py",
             "--repo-root",
             str(repo_root),
         ],
-        ["python3", "integration_tests/check_cpp_api_surface.py", *common],
-        ["python3", "integration_tests/check_fixture_contracts.py", *common],
-        ["python3", "integration_tests/check_global_recovery_regressions.py", *common],
-        ["python3", "integration_tests/check_weaponstats_regressions.py", *common],
-        ["python3", "integration_tests/check_vtable_regressions.py", *common],
-        ["python3", "integration_tests/check_type_fixer_regressions.py", *common],
+        [sys.executable, "integration_tests/check_cpp_api_surface.py", *common],
+        [sys.executable, "integration_tests/check_fixture_contracts.py", *common],
+        [sys.executable, "integration_tests/check_determinism_regressions.py", *common],
+        [sys.executable, "integration_tests/check_persistence_regressions.py", *common],
+        [sys.executable, "integration_tests/check_global_recovery_regressions.py", *common],
+        [sys.executable, "integration_tests/check_weaponstats_regressions.py", *common],
+        [sys.executable, "integration_tests/check_vtable_regressions.py", *common],
+        [sys.executable, "integration_tests/check_type_fixer_regressions.py", *common],
     ]
 
     labels = [
         "external CMake consumer",
         "C++ API surface",
         "exact fixture contracts",
+        "fresh-database determinism regressions",
+        "structure-persistence regressions",
         "global recovery regressions",
         "WeaponStats regressions",
         "vtable regressions",

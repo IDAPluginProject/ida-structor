@@ -61,6 +61,39 @@ bool is_pointee_access(const utils::PtrArithInfo& arith) {
     return arith.through_pointer_alias || arith.base_indirection > 1;
 }
 
+bool checked_add_sval(sval_t lhs, sval_t rhs, sval_t& out) {
+    if ((rhs > 0 && lhs > std::numeric_limits<sval_t>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<sval_t>::min() - rhs)) {
+        return false;
+    }
+    out = lhs + rhs;
+    return true;
+}
+
+bool checked_mul_sval(sval_t lhs, sval_t rhs, sval_t& out) {
+    if (lhs == 0 || rhs == 0) {
+        out = 0;
+        return true;
+    }
+    if ((lhs == -1 && rhs == std::numeric_limits<sval_t>::min()) ||
+        (rhs == -1 && lhs == std::numeric_limits<sval_t>::min())) {
+        return false;
+    }
+    if (lhs > 0) {
+        if ((rhs > 0 && lhs > std::numeric_limits<sval_t>::max() / rhs) ||
+            (rhs < 0 && rhs < std::numeric_limits<sval_t>::min() / lhs)) {
+            return false;
+        }
+    } else {
+        if ((rhs > 0 && lhs < std::numeric_limits<sval_t>::min() / rhs) ||
+            (rhs < 0 && lhs < std::numeric_limits<sval_t>::max() / rhs)) {
+            return false;
+        }
+    }
+    out = lhs * rhs;
+    return true;
+}
+
 } // namespace
 
 // ============================================================================
@@ -168,6 +201,8 @@ int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
 
         case cot_ult:
         case cot_ule:
+        case cot_slt:
+        case cot_sle:
             process_index_bound(expr);
             break;
 
@@ -293,7 +328,12 @@ utils::PtrArithInfo AccessPatternVisitor::resolve_ptr_arith(const cexpr_t* expr)
 
     const FieldAccess& alias = it->second;
     info.var_idx = target_var_idx_;
-    info.offset += alias.offset;
+    const auto rebased = checked_sval_add(info.offset, alias.offset);
+    if (!rebased.has_value()) {
+        info.valid = false;
+        return info;
+    }
+    info.offset = *rebased;
     if (alias.base_indirection.has_value()) {
         info.base_indirection = static_cast<std::uint8_t>(
             std::min<int>(0xFF, info.base_indirection + *alias.base_indirection));
@@ -376,10 +416,10 @@ void AccessPatternVisitor::process_index_bound(cexpr_t* expr) {
     const cexpr_t* var_expr = nullptr;
     std::uint32_t bound = 0;
 
-    if (expr->x->op == cot_num && expr->y->op == cot_var) {
-        bound = static_cast<std::uint32_t>(expr->x->numval());
-        var_expr = expr->y;
-    } else if (expr->y->op == cot_num && expr->x->op == cot_var) {
+    // Only a variable on the left and a constant on the right establishes an
+    // upper bound.  `constant < variable` is a lower bound and must not be
+    // materialized as a finite array extent.
+    if (expr->y->op == cot_num && expr->x->op == cot_var) {
         bound = static_cast<std::uint32_t>(expr->y->numval());
         var_expr = expr->x;
     } else if (expr->y->op == cot_num && expr->x->op == cot_cast && expr->x->x && expr->x->x->op == cot_var) {
@@ -389,7 +429,7 @@ void AccessPatternVisitor::process_index_bound(cexpr_t* expr) {
         return;
     }
 
-    if (expr->op == cot_ule && bound < 32) {
+    if ((expr->op == cot_ule || expr->op == cot_sle) && bound < 32) {
         ++bound;
     }
 
@@ -416,9 +456,18 @@ void AccessPatternVisitor::flush_pending_symbolic_accesses(int index_var, std::u
 
     for (const auto& pending : it->second) {
         for (std::uint32_t idx = 0; idx < bound; ++idx) {
+            sval_t index_delta = 0;
+            sval_t materialized_offset = 0;
+            if (!checked_mul_sval(
+                    static_cast<sval_t>(idx),
+                    static_cast<sval_t>(pending.stride), index_delta) ||
+                !checked_add_sval(
+                    pending.base_offset, index_delta, materialized_offset)) {
+                continue;
+            }
             FieldAccess access;
             access.insn_ea = pending.insn_ea;
-            access.offset = pending.base_offset + static_cast<sval_t>(idx) * static_cast<sval_t>(pending.stride);
+            access.offset = materialized_offset;
             access.size = pending.size;
             access.access_type = pending.access_type;
             access.semantic_type = pending.semantic_type;
@@ -444,64 +493,133 @@ void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr_t* ptr
         struct SymbolicPtrInfo {
             bool has_base = false;
             int index_var = -1;
-            sval_t const_index = 0;
+            sval_t constant = 0;
+            sval_t index_scale = 0;
+            bool valid = true;
         } info;
 
-        std::function<void(const cexpr_t*)> walk = [&](const cexpr_t* e) {
-            if (!e) {
-                return;
+        std::function<bool(const cexpr_t*, sval_t)> walk =
+                [&](const cexpr_t* e, sval_t factor) {
+            if (!e || !info.valid) {
+                return false;
             }
             switch (e->op) {
                 case cot_var:
                     if (e->v.idx == target_var_idx_) {
+                        if (factor != 1) {
+                            info.valid = false;
+                            return false;
+                        }
                         info.has_base = true;
-                    } else if (info.index_var < 0) {
+                    } else {
+                        if (info.index_var >= 0 && info.index_var != e->v.idx) {
+                            info.valid = false;
+                            return false;
+                        }
                         info.index_var = e->v.idx;
+                        sval_t updated = 0;
+                        if (!checked_add_sval(info.index_scale, factor, updated)) {
+                            info.valid = false;
+                            return false;
+                        }
+                        info.index_scale = updated;
                     }
-                    break;
-                case cot_num:
-                    info.const_index += static_cast<sval_t>(e->numval());
-                    break;
+                    return true;
+                case cot_num: {
+                    sval_t term = 0;
+                    sval_t updated = 0;
+                    if (!checked_mul_sval(
+                            factor, static_cast<sval_t>(e->numval()), term) ||
+                        !checked_add_sval(info.constant, term, updated)) {
+                        info.valid = false;
+                        return false;
+                    }
+                    info.constant = updated;
+                    return true;
+                }
                 case cot_cast:
                 case cot_ref:
-                    walk(e->x);
-                    break;
+                    return walk(e->x, factor);
                 case cot_add:
-                    walk(e->x);
-                    walk(e->y);
-                    break;
-                case cot_sub:
-                    walk(e->x);
-                    if (e->y && e->y->op == cot_num) {
-                        info.const_index -= static_cast<sval_t>(e->y->numval());
+                    return walk(e->x, factor) && walk(e->y, factor);
+                case cot_sub: {
+                    if (!walk(e->x, factor)) {
+                        return false;
                     }
-                    break;
+                    sval_t negative_factor = 0;
+                    if (!checked_mul_sval(factor, -1, negative_factor)) {
+                        info.valid = false;
+                        return false;
+                    }
+                    return walk(e->y, negative_factor);
+                }
+                case cot_mul: {
+                    const cexpr_t* value = nullptr;
+                    const cexpr_t* multiplier = nullptr;
+                    if (e->x && e->x->op == cot_num) {
+                        multiplier = e->x;
+                        value = e->y;
+                    } else if (e->y && e->y->op == cot_num) {
+                        multiplier = e->y;
+                        value = e->x;
+                    } else {
+                        info.valid = false;
+                        return false;
+                    }
+                    sval_t scaled_factor = 0;
+                    if (!checked_mul_sval(
+                            factor,
+                            static_cast<sval_t>(multiplier->numval()),
+                            scaled_factor)) {
+                        info.valid = false;
+                        return false;
+                    }
+                    return walk(value, scaled_factor);
+                }
                 default:
-                    break;
+                    info.valid = false;
+                    return false;
             }
         };
 
-        walk(ptr_expr);
+        (void)walk(ptr_expr, 1);
 
-        if (info.has_base && info.index_var >= 0) {
-            msg("Structor:   Symbolic deref candidate in %a base=v%d idx=v%d const=%lld\n",
-                expr->ea, target_var_idx_, info.index_var,
-                static_cast<long long>(info.const_index));
+        if (info.valid && info.has_base && info.index_var >= 0 &&
+                info.index_scale != 0) {
+            msg("Structor:   Symbolic deref candidate in 0x%llX base=v%d idx=v%d "
+                "constant=%lld scale=%lld\n",
+                static_cast<unsigned long long>(expr->ea),
+                target_var_idx_, info.index_var,
+                static_cast<long long>(info.constant),
+                static_cast<long long>(info.index_scale));
             auto bound_it = local_index_bounds_.find(info.index_var);
-            tinfo_t pointed = ptr_expr->type.get_pointed_object();
-            size_t stride = pointed.empty() ? 0 : pointed.get_size();
-            if (stride == BADSIZE || stride == 0) {
-                stride = !expr->type.empty() ? utils::get_type_size(expr->type, get_ptr_size()) : 0;
-            }
 
-            if (stride > 0) {
+            sval_t base_offset = 0;
+            sval_t signed_stride = 0;
+            // Hex-Rays cot_add/cot_mul address expressions are already in byte
+            // units even when the final dereference gives the expression a
+            // wider pointer type. cot_idx is handled by process_array_access().
+            if (checked_mul_sval(
+                    info.constant, 1, base_offset) &&
+                checked_mul_sval(
+                    info.index_scale, 1, signed_stride) &&
+                signed_stride > 0 &&
+                static_cast<std::uint64_t>(signed_stride) <=
+                    std::numeric_limits<std::uint32_t>::max()) {
+                const auto stride = static_cast<std::uint32_t>(signed_stride);
                 if (bound_it != local_index_bounds_.end() && bound_it->second > 0 && bound_it->second <= 32) {
-                    msg("Structor:   Expanding bounded symbolic deref with bound=%u stride=%zu\n",
+                    msg("Structor:   Expanding bounded symbolic deref with bound=%u stride=%u\n",
                         bound_it->second, stride);
                     for (std::uint32_t idx = 0; idx < bound_it->second; ++idx) {
                         FieldAccess access;
                         access.insn_ea = expr->ea;
-                        access.offset = (info.const_index + static_cast<sval_t>(idx)) * static_cast<sval_t>(stride);
+                        sval_t index_term = 0;
+                        if (!checked_mul_sval(
+                                static_cast<sval_t>(idx),
+                                static_cast<sval_t>(stride), index_term) ||
+                            !checked_add_sval(base_offset, index_term, access.offset)) {
+                            continue;
+                        }
                         access.size = !expr->type.empty()
                             ? utils::get_type_size(expr->type, get_ptr_size())
                             : get_ptr_size();
@@ -520,12 +638,12 @@ void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr_t* ptr
                     }
                     return;
                 } else {
-                    msg("Structor:   Deferring symbolic deref for idx=v%d stride=%zu\n",
+                    msg("Structor:   Deferring symbolic deref for idx=v%d stride=%u\n",
                         info.index_var, stride);
                     PendingSymbolicAccess pending;
                     pending.insn_ea = expr->ea;
-                    pending.base_offset = (info.const_index) * static_cast<sval_t>(stride);
-                    pending.stride = static_cast<std::uint32_t>(stride);
+                    pending.base_offset = base_offset;
+                    pending.stride = stride;
                     pending.size = !expr->type.empty()
                         ? utils::get_type_size(expr->type, get_ptr_size())
                         : get_ptr_size();
@@ -609,6 +727,9 @@ void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr_t* ptr
         if (inner_arith.valid && inner_arith.var_idx == target_var_idx_ &&
             arith.offset >= inner_arith.offset && function_slot_like) {
             const sval_t slot_offset = arith.offset - inner_arith.offset;
+            if (!is_valid_vtable_slot_offset(slot_offset)) {
+                return;
+            }
             // Normalize nested vtable slot dereferences back to the parent
             // vtable pointer field so we don't mistake the object for the
             // vtable layout itself.
@@ -616,7 +737,8 @@ void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr_t* ptr
             access.semantic_type = SemanticType::VTablePointer;
             access.is_vtable_access = true;
             access.vtable_slot = slot_offset / get_ptr_size();
-            access.set_vtable_nested_access(inner_arith.offset, slot_offset, expr->type);
+            (void)access.set_vtable_nested_access(
+                inner_arith.offset, slot_offset, expr->type);
             access.base_indirection.reset();
         }
     }
@@ -658,7 +780,10 @@ void AccessPatternVisitor::process_memptr_access(cexpr_t* expr) {
 
     FieldAccess access;
     access.insn_ea = expr->ea;
-    access.offset = arith.offset + expr->m;  // Add member offset
+    if (!checked_add_sval(
+            arith.offset, static_cast<sval_t>(expr->m), access.offset)) {
+        return;
+    }
 
     if (!expr->type.empty()) {
         access.size = utils::get_type_size(expr->type, get_ptr_size());
@@ -696,7 +821,8 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
     tinfo_t elem_type = expr->type;
     if (!elem_type.empty()) {
         size_t elem_size = elem_type.get_size();
-        if (elem_size != BADSIZE && elem_size > 0) {
+        if (elem_size != BADSIZE && elem_size > 0 &&
+            elem_size <= std::numeric_limits<std::uint32_t>::max()) {
             stride_hint = static_cast<std::uint32_t>(elem_size);
         }
     }
@@ -705,7 +831,8 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
         tinfo_t ptr_elem = expr->x->type.get_pointed_object();
         if (!ptr_elem.empty()) {
             size_t elem_size = ptr_elem.get_size();
-            if (elem_size != BADSIZE && elem_size > 0) {
+            if (elem_size != BADSIZE && elem_size > 0 &&
+                elem_size <= std::numeric_limits<std::uint32_t>::max()) {
                 stride_hint = static_cast<std::uint32_t>(elem_size);
             }
         }
@@ -715,10 +842,17 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
     const sval_t base_offset = arith.offset;
 
     if (expr->y->op == cot_num) {
+        const sval_t index_value = static_cast<sval_t>(expr->y->numval());
+        sval_t index_delta = index_value;
         if (stride_hint.has_value()) {
-            offset += expr->y->numval() * static_cast<sval_t>(*stride_hint);
-        } else {
-            offset += expr->y->numval();
+            if (!checked_mul_sval(
+                    index_value, static_cast<sval_t>(*stride_hint),
+                    index_delta)) {
+                return;
+            }
+        }
+        if (!checked_add_sval(offset, index_delta, offset)) {
+            return;
         }
     }
 
@@ -730,9 +864,17 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
             }
             const std::uint32_t bound = it->second;
             for (std::uint32_t idx = 0; idx < bound; ++idx) {
+                sval_t index_delta = 0;
+                sval_t bounded_offset = 0;
+                if (!checked_mul_sval(
+                        static_cast<sval_t>(idx),
+                        static_cast<sval_t>(*stride_hint), index_delta) ||
+                    !checked_add_sval(offset, index_delta, bounded_offset)) {
+                    continue;
+                }
                 FieldAccess bounded;
                 bounded.insn_ea = expr->ea;
-                bounded.offset = offset + static_cast<sval_t>(idx) * static_cast<sval_t>(*stride_hint);
+                bounded.offset = bounded_offset;
                 bounded.size = !expr->type.empty()
                     ? utils::get_type_size(expr->type, get_ptr_size())
                     : get_ptr_size();
@@ -744,14 +886,16 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
                 const cexpr_t* parent = parent_expr();
                 bounded.semantic_type = infer_semantic_from_usage(expr, parent);
                 bounded.is_call_argument = is_call_argument_use(expr);
-                if (function_slot_like && arith.base_indirection > 0 && stride_hint.has_value()) {
+                if (function_slot_like && arith.base_indirection > 0 &&
+                    stride_hint.has_value() && *stride_hint == get_ptr_size()) {
                     bounded.offset = base_offset;
                     bounded.semantic_type = SemanticType::VTablePointer;
                     bounded.is_vtable_access = true;
                     bounded.vtable_slot = idx;
-                    bounded.set_vtable_nested_access(base_offset,
-                                                     static_cast<sval_t>(idx) * static_cast<sval_t>(*stride_hint),
-                                                     expr->type);
+                    (void)bounded.set_vtable_nested_access(
+                        base_offset,
+                        static_cast<sval_t>(idx) * static_cast<sval_t>(*stride_hint),
+                        expr->type);
                 }
                 if (arith.base_indirection > 0) {
                     if (!bounded.is_vtable_access) {
@@ -786,13 +930,15 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
     const cexpr_t* parent = parent_expr();
     access.semantic_type = infer_semantic_from_usage(expr, parent);
     access.is_call_argument = is_call_argument_use(expr);
-    if (function_slot_like && arith.base_indirection > 0 && stride_hint.has_value() && expr->y->op == cot_num) {
+    if (function_slot_like && arith.base_indirection > 0 &&
+        stride_hint.has_value() && *stride_hint == get_ptr_size() &&
+        expr->y->op == cot_num) {
         const sval_t slot_offset = offset - base_offset;
         access.offset = base_offset;
         access.semantic_type = SemanticType::VTablePointer;
         access.is_vtable_access = true;
         access.vtable_slot = slot_offset / static_cast<sval_t>(*stride_hint);
-        access.set_vtable_nested_access(base_offset, slot_offset, expr->type);
+        (void)access.set_vtable_nested_access(base_offset, slot_offset, expr->type);
     }
     if (!access.is_vtable_access && is_pointee_access(arith)) {
         return;
@@ -883,6 +1029,9 @@ void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
     tinfo_t funcptr_type = build_funcptr_type(call_expr);
 
     auto add_fp_access = [&](sval_t offset, SemanticType sem, bool is_vtable, sval_t slot_offset) {
+        if (is_vtable && !is_valid_vtable_slot_offset(slot_offset)) {
+            return;
+        }
         FieldAccess access;
         access.insn_ea = call_expr->ea;
         access.source_func_ea = cfunc_->entry_ea;
@@ -898,7 +1047,7 @@ void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
         if (is_vtable) {
             access.is_vtable_access = true;
             access.vtable_slot = slot_offset / get_ptr_size();
-            access.set_vtable_nested_access(offset, slot_offset, funcptr_type);
+            (void)access.set_vtable_nested_access(offset, slot_offset, funcptr_type);
         }
 
         accesses_.push_back(std::move(access));
@@ -955,7 +1104,13 @@ void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
     if (callee->op == cot_memptr || callee->op == cot_memref) {
         auto arith = utils::extract_ptr_arith(callee->x);
         if (arith.valid && arith.var_idx == target_var_idx_) {
-            add_fp_access(arith.offset + callee->m, SemanticType::FunctionPointer, false, 0);
+            const auto member_offset = checked_sval_from_u64(callee->m);
+            const auto total = member_offset.has_value()
+                ? checked_sval_add(arith.offset, *member_offset)
+                : std::nullopt;
+            if (total.has_value()) {
+                add_fp_access(*total, SemanticType::FunctionPointer, false, 0);
+            }
             return;
         }
     }
@@ -966,7 +1121,17 @@ void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
         if (arith.valid && arith.var_idx == target_var_idx_) {
             sval_t offset = arith.offset;
             if (callee->y && callee->y->op == cot_num) {
-                offset += callee->y->numval() * get_ptr_size();
+                const auto index = checked_sval_from_u64(callee->y->numval());
+                const auto scaled = index.has_value()
+                    ? checked_sval_mul(*index, static_cast<sval_t>(get_ptr_size()))
+                    : std::nullopt;
+                const auto total = scaled.has_value()
+                    ? checked_sval_add(offset, *scaled)
+                    : std::nullopt;
+                if (!total.has_value()) {
+                    return;
+                }
+                offset = *total;
             }
             add_fp_access(offset, SemanticType::FunctionPointer, false, 0);
             return;
@@ -1020,7 +1185,12 @@ bool AccessPatternVisitor::extract_access(const cexpr_t* expr, sval_t& offset, u
         auto arith = resolve_ptr_arith(expr->x);
         if (!arith.valid || arith.var_idx != target_var_idx_) return false;
         if (is_pointee_access(arith)) return false;
-        offset = arith.offset + expr->m;
+        const auto member_offset = checked_sval_from_u64(expr->m);
+        const auto total = member_offset.has_value()
+            ? checked_sval_add(arith.offset, *member_offset)
+            : std::nullopt;
+        if (!total.has_value()) return false;
+        offset = *total;
         size = expr->type.empty() ? get_ptr_size() : utils::get_type_size(expr->type, get_ptr_size());
         if (base_indirection && arith.base_indirection > 0) {
             *base_indirection = arith.base_indirection;
@@ -1061,13 +1231,23 @@ tinfo_t AccessPatternVisitor::build_funcptr_type(const cexpr_t* call_expr) const
     tinfo_t result;
     if (!call_expr || call_expr->op != cot_call) return result;
 
+    if (call_expr->x && !call_expr->x->type.empty()) {
+        tinfo_t callee_type = call_expr->x->type;
+        if (callee_type.is_funcptr()) {
+            return callee_type;
+        }
+        if (callee_type.is_func() && result.create_ptr(callee_type)) {
+            return result;
+        }
+    }
+
     func_type_data_t ftd;
     if (!call_expr->type.empty()) {
         ftd.rettype = call_expr->type;
     } else {
         ftd.rettype.create_simple_type(BTF_VOID);
     }
-    ftd.set_cc(CM_CC_FASTCALL);
+    ftd.set_cc(CM_CC_UNKNOWN);
 
     if (call_expr->a) {
         for (const auto& arg : *call_expr->a) {
@@ -1353,16 +1533,19 @@ AccessPattern AccessCollector::collect(cfunc_t* cfunc, int var_idx) {
     // Post-process
     analyze_accesses(pattern);
     deduplicate_accesses(pattern);
+    analyze_accesses(pattern);
 
-    if (Config::instance().options().debug_mode) {
+    if (options_.debug_mode) {
         qstring func_name;
         get_func_name(&func_name, pattern.func_ea);
         msg("Structor: collected %zu accesses for %s var_idx=%d\n",
             pattern.accesses.size(), func_name.c_str(), var_idx);
         for (const auto& access : pattern.accesses) {
-            msg("Structor:   access off=0x%llX size=%u sem=%s type=%s base_indir=%u call_arg=%s ctx=%s\n",
+            msg("Structor:   access off=0x%llX size=%u kind=%s zero_init=%s sem=%s type=%s base_indir=%u call_arg=%s ctx=%s\n",
                 static_cast<unsigned long long>(access.offset),
                 access.size,
+                access_type_str(access.access_type),
+                access.is_zero_init ? "true" : "false",
                 semantic_type_str(access.semantic_type),
                 access.inferred_type.dstr(),
                 access.base_indirection.value_or(0),
@@ -1406,15 +1589,33 @@ AccessPattern AccessCollector::collect(ea_t func_ea, const char* var_name) {
 void AccessCollector::analyze_accesses(AccessPattern& pattern) {
     if (pattern.accesses.empty()) return;
 
+    qvector<FieldAccess> bounded;
+    bounded.reserve(pattern.accesses.size());
+    for (auto& access : pattern.accesses) {
+        if (checked_interval_end(access.offset, access.size).has_value()) {
+            bounded.push_back(std::move(access));
+        }
+    }
+    pattern.accesses = std::move(bounded);
+    if (pattern.accesses.empty()) {
+        pattern.min_offset = 0;
+        pattern.max_offset = 0;
+        return;
+    }
+
     pattern.sort_by_offset();
 
     // Recalculate min/max
     pattern.min_offset = pattern.accesses.front().offset;
-    pattern.max_offset = pattern.accesses.front().offset + pattern.accesses.front().size;
+    pattern.max_offset = *checked_interval_end(
+        pattern.accesses.front().offset, pattern.accesses.front().size);
 
     for (const auto& access : pattern.accesses) {
         pattern.min_offset = std::min(pattern.min_offset, access.offset);
-        pattern.max_offset = std::max(pattern.max_offset, access.offset + static_cast<sval_t>(access.size));
+        const auto access_end = checked_interval_end(access.offset, access.size);
+        if (access_end.has_value()) {
+            pattern.max_offset = std::max(pattern.max_offset, *access_end);
+        }
     }
 }
 
@@ -1443,63 +1644,10 @@ void AccessCollector::deduplicate_accesses(AccessPattern& pattern) {
     for (auto& access : pattern.accesses) {
         bool found = false;
         for (auto& existing : unique) {
-            if (existing.offset == access.offset && existing.size == access.size) {
-                // Merge access types
-                if (existing.access_type == AccessType::Read && access.access_type == AccessType::Write) {
-                    existing.access_type = AccessType::ReadWrite;
-                } else if (existing.access_type == AccessType::Write && access.access_type == AccessType::Read) {
-                    existing.access_type = AccessType::ReadWrite;
-                }
-
-                // Prefer more specific semantic type (using Suture-style priority)
-                if (semantic_priority(access.semantic_type) > semantic_priority(existing.semantic_type)) {
-                    existing.semantic_type = access.semantic_type;
-                }
-
-                // Merge inferred types using conflict resolution
-                if (!access.inferred_type.empty()) {
-                    existing.inferred_type = resolve_type_conflict(existing.inferred_type, access.inferred_type);
-                }
-
-                // Keep vtable info
-                if (access.is_vtable_access) {
-                    existing.is_vtable_access = true;
-                    existing.vtable_slot = access.vtable_slot;
-                }
-
-                // Merge nested info if present
-                if (access.nested_info && !existing.nested_info) {
-                    existing.nested_info = access.nested_info;
-                }
-
-                if (!access.bitfields.empty()) {
-                    for (const auto& bf : access.bitfields) {
-                        existing.add_bitfield(bf);
-                    }
-                }
-
-                for (auto value : access.observed_constants) {
-                    existing.add_observed_constant(value);
-                }
-
-                if (access.array_stride_hint.has_value()) {
-                    if (!existing.array_stride_hint.has_value()) {
-                        existing.array_stride_hint = access.array_stride_hint;
-                    } else if (*existing.array_stride_hint != *access.array_stride_hint) {
-                        existing.array_stride_hint.reset();
-                    }
-                }
-
-                existing.is_call_argument = existing.is_call_argument || access.is_call_argument;
-
-                if (access.base_indirection.has_value()) {
-                    if (!existing.base_indirection.has_value()) {
-                        existing.base_indirection = access.base_indirection;
-                    } else if (*existing.base_indirection != *access.base_indirection) {
-                        existing.base_indirection.reset();
-                    }
-                }
-
+            if (existing.offset == access.offset &&
+                existing.size == access.size &&
+                field_access_evidence_compatible(existing, access)) {
+                merge_field_access_evidence(existing, access);
                 found = true;
                 break;
             }
@@ -1511,6 +1659,8 @@ void AccessCollector::deduplicate_accesses(AccessPattern& pattern) {
     }
 
     pattern.accesses = std::move(unique);
+    std::sort(pattern.accesses.begin(), pattern.accesses.end(),
+              canonical_field_access_less);
 
     // Drop coarse aggregate accesses when we already observed finer-grained
     // accesses inside the same region. These usually come from decompiler-
@@ -1524,14 +1674,18 @@ void AccessCollector::deduplicate_accesses(AccessPattern& pattern) {
         if (!access.inferred_type.empty() &&
             (access.inferred_type.is_array() || access.inferred_type.is_struct())) {
             int contained_smaller = 0;
-            const sval_t access_end = access.offset + static_cast<sval_t>(access.size);
+            const auto access_end = checked_interval_end(access.offset, access.size);
+            if (!access_end.has_value()) {
+                continue;
+            }
 
             for (const auto& other : pattern.accesses) {
                 if (&other == &access) {
                     continue;
                 }
-                const sval_t other_end = other.offset + static_cast<sval_t>(other.size);
-                if (other.offset >= access.offset && other_end <= access_end &&
+                const auto other_end = checked_interval_end(other.offset, other.size);
+                if (other_end.has_value() && other.offset >= access.offset &&
+                    *other_end <= *access_end &&
                     (other.size < access.size || other.offset != access.offset)) {
                     ++contained_smaller;
                 }

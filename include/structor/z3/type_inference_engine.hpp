@@ -14,18 +14,24 @@
 #endif
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 
 namespace structor::z3 {
 
-/// Configuration for the type inference engine
+/// Configuration for the experimental type inference adjunct.
+///
+/// This pipeline is independent of the production structure-layout solver.
+/// It is disabled by default because memory-location inference, signature
+/// inference, and interprocedural fixed-point inference are not implemented.
 struct TypeInferenceConfig {
+    /// Explicit opt-in required by every inference entry point.
+    bool enable_experimental_pipeline = false;
+
     // Phase enables
     bool phase_constraint_extraction = true;
     bool phase_alias_analysis = true;
     bool phase_soft_constraints = true;
-    bool phase_cross_function = true;
-    bool phase_polymorphic_detection = false;  // Expensive, disabled by default
     
     // Constraint generation
     InstructionSemanticsConfig semantics_config;
@@ -34,21 +40,21 @@ struct TypeInferenceConfig {
     AliasAnalysisConfig alias_config;
     
     // Solver configuration
-    bool use_optimize = true;          // Use z3::optimize for soft constraints
-    bool use_incremental = true;       // Use incremental solving
     unsigned solver_timeout_ms = 10000;
-    unsigned max_relaxation_iterations = 10;
     
     // Type preference weights (for MaxSMT)
     int weight_signed_over_unsigned = 5;
-    int weight_concrete_over_unknown = 10;
-    int weight_pointer_for_mem_base = 15;
     int weight_from_signature = 20;
-    int weight_from_decompiler = 10;
-    
-    // Output options
-    bool generate_confidence_scores = true;
-    bool propagate_to_decompiler = true;
+};
+
+/// Stable result category for the experimental inference adjunct.
+enum class TypeInferenceStatus : std::uint8_t {
+    ExperimentalDisabled = 0,
+    InvalidInput,
+    SolverFailure,
+    UnsupportedOperation,
+    InternalError,
+    Success,
 };
 
 /// Statistics from type inference
@@ -65,6 +71,8 @@ struct TypeInferenceStats {
     unsigned variables_typed = 0;
     unsigned type_constraints_hard = 0;
     unsigned type_constraints_soft = 0;
+    // Compatibility counters: the adjunct has no relaxation phase and these
+    // remain zero/false in engine-produced results.
     unsigned constraints_relaxed = 0;
     unsigned alias_pairs_found = 0;
     
@@ -89,7 +97,7 @@ struct InferredVariableType {
     InferredType type;
     TypeConfidence confidence;
     
-    // Provenance - where this type came from
+    // Reserved provenance slots. The current engine does not populate them.
     qvector<ea_t> source_constraints;
     bool from_signature = false;
     bool from_decompiler = false;
@@ -109,14 +117,15 @@ struct FunctionTypeInferenceResult {
     // Inferred types for local variables
     qvector<InferredVariableType> local_types;
     
-    // Inferred types for memory locations accessed
+    // External-result slots. The current engine leaves memory and signature
+    // outputs empty; callers may populate them only in explicitly constructed
+    // FunctionTypeInferenceResult values.
     std::unordered_map<std::size_t, InferredType> memory_types;  // hash -> type
-    
-    // Function signature inference
     std::optional<InferredType> return_type;
     qvector<InferredType> param_types;
     
     // Status
+    TypeInferenceStatus status = TypeInferenceStatus::ExperimentalDisabled;
     bool success = false;
     qstring error_message;
     TypeInferenceStats stats;
@@ -150,13 +159,18 @@ public:
     /// Infer types for all variables in a function
     [[nodiscard]] FunctionTypeInferenceResult infer_function(cfunc_t* cfunc);
     
-    /// Infer types for a specific variable
+    /// Infer a specific variable. Throws std::runtime_error when the pipeline
+    /// is disabled or the containing function inference fails; use
+    /// infer_function() when typed failure status is required.
     [[nodiscard]] InferredVariableType infer_variable(
         cfunc_t* cfunc,
         int var_idx
     );
     
-    /// Infer types across multiple functions (inter-procedural)
+    /// Interprocedural fixed-point inference is not implemented. This method
+    /// returns UnsupportedOperation for every supplied function and performs
+    /// no analysis or mutation.
+    [[deprecated("interprocedural type inference is unavailable; use infer_function for explicit experimental per-function analysis")]]
     [[nodiscard]] std::vector<FunctionTypeInferenceResult> infer_cross_function(
         const qvector<cfunc_t*>& cfuncs
     );
@@ -184,8 +198,6 @@ private:
     // Sub-analyzers
     std::unique_ptr<InstructionSemanticsExtractor> semantics_extractor_;
     std::unique_ptr<AliasAnalyzer> alias_analyzer_;
-    std::unique_ptr<SignednessInferrer> signedness_inferrer_;
-    std::unique_ptr<PointerIntegerDiscriminator> ptr_int_discriminator_;
     TypeLatticeEncoder type_encoder_;
     
     // Current analysis state
@@ -233,8 +245,8 @@ private:
     void add_calling_convention_constraints(cfunc_t* cfunc);
 };
 
-/// Type scheme for polymorphic functions
-/// Represents universally quantified types: forall a. ptr(a) -> ptr(a) -> int -> ptr(a)
+/// Experimental type-scheme descriptor. InferredType currently has no type-
+/// parameter node, so non-trivial instantiation fails explicitly.
 struct TypeScheme {
     struct TypeParam {
         int id;
@@ -247,32 +259,30 @@ struct TypeScheme {
     /// Check if this is a polymorphic (non-trivial) type scheme
     [[nodiscard]] bool is_polymorphic() const noexcept { return !type_params.empty(); }
     
-    /// Instantiate the scheme with fresh type variables
+    /// Instantiate a monomorphic scheme. Throws std::logic_error when
+    /// type_params is non-empty; substituting those parameters is unsupported.
+    [[deprecated("non-trivial polymorphic type-scheme instantiation is unsupported")]]
     [[nodiscard]] std::pair<InferredType, std::unordered_map<int, TypeVariable>> 
     instantiate(int call_site_id, std::function<TypeVariable(int, const char*)> make_var) const;
 };
 
-/// Detects polymorphic functions (memcpy, qsort, etc.)
+/// Explicit catalog of caller-registered polymorphic function descriptors.
+/// No name-, import-, or usage-based automatic detection is performed.
 class PolymorphicFunctionDetector {
 public:
     PolymorphicFunctionDetector(Z3Context& ctx);
     
-    /// Check if a function is polymorphic based on its usage patterns
-    [[nodiscard]] bool is_polymorphic(ea_t func_ea);
+    /// Check whether a descriptor was explicitly registered for this address.
+    [[nodiscard]] bool is_polymorphic(ea_t func_ea) const;
     
-    /// Get the type scheme for a polymorphic function
-    [[nodiscard]] std::optional<TypeScheme> get_type_scheme(ea_t func_ea);
+    /// Get an explicitly registered type scheme.
+    [[nodiscard]] std::optional<TypeScheme> get_type_scheme(ea_t func_ea) const;
     
     /// Register a known polymorphic function
     void register_polymorphic(ea_t func_ea, TypeScheme scheme);
     
-    /// Common polymorphic functions
-    void register_known_functions();
-
 private:
-    Z3Context& ctx_;
     std::unordered_map<ea_t, TypeScheme> known_schemes_;
-    std::unordered_set<ea_t> known_polymorphic_;
 };
 
 /// Calling convention detector

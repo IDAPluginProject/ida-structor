@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+COMMAND_TIMEOUT_SECONDS = 300
 
 
 def strip_ansi(text: str) -> str:
@@ -27,7 +28,14 @@ def hr(char: str = "-", width: int = 78) -> str:
 
 
 def run(cmd, *, cwd=None, env=None):
-    return subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
 
 
 def expand_function_filters(functions: list[str]) -> list[str]:

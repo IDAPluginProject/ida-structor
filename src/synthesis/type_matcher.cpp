@@ -116,12 +116,13 @@ bool ExistingTypeMatcher::ranges_overlap(
         return false;
     }
 
-    const sval_t a_end = a_offset + static_cast<sval_t>(a_size);
-    const sval_t b_end = b_offset + static_cast<sval_t>(b_size);
-    return a_offset < b_end && b_offset < a_end;
+    const auto a_end = checked_interval_end(a_offset, a_size);
+    const auto b_end = checked_interval_end(b_offset, b_size);
+    return a_end.has_value() && b_end.has_value() &&
+        a_offset < *b_end && b_offset < *a_end;
 }
 
-bool ExistingTypeMatcher::is_padding_name(const qstring& name) noexcept {
+bool ExistingTypeMatcher::is_padding_name(const qstring& name) {
     if (name.empty()) {
         return false;
     }
@@ -139,11 +140,11 @@ bool ExistingTypeMatcher::is_padding_name(const qstring& name) noexcept {
            lower.rfind("align", 0) == 0;
 }
 
-bool ExistingTypeMatcher::is_effective_padding(const SynthField& field) noexcept {
+bool ExistingTypeMatcher::is_effective_padding(const SynthField& field) {
     return field.is_padding || field.semantic == SemanticType::Padding || is_padding_name(field.name);
 }
 
-SemanticType ExistingTypeMatcher::semantic_from_type(const tinfo_t& type) noexcept {
+SemanticType ExistingTypeMatcher::semantic_from_type(const tinfo_t& type) {
     if (type.empty()) {
         return SemanticType::Unknown;
     }
@@ -172,7 +173,7 @@ SemanticType ExistingTypeMatcher::semantic_from_type(const tinfo_t& type) noexce
     return SemanticType::Integer;
 }
 
-bool ExistingTypeMatcher::types_compatible(const tinfo_t& a, const tinfo_t& b) noexcept {
+bool ExistingTypeMatcher::types_compatible(const tinfo_t& a, const tinfo_t& b) {
     if (a.empty() || b.empty()) {
         return false;
     }
@@ -189,7 +190,7 @@ bool ExistingTypeMatcher::types_compatible(const tinfo_t& a, const tinfo_t& b) n
     return a_size != BADSIZE && a_size == b_size && semantic_from_type(a) == semantic_from_type(b);
 }
 
-bool ExistingTypeMatcher::field_name_can_be_reused(const SynthField& field) noexcept {
+bool ExistingTypeMatcher::field_name_can_be_reused(const SynthField& field) {
     if (field.name.empty()) {
         return true;
     }
@@ -357,6 +358,14 @@ TypeMergeResult ExistingTypeMatcher::merge_existing_type(
         if (existing.is_padding || existing.size == 0) {
             continue;
         }
+        const auto existing_end =
+            checked_interval_end(existing.offset, existing.size);
+        if (existing.offset < 0 || !existing_end.has_value() ||
+            *existing_end <= 0 ||
+            static_cast<std::uint64_t>(*existing_end) > MAX_STRUCT_SIZE) {
+            ++result.fields_skipped;
+            continue;
+        }
 
         SynthField* exact = nullptr;
         for (auto& synth : synth_struct.fields) {
@@ -446,9 +455,11 @@ TypeMergeResult ExistingTypeMatcher::merge_existing_type(
         if (existing.is_padding || existing.size == 0 || existing.offset < 0) {
             continue;
         }
-        const sval_t end = existing.offset + static_cast<sval_t>(existing.size);
-        if (end > 0) {
-            synth_struct.size = std::max(synth_struct.size, static_cast<std::uint32_t>(end));
+        const auto end = checked_interval_end(existing.offset, existing.size);
+        if (end.has_value() && *end > 0 &&
+            static_cast<std::uint64_t>(*end) <= MAX_STRUCT_SIZE) {
+            synth_struct.size = std::max(
+                synth_struct.size, static_cast<std::uint32_t>(*end));
         }
     }
 

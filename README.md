@@ -117,7 +117,9 @@ Generated names vary by naming heuristics and the detected field roles.
 - macOS, Linux, or Windows
 - Z3
 
-Z3 is detected from the system first. If no system Z3 is found, the build can fetch and build Z3 from source automatically.
+By default, CMake fetches Z3 4.15.4 and links it statically for a reproducible,
+self-contained plugin. Set `Z3_USE_CUSTOM=ON` with custom include and library
+paths to use another Z3 build.
 
 ## Building
 
@@ -387,20 +389,59 @@ generate_comments=true
 [Z3]
 z3_mode=preferred
 z3_timeout_ms=5000
-z3_memory_limit_mb=256
+z3_memory_limit_mb=0
 z3_enable_maxsmt=true
 z3_enable_unsat_core=true
 z3_detect_arrays=true
 z3_min_array_elements=3
+z3_detect_symbolic_arrays=true
+z3_max_array_stride=4096
 z3_cross_function=true
+z3_max_accesses=10000
 z3_max_candidates=1000
+z3_max_fields=4096
+z3_max_array_elements=1024
+z3_max_structure_size=65536
+z3_max_constraint_pairs=500000
 z3_allow_unions=true
+z3_max_union_alternatives=8
 z3_min_confidence=20
 z3_relax_on_unsat=true
 z3_max_relax_iterations=5
 z3_weight_minimize_padding=1
 z3_weight_prefer_non_union=2
 ```
+
+`z3_min_confidence` uses the explicit candidate scale low/medium/high/absolute
+= 25/50/75/100 and filters only optional candidates; direct observations are
+never removed. `z3_max_array_elements` similarly limits optional aggregate
+array interpretations while retaining the underlying scalar evidence.
+`z3_max_constraint_pairs` is the total statically constructed relation budget:
+unordered candidate pairs plus the `candidate_count * union_group_count`
+occupancy relations needed for per-union cardinality. Arithmetic overflow is a
+terminal budget violation.
+
+Terminal access, candidate, field, structure-span, relation,
+union-alternative, solver-time, and solver-memory limits return a structured
+`resource_limit` result and do not enter heuristic fallback. Bundled Z3 4.15.4
+does not expose a per-`Optimize` memory parameter, so the MaxSMT default uses
+the explicit unlimited value `z3_memory_limit_mb=0`. Requesting a nonzero
+memory cap together with an enabled optimizer (layout MaxSMT or the optional
+type-inference optimizer) fails closed during solver configuration; a pure
+solver path applies the cap directly to its local solver instance.
+Process-global Z3 parameters are not modified.
+
+The `z3` layout solver above is the production structure-recovery path. The
+separate `z3::TypeInferenceEngine` adjunct is experimental and is not enabled
+by `SynthOptions` or configuration-file keys. Its C++ API requires explicit
+`TypeInferenceConfig::enable_experimental_pipeline=true`; the layout wrapper
+additionally requires `LayoutSynthConfig::use_type_inference=true`. Both
+defaults are false, applying its inferred secondary types defaults to false,
+and cross-function propagation in `TypeApplicationConfig` defaults to false.
+Disabled or unsupported adjunct operations return explicit status/error data.
+The current adjunct infers per-function local-variable types only; it does not
+produce memory-location types, function signatures, interprocedural fixed
+points, allocation provenance, or polymorphic type-scheme substitutions.
 
 ## Testing
 
@@ -411,30 +452,53 @@ cmake -S . -B build -DIDA_SDK_DIR=/path/to/idasdk -DBUILD_TESTS=ON
 cmake --build build --parallel
 ```
 
-### Run the full suite
+### Run the IDA-independent suite
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure --no-tests=error -E '_live$'
 ```
+
+Release test targets explicitly keep C/C++ assertions enabled. GitHub Actions
+builds and runs this suite for every configured platform and IDA SDK matrix
+entry.
+
+The standalone `z3_*` executables exercise IDA-independent solver models. They
+are useful solver checks, but the production synthesis pipeline is verified by
+production-linked tests and the live contract suite rather than inferred from
+those models alone.
 
 ### Convenience targets
 
 With `BUILD_TESTS=ON`, the test CMake project also provides:
 
-- `check` for the full suite
-- `check_z3` for the Z3-focused subset
+- `check` for every test available in the configured environment
+- `check_z3` for the standalone Z3-model subset
 
 ### Live plugin regression tests
 
-On supported Apple arm64 hosts with `idump` available and a valid local IDA license, the CTest suite also runs live plugin regressions against real binaries. Those regressions currently exercise:
+On Apple arm64 hosts with `idump` available and a local `ida.reg`, `*.hexlic`,
+or `*.lic` license, CTest also registers the serial
+`full_integrity_suite_live` test. It covers:
 
-- missing register-backed argument reporting with `test_missing_regarg`
-- overlap-based local type recovery with `test_overlap_scope`
+- a clean external CMake consumer build
+- the public C++ API surface
+- exact normalized result and pseudocode contracts
+- five-run, fresh-database determinism checks for local and global union recovery
+- global-object recovery
+- the large WeaponStats layout corpus
+- vtable recovery
+- function type-fixing regressions
 
-You can also run the live regression script directly:
+Run both the IDA-independent and complete live gates with:
 
 ```bash
-python3 integration_tests/check_type_fixer_regressions.py \
+make test TEST_IDUMP=idump
+```
+
+Or invoke the live suite directly:
+
+```bash
+python3 integration_tests/check_full_integrity_suite.py \
   --repo-root /path/to/structor \
   --plugin /path/to/structor/build/structor.dylib \
   --idump idump
@@ -445,6 +509,9 @@ python3 integration_tests/check_type_fixer_regressions.py \
 ```bash
 sh integration_tests/build_fixtures.sh
 ```
+
+On macOS the fixture builder resolves the active Xcode compiler and SDK with
+`xcrun`; explicit `CC`, `CXX`, and `SDKROOT` values take precedence.
 
 Or build only specific fixtures:
 

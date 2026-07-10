@@ -13,7 +13,10 @@
 
 BUILD_DIR     := build
 BUILD_TYPE    ?= Release
+BUILD_TESTS   ?= OFF
+LIVE_TEST_HOOKS ?= OFF
 INSTALL_DIR   ?= $(HOME)/.idapro/plugins
+INSTALL_STAGE_DIR := $(BUILD_DIR)/install-stage
 PLUGIN_NAME   := structor.dylib
 TEST_IDUMP    ?= idump
 PYTHON        ?= python3
@@ -35,7 +38,9 @@ else
     PLUGIN_EXT := .dll
 endif
 
-CMAKE_FLAGS := -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
+CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
+	-DBUILD_TESTS=$(BUILD_TESTS) \
+	-DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=$(LIVE_TEST_HOOKS)
 
 ifdef IDA_SDK_DIR
     CMAKE_FLAGS += -DIDA_SDK_DIR=$(IDA_SDK_DIR)
@@ -52,7 +57,10 @@ configure:
 build: configure
 	@cmake --build $(BUILD_DIR) --parallel
 
+test: BUILD_TESTS=ON
+test: LIVE_TEST_HOOKS=ON
 test: build
+	@ctest --test-dir $(BUILD_DIR) --build-config $(BUILD_TYPE) --output-on-failure --no-tests=error -E '_live$$'
 	@$(PYTHON) integration_tests/check_full_integrity_suite.py --repo-root "$(CURDIR)" --plugin "$(CURDIR)/$(BUILD_DIR)/structor$(PLUGIN_EXT)" --idump "$(TEST_IDUMP)"
 
 clean:
@@ -60,9 +68,25 @@ clean:
 
 rebuild: clean build
 
-install: build
+install:
+	@mkdir -p $(BUILD_DIR)
+	@cd $(BUILD_DIR) && cmake $(CMAKE_FLAGS) \
+		-DBUILD_TESTS=OFF \
+		-DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=OFF ..
+	@cmake --build $(BUILD_DIR) --parallel
+	@rm -rf $(INSTALL_STAGE_DIR)
+	@cmake --install $(BUILD_DIR) --config $(BUILD_TYPE) --component Runtime \
+		--prefix "$(CURDIR)/$(INSTALL_STAGE_DIR)"
+	@for marker in STRUCTOR_INTEGRATION_TESTING \
+		STRUCTOR_TEST_PERSISTENCE_FAULT fault_global_tinfo_rollback; do \
+		if strings "$(INSTALL_STAGE_DIR)/plugins/structor$(PLUGIN_EXT)" | \
+			grep -F -- "$$marker" >/dev/null; then \
+			echo "Production plugin contains live-test marker: $$marker"; \
+			exit 1; \
+		fi; \
+	done
 	@mkdir -p $(INSTALL_DIR)
-	@cp -f $(BUILD_DIR)/structor$(PLUGIN_EXT) $(INSTALL_DIR)/
+	@cp -f $(INSTALL_STAGE_DIR)/plugins/structor$(PLUGIN_EXT) $(INSTALL_DIR)/
 	@if [ "$(UNAME_S)" = "Darwin" ]; then \
 		codesign -s - -f "$(INSTALL_DIR)/structor$(PLUGIN_EXT)"; \
 		echo "Codesigned $(INSTALL_DIR)/structor$(PLUGIN_EXT)"; \
@@ -81,5 +105,7 @@ debug:
 info:
 	@echo "BUILD_DIR:   $(BUILD_DIR)"
 	@echo "BUILD_TYPE:  $(BUILD_TYPE)"
+	@echo "BUILD_TESTS: $(BUILD_TESTS)"
+	@echo "LIVE_HOOKS:  $(LIVE_TEST_HOOKS)"
 	@echo "INSTALL_DIR: $(INSTALL_DIR)"
 	@echo "IDA_SDK_DIR: $(IDA_SDK_DIR)"

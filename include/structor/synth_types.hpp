@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <format>
 #include <span>
+#include <stdexcept>
+#include <limits>
 
 namespace structor {
 
@@ -43,7 +45,7 @@ class StructurePersistence;
 // ============================================================================
 
 inline constexpr const char* PLUGIN_NAME = "Structor";
-inline constexpr const char* PLUGIN_VERSION = "1.0.0";
+inline constexpr const char* PLUGIN_VERSION = "2.2.0";
 inline constexpr const char* PLUGIN_AUTHOR = "Structor Authors";
 inline constexpr const char* ACTION_NAME = "synth:synthesize_structure";
 inline constexpr const char* ACTION_LABEL = "Synthesize Structure";
@@ -55,6 +57,16 @@ inline constexpr const char* DEFAULT_MATCH_HOTKEY = "Ctrl+Shift+S";
 inline constexpr std::size_t MAX_STRUCT_SIZE = 0x100000;  // 1MB max structure size
 inline constexpr std::size_t MAX_VTABLE_SLOTS = 512;
 inline constexpr std::size_t MAX_FIELDS = 4096;
+
+/// A virtual dispatch slot is addressable only at a non-negative,
+/// pointer-width-aligned byte offset. Reject all other offsets rather than
+/// silently truncating them into a slot index.
+[[nodiscard]] inline bool is_valid_vtable_slot_offset(sval_t offset) noexcept {
+    const sval_t pointer_size = inf_is_64bit() ? 8 : 4;
+    return offset >= 0 &&
+           (offset % pointer_size) == 0 &&
+           static_cast<std::uint64_t>(offset / pointer_size) < MAX_VTABLE_SLOTS;
+}
 
 // ============================================================================
 // Access Types and Patterns
@@ -84,6 +96,70 @@ enum class SemanticType : std::uint8_t {
     NestedStruct,
     Padding
 };
+
+/// Compute the exclusive end of a byte interval without signed overflow.
+/// `size == 0` is a valid empty interval.  Invalid intervals are represented
+/// explicitly instead of invoking undefined behavior in range predicates.
+[[nodiscard]] inline constexpr std::optional<sval_t> checked_interval_end(
+    sval_t offset,
+    std::uint32_t size) noexcept
+{
+    if (offset > std::numeric_limits<sval_t>::max() -
+                     static_cast<sval_t>(size)) {
+        return std::nullopt;
+    }
+    return offset + static_cast<sval_t>(size);
+}
+
+/// Return the mathematical distance between two ordered signed offsets.  The
+/// unsigned subtraction is intentional: for end >= begin it is the exact
+/// two's-complement distance over the full signed domain, including
+/// [SVAL_MIN, SVAL_MAX].
+[[nodiscard]] inline constexpr std::optional<std::uint64_t>
+checked_interval_span(sval_t begin, sval_t end) noexcept
+{
+    if (end < begin) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(end) -
+           static_cast<std::uint64_t>(begin);
+}
+
+[[nodiscard]] inline constexpr bool checked_intervals_overlap(
+    sval_t lhs_offset,
+    std::uint32_t lhs_size,
+    sval_t rhs_offset,
+    std::uint32_t rhs_size) noexcept
+{
+    if (lhs_size == 0 || rhs_size == 0) {
+        return false;
+    }
+    const auto lhs_end = checked_interval_end(lhs_offset, lhs_size);
+    const auto rhs_end = checked_interval_end(rhs_offset, rhs_size);
+    return lhs_end.has_value() && rhs_end.has_value() &&
+           lhs_offset < *rhs_end && rhs_offset < *lhs_end;
+}
+
+[[nodiscard]] inline constexpr bool checked_interval_contains(
+    sval_t outer_offset,
+    std::uint32_t outer_size,
+    sval_t inner_offset,
+    std::uint32_t inner_size) noexcept
+{
+    const auto outer_end = checked_interval_end(outer_offset, outer_size);
+    const auto inner_end = checked_interval_end(inner_offset, inner_size);
+    return outer_end.has_value() && inner_end.has_value() &&
+           outer_offset <= inner_offset && *outer_end >= *inner_end;
+}
+
+[[nodiscard]] inline constexpr std::optional<std::uint32_t>
+checked_u32_product(std::uint32_t lhs, std::uint32_t rhs) noexcept
+{
+    if (lhs != 0 && rhs > std::numeric_limits<std::uint32_t>::max() / lhs) {
+        return std::nullopt;
+    }
+    return lhs * rhs;
+}
 
 /// How a generated name should be interpreted by the naming pipeline
 enum class GeneratedNameKind : std::uint8_t {
@@ -272,9 +348,8 @@ struct FieldAccess {
     }
 
     bool overlaps(const FieldAccess& other) const noexcept {
-        if (offset >= other.offset + static_cast<sval_t>(other.size)) return false;
-        if (other.offset >= offset + static_cast<sval_t>(size)) return false;
-        return true;
+        return checked_intervals_overlap(
+            offset, size, other.offset, other.size);
     }
 
     /// Check if this access represents nested structure access
@@ -288,10 +363,21 @@ struct FieldAccess {
     }
 
     /// Create nested access info for vtable patterns: obj->vtable[slot]
-    void set_vtable_nested_access(sval_t vtable_offset, sval_t slot_offset, const tinfo_t& slot_type) {
+    [[nodiscard]] bool set_vtable_nested_access(
+        sval_t vtable_offset,
+        sval_t slot_offset,
+        const tinfo_t& slot_type)
+    {
+        if (!is_valid_vtable_slot_offset(slot_offset)) {
+            nested_info.reset();
+            is_vtable_access = false;
+            vtable_slot = -1;
+            return false;
+        }
         nested_info = NestedAccessInfo(vtable_offset, NestedAccessInfo(slot_offset, slot_type));
         is_vtable_access = true;
         vtable_slot = slot_offset / (inf_is_64bit() ? 8 : 4);
+        return true;
     }
 
     void add_bitfield(const BitfieldInfo& info) {
@@ -312,6 +398,19 @@ struct FieldAccess {
         observed_constants.push_back(value);
     }
 };
+
+/// True when equal-range observations can be combined without destroying a
+/// materially different storage interpretation (for example integer vs float
+/// or pointer vs integer).
+[[nodiscard]] bool field_access_evidence_compatible(
+    const FieldAccess& lhs, const FieldAccess& rhs);
+
+/// Merge metadata from a compatible equal-range observation.
+void merge_field_access_evidence(FieldAccess& dst, const FieldAccess& src);
+
+/// Canonical ordering for evidence retained as distinct alternatives.
+[[nodiscard]] bool canonical_field_access_less(
+    const FieldAccess& lhs, const FieldAccess& rhs);
 
 /// Collection of accesses for analysis
 struct AccessPattern {
@@ -334,12 +433,16 @@ struct AccessPattern {
         , vtable_offset(0) {}
 
     void add_access(FieldAccess&& access) {
+        const auto access_end = checked_interval_end(access.offset, access.size);
         if (accesses.empty()) {
             min_offset = access.offset;
-            max_offset = access.offset + access.size;
+            max_offset = access_end.value_or(
+                std::numeric_limits<sval_t>::max());
         } else {
             min_offset = std::min(min_offset, access.offset);
-            max_offset = std::max(max_offset, access.offset + static_cast<sval_t>(access.size));
+            max_offset = std::max(
+                max_offset,
+                access_end.value_or(std::numeric_limits<sval_t>::max()));
         }
         accesses.push_back(std::move(access));
     }
@@ -364,6 +467,20 @@ enum class TypeConfidence : std::uint8_t {
     High = 2,       // Very strong evidence (pattern match, explicit type)
     Certain = 3     // Type is definitively known (debug info, user override)
 };
+
+/// Stable percentage representation used by the public 0..100 confidence
+/// threshold.  Direct evidence is never discarded by this score; it controls
+/// only optional aggregate/covering/padding candidates.
+[[nodiscard]] inline constexpr std::uint8_t type_confidence_percent(
+    TypeConfidence confidence) noexcept {
+    switch (confidence) {
+        case TypeConfidence::Low:     return 25;
+        case TypeConfidence::Medium:  return 50;
+        case TypeConfidence::High:    return 75;
+        case TypeConfidence::Certain: return 100;
+        default:                      return 0;
+    }
+}
 
 /// Get string representation of TypeConfidence
 [[nodiscard]] inline const char* type_confidence_str(TypeConfidence conf) noexcept {
@@ -471,8 +588,10 @@ struct SynthField {
 
         // Calculate size
         size_t elem_size = elem_type.get_size();
-        if (elem_size != BADSIZE) {
-            f.size = static_cast<std::uint32_t>(elem_size * count);
+        if (elem_size != BADSIZE &&
+            elem_size <= std::numeric_limits<std::uint32_t>::max()) {
+            f.size = checked_u32_product(
+                static_cast<std::uint32_t>(elem_size), count).value_or(0);
         } else {
             f.size = count;  // Fallback
         }
@@ -549,7 +668,8 @@ struct SynthStruct {
     tid_t                   tid;            // Type ID in IDB
     qvector<SynthField>     fields;         // All fields
     std::uint32_t           size;           // Total size
-    std::uint32_t           alignment;      // Structure alignment
+    std::uint32_t           alignment;      // Effective structure alignment in bytes
+    std::optional<std::uint32_t> packing;   // Explicit packing cap in bytes; nullopt = ABI default
     ea_t                    source_func;    // Function where struct was synthesized
     qstring                 source_var;     // Variable name that was analyzed
     std::optional<SynthVTable> vtable;      // Associated vtable if any
@@ -581,9 +701,60 @@ struct SynthStruct {
 struct SubStructInfo {
     SynthStruct     structure;
     sval_t          parent_offset = 0;
+    int             source_var_idx = -1;
+    std::optional<lvar_locator_t> source_locator;
     qstring         field_name;
     NameMetadata    field_naming;
     qvector<SubStructInfo> children;
+};
+
+enum class ResourceLimitKind : std::uint8_t {
+    Accesses,
+    Candidates,
+    Fields,
+    ArrayElements,
+    StructureSize,
+    ConstraintPairs,
+    UnionAlternatives,
+    SolverTimeout,
+    SolverMemory,
+};
+
+[[nodiscard]] inline constexpr const char* resource_limit_kind_str(
+    ResourceLimitKind kind) noexcept
+{
+    switch (kind) {
+        case ResourceLimitKind::Accesses:          return "accesses";
+        case ResourceLimitKind::Candidates:        return "candidates";
+        case ResourceLimitKind::Fields:            return "fields";
+        case ResourceLimitKind::ArrayElements:     return "array_elements";
+        case ResourceLimitKind::StructureSize:     return "structure_size";
+        case ResourceLimitKind::ConstraintPairs:   return "constraint_pairs";
+        case ResourceLimitKind::UnionAlternatives: return "union_alternatives";
+        case ResourceLimitKind::SolverTimeout:     return "solver_timeout";
+        case ResourceLimitKind::SolverMemory:      return "solver_memory";
+        default:                                   return "unknown";
+    }
+}
+
+struct ResourceLimitViolation {
+    ResourceLimitKind kind = ResourceLimitKind::Candidates;
+    std::uint64_t configured_limit = 0;
+    std::uint64_t observed_value = 0;
+    qstring phase;
+};
+
+class ResourceLimitException final : public std::runtime_error {
+public:
+    ResourceLimitException(ResourceLimitKind kind,
+                           std::uint64_t configured_limit,
+                           std::uint64_t observed_value,
+                           const char* phase,
+                           const std::string& message)
+        : std::runtime_error(message)
+        , violation{kind, configured_limit, observed_value, qstring(phase)} {}
+
+    ResourceLimitViolation violation;
 };
 
 // ============================================================================
@@ -601,12 +772,14 @@ enum class SynthError : std::uint8_t {
     TypeCreationFailed,
     PropagationFailed,
     RewriteFailed,
+    ResourceLimitExceeded,
     InternalError,
     // Z3-specific errors
     Z3Timeout,              // Z3 solver timed out
     Z3OutOfMemory,          // Z3 ran out of memory
     Z3Unsat,                // Z3 constraints are unsatisfiable
-    Z3Disabled              // Z3 is disabled in configuration
+    Z3Disabled,             // Z3 is disabled in configuration
+    ExperimentalFeatureDisabled // Explicitly quarantined adjunct is disabled
 };
 
 /// Status of Z3 synthesis phase
@@ -618,6 +791,7 @@ enum class Z3SynthesisStatus : std::uint8_t {
     FallbackHeuristic,      // Fell back to heuristic synthesis
     Timeout,                // Z3 timed out
     OutOfMemory,            // Z3 ran out of memory
+    ResourceLimit,          // Host-side synthesis limit exceeded
     Unsat,                  // Constraints unsatisfiable
     Error                   // Internal error
 };
@@ -685,6 +859,7 @@ struct SynthResult {
     int                     vtable_slots;
     qvector<AccessConflict> conflicts;          // Conflicts for user review
     std::unique_ptr<SynthStruct> synthesized_struct;
+    std::optional<ResourceLimitViolation> resource_limit;
 
     // Z3-specific result information
     Z3SynthesisInfo         z3_info;            // Z3 synthesis details
@@ -741,6 +916,8 @@ enum class PropagationDirection : std::uint8_t {
 /// A site where type was propagated
 struct PropagationSite {
     ea_t            func_ea;
+    // Index in the post-application decompilation generation. A durable
+    // application whose locator can no longer be resolved reports -1.
     int             var_idx;
     qstring         var_name;
     tinfo_t         old_type;
@@ -761,18 +938,43 @@ struct PropagationResult {
     qvector<PropagationSite> sites;
     int                      success_count;
     int                      failure_count;
+    bool                     incomplete;
+    qstring                  error_message;
 
     PropagationResult()
         : success_count(0)
-        , failure_count(0) {}
+        , failure_count(0)
+        , incomplete(false) {}
+
+    [[nodiscard]] bool can_record_site() const noexcept {
+        return sites.size() < MAX_FIELDS;
+    }
+
+    void mark_incomplete(const char* reason) noexcept {
+        incomplete = true;
+        try {
+            if (error_message.empty() && reason != nullptr) {
+                error_message = reason;
+            }
+        } catch (...) {
+        }
+    }
 
     void add_success(PropagationSite&& site) {
+        if (!can_record_site()) {
+            mark_incomplete("propagation site limit exceeded");
+            return;
+        }
         site.success = true;
         sites.push_back(std::move(site));
         ++success_count;
     }
 
     void add_failure(PropagationSite&& site) {
+        if (!can_record_site()) {
+            mark_incomplete("propagation site limit exceeded");
+            return;
+        }
         site.success = false;
         sites.push_back(std::move(site));
         ++failure_count;
@@ -825,11 +1027,14 @@ struct RewriteResult {
         case SynthError::TypeCreationFailed:    return "Failed to create type";
         case SynthError::PropagationFailed:     return "Type propagation failed";
         case SynthError::RewriteFailed:         return "Pseudocode rewrite failed";
+        case SynthError::ResourceLimitExceeded: return "Synthesis resource limit exceeded";
         case SynthError::InternalError:         return "Internal error";
         case SynthError::Z3Timeout:             return "Z3 solver timed out";
         case SynthError::Z3OutOfMemory:         return "Z3 ran out of memory";
         case SynthError::Z3Unsat:               return "Z3 constraints unsatisfiable";
         case SynthError::Z3Disabled:            return "Z3 synthesis is disabled";
+        case SynthError::ExperimentalFeatureDisabled:
+            return "Experimental feature is disabled";
         default:                                return "Unknown error";
     }
 }
@@ -844,6 +1049,7 @@ struct RewriteResult {
         case Z3SynthesisStatus::FallbackHeuristic:  return "fallback_heuristic";
         case Z3SynthesisStatus::Timeout:            return "timeout";
         case Z3SynthesisStatus::OutOfMemory:        return "out_of_memory";
+        case Z3SynthesisStatus::ResourceLimit:      return "resource_limit";
         case Z3SynthesisStatus::Unsat:              return "unsat";
         case Z3SynthesisStatus::Error:              return "error";
         default:                                    return "unknown";
@@ -887,10 +1093,151 @@ struct RewriteResult {
     return 1;
 }
 
+/// Validate an ABI alignment before it is stored in SynthOptions::alignment or
+/// embedded in integer-valued solver constraints. The configured value must be
+/// positive, a power of two, and representable by the public int field.
+[[nodiscard]] inline constexpr bool is_valid_abi_alignment(
+    std::int64_t alignment) noexcept
+{
+    if (alignment <= 0 ||
+        alignment > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    const auto value = static_cast<std::uint64_t>(alignment);
+    return (value & (value - 1)) == 0;
+}
+
+/// Checked arithmetic in IDA's signed address-offset domain. The
+/// implementation avoids non-portable wider integer types and is therefore
+/// shared by MSVC, Clang, and GCC builds.
+[[nodiscard]] inline constexpr std::optional<sval_t> checked_sval_add(
+    sval_t lhs, sval_t rhs) noexcept {
+    constexpr sval_t kMin = std::numeric_limits<sval_t>::min();
+    constexpr sval_t kMax = std::numeric_limits<sval_t>::max();
+    if ((rhs > 0 && lhs > kMax - rhs) ||
+        (rhs < 0 && lhs < kMin - rhs)) {
+        return std::nullopt;
+    }
+    return static_cast<sval_t>(lhs + rhs);
+}
+
+[[nodiscard]] inline constexpr std::optional<sval_t> checked_sval_sub(
+    sval_t lhs, sval_t rhs) noexcept {
+    constexpr sval_t kMin = std::numeric_limits<sval_t>::min();
+    constexpr sval_t kMax = std::numeric_limits<sval_t>::max();
+    if ((rhs > 0 && lhs < kMin + rhs) ||
+        (rhs < 0 && lhs > kMax + rhs)) {
+        return std::nullopt;
+    }
+    return static_cast<sval_t>(lhs - rhs);
+}
+
+[[nodiscard]] inline constexpr std::optional<sval_t> checked_sval_mul(
+    sval_t lhs, sval_t rhs) noexcept {
+    using U = std::make_unsigned_t<sval_t>;
+    constexpr U kPositiveLimit =
+        static_cast<U>(std::numeric_limits<sval_t>::max());
+    constexpr U kNegativeLimit = kPositiveLimit + U{1};
+    const bool negative = (lhs < 0) != (rhs < 0);
+    const U lhs_bits = static_cast<U>(lhs);
+    const U rhs_bits = static_cast<U>(rhs);
+    const U lhs_magnitude = lhs < 0 ? U{0} - lhs_bits : lhs_bits;
+    const U rhs_magnitude = rhs < 0 ? U{0} - rhs_bits : rhs_bits;
+    const U limit = negative ? kNegativeLimit : kPositiveLimit;
+    if (lhs_magnitude != 0 && rhs_magnitude > limit / lhs_magnitude) {
+        return std::nullopt;
+    }
+    const U magnitude = lhs_magnitude * rhs_magnitude;
+    if (!negative) {
+        return static_cast<sval_t>(magnitude);
+    }
+    if (magnitude == kNegativeLimit) {
+        return std::numeric_limits<sval_t>::min();
+    }
+    return static_cast<sval_t>(-static_cast<sval_t>(magnitude));
+}
+
+[[nodiscard]] inline constexpr std::optional<sval_t> checked_sval_from_u64(
+    std::uint64_t value) noexcept {
+    if (value > static_cast<std::uint64_t>(
+            std::numeric_limits<sval_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<sval_t>(value);
+}
+
 /// Align offset to boundary
 [[nodiscard]] inline sval_t align_offset(sval_t offset, std::uint32_t alignment) noexcept {
-    if (alignment == 0) alignment = 1;
-    return (offset + alignment - 1) & ~(alignment - 1);
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        return std::numeric_limits<sval_t>::max();
+    }
+    const sval_t adjustment = static_cast<sval_t>(alignment - 1);
+    if (offset > std::numeric_limits<sval_t>::max() - adjustment) {
+        return std::numeric_limits<sval_t>::max();
+    }
+    return (offset + adjustment) & ~adjustment;
+}
+
+/// One selected storage location whose natural alignment constrains the
+/// maximum physically representable structure packing cap.
+struct PackingAlignmentRequirement {
+    sval_t offset = 0;
+    std::uint32_t natural_alignment = 1;
+};
+
+[[nodiscard]] inline bool is_valid_packing_value(std::uint32_t value) noexcept {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+/// Select the largest configured packing cap for which every selected field
+/// is aligned to min(natural_alignment, packing). Invalid/non-power-of-two
+/// options are ignored. Complexity: O(k log k + k*n) time and O(k) space.
+[[nodiscard]] inline std::optional<std::uint32_t> canonical_packing_cap(
+    std::span<const PackingAlignmentRequirement> requirements,
+    std::span<const std::uint32_t> packing_options,
+    std::uint32_t maximum_cap) {
+    if (maximum_cap == 0) {
+        return std::nullopt;
+    }
+
+    std::vector<std::uint32_t> options;
+    options.reserve(packing_options.size());
+    for (std::uint32_t value : packing_options) {
+        if (is_valid_packing_value(value) && value <= maximum_cap) {
+            options.push_back(value);
+        }
+    }
+    std::sort(options.begin(), options.end(), std::greater<std::uint32_t>());
+    options.erase(std::unique(options.begin(), options.end()), options.end());
+
+    for (std::uint32_t packing : options) {
+        const bool valid = std::all_of(
+            requirements.begin(), requirements.end(),
+            [packing](const PackingAlignmentRequirement& requirement) {
+                const std::uint32_t natural =
+                    std::max<std::uint32_t>(1, requirement.natural_alignment);
+                const std::uint32_t effective = std::min(natural, packing);
+                return requirement.offset % static_cast<sval_t>(effective) == 0;
+            });
+        if (valid) {
+            return packing;
+        }
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] inline std::uint32_t effective_alignment_for_packing(
+    std::span<const PackingAlignmentRequirement> requirements,
+    std::uint32_t packing) noexcept {
+    packing = std::max<std::uint32_t>(1, packing);
+    std::uint32_t result = 1;
+    for (const auto& requirement : requirements) {
+        result = std::max(
+            result,
+            std::min(std::max<std::uint32_t>(1, requirement.natural_alignment),
+                     packing));
+    }
+    return result;
 }
 
 /// Check if a type is a pointer type
@@ -927,7 +1274,7 @@ struct RewriteResult {
 
 /// Type priority scoring for conflict resolution (adopted from Suture)
 /// Higher score = more specific/preferred type
-[[nodiscard]] inline int type_priority_score(const tinfo_t& type) noexcept {
+[[nodiscard]] inline int type_priority_score(const tinfo_t& type) {
     if (type.empty()) return 0;
 
     // Function pointers are highest priority (most specific)
@@ -1002,6 +1349,138 @@ struct RewriteResult {
 
     // Default: keep first
     return a;
+}
+
+namespace detail {
+
+enum class EvidenceTypeClass : std::uint8_t {
+    Unknown,
+    Integer,
+    Floating,
+    Pointer,
+    Aggregate,
+};
+
+[[nodiscard]] inline EvidenceTypeClass evidence_type_class(
+    const FieldAccess& access) {
+    if (!access.inferred_type.empty()) {
+        if (access.inferred_type.is_ptr() || access.inferred_type.is_funcptr() ||
+            access.inferred_type.is_func()) {
+            return EvidenceTypeClass::Pointer;
+        }
+        if (access.inferred_type.is_floating()) {
+            return EvidenceTypeClass::Floating;
+        }
+        if (access.inferred_type.is_struct() || access.inferred_type.is_union() ||
+            access.inferred_type.is_array()) {
+            return EvidenceTypeClass::Aggregate;
+        }
+        const size_t size = access.inferred_type.get_size();
+        if (size != BADSIZE && size > 0) {
+            return EvidenceTypeClass::Integer;
+        }
+    }
+
+    switch (access.semantic_type) {
+        case SemanticType::Integer:
+        case SemanticType::UnsignedInteger:
+            return EvidenceTypeClass::Integer;
+        case SemanticType::Float:
+        case SemanticType::Double:
+            return EvidenceTypeClass::Floating;
+        case SemanticType::Pointer:
+        case SemanticType::FunctionPointer:
+        case SemanticType::VTablePointer:
+            return EvidenceTypeClass::Pointer;
+        case SemanticType::Array:
+        case SemanticType::NestedStruct:
+            return EvidenceTypeClass::Aggregate;
+        default:
+            return EvidenceTypeClass::Unknown;
+    }
+}
+
+} // namespace detail
+
+inline bool field_access_evidence_compatible(
+    const FieldAccess& lhs, const FieldAccess& rhs) {
+    const auto lhs_class = detail::evidence_type_class(lhs);
+    const auto rhs_class = detail::evidence_type_class(rhs);
+    return lhs_class == detail::EvidenceTypeClass::Unknown ||
+           rhs_class == detail::EvidenceTypeClass::Unknown ||
+           lhs_class == rhs_class;
+}
+
+inline void merge_field_access_evidence(
+    FieldAccess& dst, const FieldAccess& src) {
+    const bool dst_reads = dst.access_type == AccessType::Read ||
+                           dst.access_type == AccessType::ReadWrite;
+    const bool dst_writes = dst.access_type == AccessType::Write ||
+                            dst.access_type == AccessType::ReadWrite;
+    const bool src_reads = src.access_type == AccessType::Read ||
+                           src.access_type == AccessType::ReadWrite;
+    const bool src_writes = src.access_type == AccessType::Write ||
+                            src.access_type == AccessType::ReadWrite;
+    if ((dst_reads || src_reads) && (dst_writes || src_writes)) {
+        dst.access_type = AccessType::ReadWrite;
+    } else if (dst.access_type == AccessType::Unknown) {
+        dst.access_type = src.access_type;
+    }
+
+    if (semantic_priority(src.semantic_type) >
+        semantic_priority(dst.semantic_type)) {
+        dst.semantic_type = src.semantic_type;
+    }
+    if (!src.inferred_type.empty()) {
+        dst.inferred_type = resolve_type_conflict(
+            dst.inferred_type, src.inferred_type);
+    }
+    if (src.is_vtable_access) {
+        dst.is_vtable_access = true;
+        dst.vtable_slot = src.vtable_slot;
+    }
+    if (src.nested_info && !dst.nested_info) {
+        dst.nested_info = src.nested_info;
+    }
+    for (const auto& bitfield : src.bitfields) {
+        dst.add_bitfield(bitfield);
+    }
+    for (std::uint64_t value : src.observed_constants) {
+        dst.add_observed_constant(value);
+    }
+    dst.is_zero_init = dst.is_zero_init || src.is_zero_init;
+    dst.is_call_argument = dst.is_call_argument || src.is_call_argument;
+
+    if (src.array_stride_hint.has_value()) {
+        if (!dst.array_stride_hint.has_value()) {
+            dst.array_stride_hint = src.array_stride_hint;
+        } else if (*dst.array_stride_hint != *src.array_stride_hint) {
+            dst.array_stride_hint.reset();
+        }
+    }
+    if (src.base_indirection.has_value()) {
+        if (!dst.base_indirection.has_value()) {
+            dst.base_indirection = src.base_indirection;
+        } else if (*dst.base_indirection != *src.base_indirection) {
+            dst.base_indirection.reset();
+        }
+    }
+}
+
+inline bool canonical_field_access_less(
+    const FieldAccess& lhs, const FieldAccess& rhs) {
+    if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+    if (lhs.size != rhs.size) return lhs.size < rhs.size;
+    const auto lhs_class = detail::evidence_type_class(lhs);
+    const auto rhs_class = detail::evidence_type_class(rhs);
+    if (lhs_class != rhs_class) return lhs_class < rhs_class;
+    if (lhs.semantic_type != rhs.semantic_type) {
+        return lhs.semantic_type < rhs.semantic_type;
+    }
+    if (lhs.source_func_ea != rhs.source_func_ea) {
+        return lhs.source_func_ea < rhs.source_func_ea;
+    }
+    return lhs.insn_ea < rhs.insn_ea;
 }
 
 /// Generate unique structure name

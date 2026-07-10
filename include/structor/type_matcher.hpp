@@ -61,11 +61,11 @@ public:
         sval_t b_offset,
         std::uint32_t b_size) noexcept;
 
-    [[nodiscard]] static bool is_padding_name(const qstring& name) noexcept;
-    [[nodiscard]] static bool is_effective_padding(const SynthField& field) noexcept;
-    [[nodiscard]] static SemanticType semantic_from_type(const tinfo_t& type) noexcept;
-    [[nodiscard]] static bool types_compatible(const tinfo_t& a, const tinfo_t& b) noexcept;
-    [[nodiscard]] static bool field_name_can_be_reused(const SynthField& field) noexcept;
+    [[nodiscard]] static bool is_padding_name(const qstring& name);
+    [[nodiscard]] static bool is_effective_padding(const SynthField& field);
+    [[nodiscard]] static SemanticType semantic_from_type(const tinfo_t& type);
+    [[nodiscard]] static bool types_compatible(const tinfo_t& a, const tinfo_t& b);
+    [[nodiscard]] static bool field_name_can_be_reused(const SynthField& field);
 };
 
 } // namespace structor

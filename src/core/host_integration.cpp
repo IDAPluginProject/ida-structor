@@ -3,9 +3,40 @@
 #include <structor/global_object_analyzer.hpp>
 #include <structor/type_fixer.hpp>
 
+#include <exception>
+#include <type_traits>
+#include <utility>
+
 namespace structor {
 
 namespace {
+
+#ifndef STRUCTOR_TESTING
+template <typename Callable>
+class MainThreadRequest final : public exec_request_t {
+public:
+    explicit MainThreadRequest(Callable&& callable)
+        : callable_(std::move(callable)) {}
+
+    ssize_t idaapi execute() override {
+        try {
+            return callable_();
+        } catch (...) {
+            return -1;
+        }
+    }
+
+private:
+    Callable callable_;
+};
+
+template <typename Callable>
+[[nodiscard]] ssize_t dispatch_main_thread(Callable&& callable) {
+    using Request = MainThreadRequest<std::decay_t<Callable>>;
+    Request request(std::forward<Callable>(callable));
+    return execute_sync(request, MFF_WRITE);
+}
+#endif
 
 void print_type_fix_messages(const TypeFixResult& result, bool include_diagnostics) {
     for (const auto& warning : result.warnings) {
@@ -28,10 +59,27 @@ HostIntegration::HostIntegration(HostIntegrationOptions options)
 
 HostIntegration::~HostIntegration() {
     shutdown();
+    // Destruction with a live callback would leave the host holding a dangling
+    // userdata pointer. A failed synchronous dispatch cannot be recovered by
+    // invoking the non-thread-safe Hex-Rays removal API from the worker thread.
+    if (hook_lifecycle_.is_hooked()) {
+        std::terminate();
+    }
 }
 
 bool HostIntegration::install_hexrays_hooks() {
-    if (hexrays_hooked_) {
+#ifndef STRUCTOR_TESTING
+    if (!is_main_thread()) {
+        return dispatch_main_thread([this]() -> ssize_t {
+            return install_hexrays_hooks() ? 1 : 0;
+        }) > 0;
+    }
+#endif
+
+    if (!hook_lifecycle_.can_install()) {
+        return false;
+    }
+    if (hook_lifecycle_.is_hooked()) {
         return true;
     }
 
@@ -39,26 +87,54 @@ bool HostIntegration::install_hexrays_hooks() {
         return false;
     }
 
-    hexrays_hooked_ = true;
+    if (!hook_lifecycle_.mark_installed()) {
+        remove_hexrays_callback(hexrays_callback, this);
+        return false;
+    }
     return true;
 }
 
 void HostIntegration::uninstall_hexrays_hooks() {
-    if (!hexrays_hooked_) {
+#ifndef STRUCTOR_TESTING
+    if (!is_main_thread()) {
+        (void)dispatch_main_thread([this]() -> ssize_t {
+            uninstall_hexrays_hooks();
+            return 1;
+        });
+        return;
+    }
+#endif
+
+    if (!hook_lifecycle_.is_hooked()) {
         return;
     }
 
-    remove_hexrays_callback(hexrays_callback, this);
-    hexrays_hooked_ = false;
+    const int removed = remove_hexrays_callback(hexrays_callback, this);
+    if (removed <= 0) {
+        return;
+    }
+    hook_lifecycle_.mark_uninstalled();
 }
 
 void HostIntegration::shutdown() {
-    if (shutdown_) {
+#ifndef STRUCTOR_TESTING
+    if (!is_main_thread()) {
+        (void)dispatch_main_thread([this]() -> ssize_t {
+            shutdown();
+            return 1;
+        });
+        return;
+    }
+#endif
+
+    const bool first_shutdown = hook_lifecycle_.begin_shutdown();
+    // Always enforce the callback invariant, even on repeated shutdown calls.
+    uninstall_hexrays_hooks();
+    if (!first_shutdown) {
         return;
     }
 
-    shutdown_ = true;
-    uninstall_hexrays_hooks();
+    processing_functions_.clear();
     processed_functions_.clear();
 
     if (options_.clear_global_rewrites_on_shutdown) {
@@ -67,11 +143,29 @@ void HostIntegration::shutdown() {
 }
 
 void HostIntegration::reset_processed_functions() {
+#ifndef STRUCTOR_TESTING
+    if (!is_main_thread()) {
+        (void)dispatch_main_thread([this]() -> ssize_t {
+            reset_processed_functions();
+            return 1;
+        });
+        return;
+    }
+#endif
+
+    processing_functions_.clear();
     processed_functions_.clear();
 }
 
 void HostIntegration::handle_ctree_maturity(cfunc_t* cfunc, ctree_maturity_t maturity) {
-    if (!cfunc || maturity != CMAT_FINAL || !options_.enable_global_rewrite_callback) {
+#ifndef STRUCTOR_TESTING
+    if (!is_main_thread()) {
+        return;
+    }
+#endif
+
+    if (hook_lifecycle_.is_shutdown() ||
+        !cfunc || maturity != CMAT_FINAL || !options_.enable_global_rewrite_callback) {
         return;
     }
 
@@ -85,11 +179,18 @@ void HostIntegration::handle_ctree_maturity(cfunc_t* cfunc, ctree_maturity_t mat
 }
 
 void HostIntegration::handle_func_printed(cfunc_t* cfunc) {
-    if (!cfunc || !options_.enable_auto_type_fix_callback) {
+#ifndef STRUCTOR_TESTING
+    if (!is_main_thread()) {
+        return;
+    }
+#endif
+
+    if (hook_lifecycle_.is_shutdown() ||
+        !cfunc || !options_.enable_auto_type_fix_callback) {
         return;
     }
 
-    if (!Config::instance().options().auto_fix_types || auto_type_fixing_suppressed_) {
+    if (!Config::instance().options().auto_fix_types || auto_type_fixing_suppressed()) {
         return;
     }
 
@@ -102,20 +203,30 @@ ssize_t idaapi HostIntegration::hexrays_callback(void* ud, hexrays_event_t event
         return 0;
     }
 
-    switch (event) {
-        case hxe_maturity: {
-            cfunc_t* cfunc = va_arg(va, cfunc_t*);
-            ctree_maturity_t maturity = va_argi(va, ctree_maturity_t);
-            self->handle_ctree_maturity(cfunc, maturity);
-            break;
+    try {
+        switch (event) {
+            case hxe_maturity: {
+                cfunc_t* cfunc = va_arg(va, cfunc_t*);
+                ctree_maturity_t maturity = va_argi(va, ctree_maturity_t);
+                self->handle_ctree_maturity(cfunc, maturity);
+                break;
+            }
+            case hxe_func_printed: {
+                cfunc_t* cfunc = va_arg(va, cfunc_t*);
+                self->handle_func_printed(cfunc);
+                break;
+            }
+            default:
+                break;
         }
-        case hxe_func_printed: {
-            cfunc_t* cfunc = va_arg(va, cfunc_t*);
-            self->handle_func_printed(cfunc);
-            break;
-        }
-        default:
-            break;
+    } catch (const vd_interr_t& e) {
+        msg("Structor: Hex-Rays callback internal error: %s\n", e.desc().c_str());
+    } catch (const vd_failure_t& e) {
+        msg("Structor: Hex-Rays callback failure: %s\n", e.desc().c_str());
+    } catch (const std::exception& e) {
+        msg("Structor: Hex-Rays callback exception: %s\n", e.what());
+    } catch (...) {
+        msg("Structor: Hex-Rays callback raised an unknown exception\n");
     }
 
     return 0;
@@ -127,10 +238,17 @@ void HostIntegration::process_decompilation_complete(cfunc_t* cfunc) {
     }
 
     const ea_t func_ea = cfunc->entry_ea;
-    if (processed_functions_.count(func_ea) > 0) {
+    if (processed_functions_.count(func_ea) > 0 ||
+        processing_functions_.count(func_ea) > 0) {
         return;
     }
-    processed_functions_.insert(func_ea);
+
+    processing_functions_.insert(func_ea);
+    struct ProcessingGuard {
+        std::unordered_set<ea_t>& functions;
+        ea_t ea;
+        ~ProcessingGuard() { functions.erase(ea); }
+    } guard{processing_functions_, func_ea};
 
     if (Config::instance().options().debug_mode) {
         qstring func_name;
@@ -150,6 +268,7 @@ void HostIntegration::process_decompilation_complete(cfunc_t* cfunc) {
 
     TypeFixer fixer(fix_config);
     TypeFixResult result = fixer.fix_function_types(cfunc);
+    processed_functions_.insert(func_ea);
 
     const bool verbose = Config::instance().options().auto_fix_verbose;
     const bool debug = Config::instance().options().debug_mode;

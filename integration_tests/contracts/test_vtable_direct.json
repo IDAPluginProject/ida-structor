@@ -23,8 +23,7 @@
           "_access_object_fields",
           "_increment_fields",
           "_main",
-          "_modify_object_fields",
-          "_printf"
+          "_modify_object_fields"
         ],
         "failed_sites": [],
         "z3": {
@@ -32,10 +31,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_access_object_fields",
           "size": 32,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_access_object_fields",
           "source_var": "a1",
           "field_count": 4,
@@ -43,20 +44,33 @@
           "provenance": [],
           "fields": [
             {
-              "name": "ptr_0",
+              "name": "union_0",
               "offset": 0,
               "size": 8,
-              "semantic": "ptr",
-              "type": "void *",
+              "semantic": "unknown",
+              "type": "unsigned __int64",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u64_0",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "unsigned __int64"
+                },
+                {
+                  "name": "ptr_0",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "void *"
+                }
+              ]
             },
             {
               "name": "u64_8",
@@ -75,20 +89,33 @@
               "union_members": []
             },
             {
-              "name": "ptr_10",
+              "name": "union_10",
               "offset": 16,
               "size": 8,
-              "semantic": "ptr",
-              "type": "void *",
+              "semantic": "unknown",
+              "type": "unsigned __int64",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u64_10",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "unsigned __int64"
+                },
+                {
+                  "name": "ptr_10",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "void *"
+                }
+              ]
             },
             {
               "name": "u64_18",
@@ -110,7 +137,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> access_object_fields\n__int64 __fastcall access_object_fields(auto_access_object_fields *a1) {\n    return printf(\n               a1: \"vtable=%p, data1=%d, data2=%d, data3=%p, data4=%ld\\n\",\n               a1->ptr_0,\n               LODWORD(a1->u64_8),\n               HIDWORD(a1->u64_8),\n               a1->ptr_10,\n               a1->u64_18);\n}\n<<<\n\n>>> modify_object_fields\nauto_access_object_fields *__fastcall modify_object_fields(auto_access_object_fields *result, int a2, int a3) {\n    LODWORD(result->u64_8) = a2;\n    HIDWORD(result->u64_8) = a3;\n    result->u64_18 = a2 + a3;\n    return result;\n}\n<<<\n\n>>> increment_fields\nauto_access_object_fields *__fastcall increment_fields(auto_access_object_fields *result) {\n    ++LODWORD(result->u64_8);\n    ++HIDWORD(result->u64_8);\n    result->u64_18 *= 2LL;\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> access_object_fields\n__int64 __fastcall access_object_fields(auto_access_object_fields *a1) {\n    return printf(\n               a1: \"vtable=%p, data1=%d, data2=%d, data3=%p, data4=%ld\\n\",\n               a1->union_0.ptr_0,\n               LODWORD(a1->u64_8),\n               HIDWORD(a1->u64_8),\n               a1->union_10.ptr_10,\n               a1->u64_18);\n}\n<<<\n\n>>> modify_object_fields\nauto_access_object_fields *__fastcall modify_object_fields(auto_access_object_fields *result, int a2, int a3) {\n    LODWORD(result->u64_8) = a2;\n    HIDWORD(result->u64_8) = a3;\n    result->u64_18 = a2 + a3;\n    return result;\n}\n<<<\n\n>>> increment_fields\nauto_access_object_fields *__fastcall increment_fields(auto_access_object_fields *result) {\n    ++LODWORD(result->u64_8);\n    ++HIDWORD(result->u64_8);\n    result->u64_18 *= 2LL;\n    return result;\n}\n<<<\n"
     }
   ]
 }

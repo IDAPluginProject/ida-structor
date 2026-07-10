@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <map>
 #include <unordered_set>
 
 #ifndef STRUCTOR_TESTING
@@ -17,6 +18,15 @@ namespace structor::z3 {
 
 namespace {
 
+ArrayDetectionConfig make_bounded_array_config(
+    const LayoutConstraintConfig& config) {
+    return make_array_detection_config(
+        config.min_array_elements,
+        config.max_array_elements,
+        config.detect_symbolic_arrays,
+        config.max_array_stride);
+}
+
 bool is_redundant_aggregate_access(const UnifiedAccessPattern* pattern, const FieldAccess& access) {
     if (!pattern || access.inferred_type.empty()) {
         return false;
@@ -27,13 +37,16 @@ bool is_redundant_aggregate_access(const UnifiedAccessPattern* pattern, const Fi
     }
 
     int nested = 0;
-    const sval_t access_end = access.offset + static_cast<sval_t>(access.size);
+    const auto access_end = checked_interval_end(access.offset, access.size);
+    if (!access_end) {
+        return false;
+    }
     for (const auto& other : pattern->all_accesses) {
         if (&other == &access) {
             continue;
         }
-        const sval_t other_end = other.offset + static_cast<sval_t>(other.size);
-        if (other.offset >= access.offset && other_end <= access_end &&
+        const auto other_end = checked_interval_end(other.offset, other.size);
+        if (other_end && other.offset >= access.offset && *other_end <= *access_end &&
             (other.size < access.size || other.offset != access.offset)) {
             ++nested;
         }
@@ -172,10 +185,18 @@ SynthField field_from_candidate(
         semantic = SemanticType::NestedStruct;
     }
 
+    // Decode array candidates at element width, not total array width.
+    // Otherwise a 4-byte run of four byte accesses becomes uint32_t[4].
+    const uint32_t decode_size =
+        candidate.kind == FieldCandidate::Kind::ArrayField &&
+                candidate.array_stride.has_value()
+            ? *candidate.array_stride
+            : candidate.size;
+
     // Decode type
     field.type = type_encoder.decode(
         candidate.type_category,
-        candidate.size,
+        decode_size,
         &candidate.extended_type
     );
 
@@ -203,6 +224,16 @@ SynthField field_from_candidate(
 
     field.semantic = semantic;
 
+    if (!field.type.empty() && field.type.is_integral()) {
+        if (field.semantic == SemanticType::UnsignedInteger &&
+            !field.type.is_unsigned()) {
+            (void)field.type.change_sign(type_unsigned);
+        } else if (field.semantic == SemanticType::Integer &&
+                   field.type.is_unsigned()) {
+            (void)field.type.change_sign(type_signed);
+        }
+    }
+
     // Handle arrays
     if (candidate.kind == FieldCandidate::Kind::ArrayField &&
         candidate.array_element_count.has_value()) {
@@ -214,7 +245,12 @@ SynthField field_from_candidate(
         field.is_array = true;
         field.array_count = *candidate.array_element_count;
         field.semantic = SemanticType::Array;
-        field.size = candidate.array_stride.value_or(candidate.size) * *candidate.array_element_count;
+        const uint32_t stride = candidate.array_stride.value_or(decode_size);
+        if (stride != 0 &&
+            *candidate.array_element_count <=
+                std::numeric_limits<uint32_t>::max() / stride) {
+            field.size = stride * *candidate.array_element_count;
+        }
         field.name = make_array_field_name(candidate.offset,
                                            elem_type,
                                            semantic,
@@ -263,7 +299,7 @@ LayoutConstraintBuilder::LayoutConstraintBuilder(
     const LayoutConstraintConfig& config)
     : ctx_(ctx)
     , config_(config)
-    , array_builder_(ctx)
+    , array_builder_(ctx, make_bounded_array_config(config))
     , constraint_tracker_(ctx.ctx())
     , solver_(ctx.make_solver()) {}
 
@@ -273,21 +309,178 @@ void LayoutConstraintBuilder::build_constraints(
 {
     auto start_time = std::chrono::steady_clock::now();
 
+    if (config_.max_accesses == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Accesses, 0, pattern.all_accesses.size(),
+            "constraint_build",
+            "configured access-evidence limit is zero");
+    }
+    if (config_.max_candidates == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Candidates, 0, candidates.size(),
+            "constraint_build",
+            "configured field-candidate limit is zero");
+    }
+    if (config_.max_fields == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Fields, 0, 0,
+            "constraint_build",
+            "configured materialized-field limit is zero");
+    }
+    if (config_.max_array_elements == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::ArrayElements, 0, 0,
+            "constraint_build",
+            "configured array-inference element limit is zero");
+    }
+    if (config_.max_struct_size == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::StructureSize, 0, 0,
+            "constraint_build",
+            "configured structure-size limit is zero");
+    }
+    if (config_.max_constraint_pairs == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::ConstraintPairs, 0, 0,
+            "constraint_build",
+            "configured constraint-relation limit is zero");
+    }
+    if (config_.max_union_alternatives == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::UnionAlternatives, 0, 0,
+            "constraint_build",
+            "configured per-union alternative limit is zero");
+    }
+    if (!is_valid_abi_alignment(
+            static_cast<std::int64_t>(config_.default_alignment))) {
+        throw std::invalid_argument(
+            "layout default alignment must be a non-zero power of two representable by SynthOptions::alignment");
+    }
+    if (pattern.all_accesses.size() > config_.max_accesses) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Accesses,
+            config_.max_accesses,
+            pattern.all_accesses.size(),
+            "constraint_build",
+            "access evidence exceeds the configured synthesis limit");
+    }
+
+    sval_t evidence_origin = 0;
+    sval_t evidence_end = 0;
+    for (const auto& access : pattern.all_accesses) {
+        evidence_origin = std::min(evidence_origin, access.offset);
+        const auto end = checked_interval_end(access.offset, access.size);
+        if (!end) {
+            throw ResourceLimitException(
+                ResourceLimitKind::StructureSize,
+                config_.max_struct_size,
+                std::numeric_limits<std::uint64_t>::max(),
+                "constraint_build",
+                "access evidence interval overflows the signed offset domain");
+        }
+        evidence_end = std::max(evidence_end, *end);
+    }
+    const auto evidence_span = checked_interval_span(
+        evidence_origin, evidence_end);
+    if (!evidence_span || *evidence_span > config_.max_struct_size) {
+        throw ResourceLimitException(
+            ResourceLimitKind::StructureSize,
+            config_.max_struct_size,
+            evidence_span.value_or(std::numeric_limits<std::uint64_t>::max()),
+            "constraint_build",
+            "recovered object span exceeds the configured structure-size limit");
+    }
+
+    // Oversized arrays are optional aggregate interpretations.  Omit those
+    // candidates before pair construction while retaining direct scalar
+    // evidence, which remains mandatory and truthfully coverable.
+    qvector<FieldCandidate> bounded_candidates;
+    bounded_candidates.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        if (!candidate.within_array_element_limit(
+                config_.max_array_elements)) {
+            continue;
+        }
+
+        const auto end = candidate.checked_end_offset();
+        const auto span = end && candidate.offset >= evidence_origin
+            ? checked_interval_span(evidence_origin, *end)
+            : std::nullopt;
+        if (!span || *span > config_.max_struct_size) {
+            throw ResourceLimitException(
+                ResourceLimitKind::StructureSize,
+                config_.max_struct_size,
+                span.value_or(std::numeric_limits<std::uint64_t>::max()),
+                "constraint_build",
+                "field candidate interval exceeds the configured structure domain");
+        }
+        bounded_candidates.push_back(candidate);
+    }
+
+    if (bounded_candidates.size() > config_.max_candidates) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Candidates,
+            config_.max_candidates,
+            bounded_candidates.size(),
+            "constraint_build",
+            "field candidates exceed the configured solver limit");
+    }
+
+    std::vector<UnionAlternativeDescriptor> union_descriptors;
+    union_descriptors.reserve(bounded_candidates.size());
+    for (const auto& candidate : bounded_candidates) {
+        union_descriptors.push_back({
+            static_cast<std::int64_t>(candidate.offset),
+            candidate.size,
+            candidate.kind == FieldCandidate::Kind::UnionAlternative});
+    }
+    if (config_.allow_unions) {
+        const auto largest_union = largest_mandatory_union_cluster(
+            union_descriptors);
+        if (largest_union.count > config_.max_union_alternatives) {
+            throw ResourceLimitException(
+                ResourceLimitKind::UnionAlternatives,
+                config_.max_union_alternatives,
+                largest_union.count,
+                "constraint_build",
+                "mandatory storage interpretations exceed the per-union alternative limit");
+        }
+    }
+
+    const uint64_t candidate_count = bounded_candidates.size();
+    const auto relation_count = checked_layout_relation_count(
+        candidate_count, config_.max_fields, config_.allow_unions);
+    if (!relation_count ||
+        *relation_count > config_.max_constraint_pairs) {
+        throw ResourceLimitException(
+            ResourceLimitKind::ConstraintPairs,
+            config_.max_constraint_pairs,
+            relation_count.value_or(
+                std::numeric_limits<std::uint64_t>::max()),
+            "constraint_build",
+            "candidate-pair and union-cardinality relations exceed the configured constraint limit");
+    }
+
     z3_log("[Structor/Z3] Building constraints for %zu accesses, %zu field candidates\n",
-           pattern.all_accesses.size(), candidates.size());
+           pattern.all_accesses.size(), bounded_candidates.size());
 
     pattern_ = &pattern;
-    candidates_ = candidates;
+    candidates_ = std::move(bounded_candidates);
 
     // Reset state
     field_vars_.clear();
     arrays_.clear();
     union_resolutions_.clear();
+    packing_var_.reset();
+    inferred_packing_.reset();
+    statistics_ = {};
     solver_.reset();
     constraint_tracker_.clear();
 
     // Detect arrays first
-    arrays_ = array_builder_.detect_arrays(pattern.all_accesses);
+    if (config_.detect_arrays) {
+        arrays_ = array_builder_.detect_arrays(pattern.all_accesses);
+    }
     if (!arrays_.empty()) {
         z3_log("[Structor/Z3] Detected %zu potential arrays\n", arrays_.size());
     }
@@ -325,15 +518,32 @@ void LayoutConstraintBuilder::build_constraints(
 void LayoutConstraintBuilder::create_field_variables() {
     auto& ctx = ctx_.ctx();
 
+    // A C/C++ union's alternatives share one storage origin. Assign a stable
+    // group id per candidate offset instead of asking Z3 to discover an
+    // arbitrary graph coloring. This removes group-label symmetry and permits
+    // linear per-storage cardinality constraints.
+    std::map<sval_t, int> union_group_by_offset;
+    for (const auto& candidate : candidates_) {
+        union_group_by_offset.emplace(candidate.offset, 0);
+    }
+    int next_union_group = 0;
+    for (auto& [offset, group] : union_group_by_offset) {
+        (void)offset;
+        group = next_union_group++;
+    }
+    std::vector<std::vector<size_t>> candidates_by_union_group(
+        union_group_by_offset.size());
+
     z3_log("[Structor/Z3] Creating field variables for %zu candidates\n", candidates_.size());
 
     // Create packing variable if needed
-    if (config_.model_packing && !config_.packing_options.empty()) {
+    const qvector<uint32_t> packing_options = normalized_packing_options();
+    if (config_.model_packing && !packing_options.empty()) {
         packing_var_ = ctx.int_const("__packing");
 
         // Constrain packing to valid options (hard constraint, not tracked)
         ::z3::expr_vector options(ctx);
-        for (uint32_t p : config_.packing_options) {
+        for (uint32_t p : packing_options) {
             options.push_back(*packing_var_ == static_cast<int>(p));
         }
 
@@ -342,7 +552,8 @@ void LayoutConstraintBuilder::create_field_variables() {
         prov.is_soft = false;
         prov.kind = ConstraintProvenance::Kind::Other;
         constraint_tracker_.add_hard(solver_, ::z3::mk_or(options), prov);
-        z3_log("[Structor/Z3]   Added packing constraint with %zu options\n", config_.packing_options.size());
+        z3_log("[Structor/Z3]   Added packing constraint with %zu options\n",
+               packing_options.size());
     }
 
     // Create variables for each candidate
@@ -357,38 +568,51 @@ void LayoutConstraintBuilder::create_field_variables() {
         prefix.sprnt("f%zu_", i);
 
         fv.selected = ctx.bool_const((prefix + "sel").c_str());
-        fv.offset = ctx.int_val(static_cast<int>(cand.offset));  // Fixed
-        fv.size = ctx.int_val(static_cast<int>(cand.size));      // Fixed
+        fv.offset = ctx_.int_val(static_cast<int64_t>(cand.offset));  // Fixed
+        fv.size = ctx_.uint_val(cand.size);                      // Fixed
         fv.type = ctx.int_val(static_cast<int>(cand.type_category));  // Fixed
         fv.is_array = ctx.bool_val(cand.is_array());
         fv.array_count = ctx.int_val(cand.array_element_count.value_or(1));
         fv.is_union_member = ctx.bool_const((prefix + "union").c_str());
         fv.union_group = ctx.int_const((prefix + "ugrp").c_str());
 
-        // Constraint: if not union member, union_group is -1 (hard, tracked)
+        const int deterministic_union_group =
+            union_group_by_offset.at(cand.offset);
+        candidates_by_union_group[
+            static_cast<size_t>(deterministic_union_group)].push_back(i);
+
+        // Selected union alternatives at the same byte offset use one
+        // canonical group id. Nonmembers carry the -1 sentinel. This domain
+        // also canonicalizes every unselected candidate as a nonmember.
         {
             ConstraintProvenance prov;
-            prov.description.sprnt("Union group default for field %zu", i);
+            prov.description.sprnt(
+                "Canonical union group for field %zu at offset 0x%llX",
+                i,
+                static_cast<unsigned long long>(cand.offset));
             prov.is_soft = false;
             prov.kind = ConstraintProvenance::Kind::Other;
-            constraint_tracker_.add_hard(solver_, 
-                ::z3::implies(!fv.is_union_member, fv.union_group == -1), prov);
+            const ::z3::expr nonmember =
+                !fv.is_union_member && fv.union_group == -1;
+            const ::z3::expr member =
+                fv.selected && fv.is_union_member &&
+                fv.union_group == deterministic_union_group;
+            constraint_tracker_.add_hard(
+                solver_, nonmember || member, prov);
         }
 
-        // Constraint: union group in valid range (hard, tracked)
-        {
+        if (!config_.allow_unions) {
             ConstraintProvenance prov;
-            prov.description.sprnt("Union group bounds for field %zu", i);
+            prov.description.sprnt("Union membership disabled for field %zu", i);
             prov.is_soft = false;
             prov.kind = ConstraintProvenance::Kind::Other;
-            constraint_tracker_.add_hard(solver_, fv.union_group >= -1, prov);
-            constraint_tracker_.add_hard(solver_, 
-                fv.union_group < config_.max_union_alternatives, prov);
+            constraint_tracker_.add_hard(solver_, !fv.is_union_member, prov);
         }
 
-        // Soft constraint: prefer NOT being a union member
-        // This prevents Z3 from arbitrarily marking fields as unions
-        {
+        // Soft constraint: prefer NOT being a union member. Evidence-backed
+        // alternatives are handled by hard constraints in add_type_constraints;
+        // penalizing them here only forces an avoidable relaxation round.
+        if (cand.kind != FieldCandidate::Kind::UnionAlternative) {
             int weight = access_weight(cand, config_.weight_prefer_non_union);
             if (weight > 0) {
                 ConstraintProvenance prov;
@@ -414,6 +638,33 @@ void LayoutConstraintBuilder::create_field_variables() {
         }
 
         field_vars_.push_back(fv);
+    }
+
+    if (config_.allow_unions && !field_vars_.empty()) {
+        for (size_t group = 0;
+             group < candidates_by_union_group.size(); ++group) {
+            ::z3::expr selected_members = ctx.int_val(0);
+            for (size_t candidate_index :
+                 candidates_by_union_group[group]) {
+                const auto& fv = field_vars_[candidate_index];
+                selected_members = selected_members + ::z3::ite(
+                    fv.selected && fv.is_union_member,
+                    ctx.int_val(1),
+                    ctx.int_val(0));
+            }
+            ConstraintProvenance prov;
+            prov.description.sprnt(
+                "Storage union group %zu has at most %u selected alternatives",
+                group,
+                config_.max_union_alternatives);
+            prov.is_soft = false;
+            prov.kind = ConstraintProvenance::Kind::Other;
+            constraint_tracker_.add_hard(
+                solver_,
+                selected_members <=
+                    ctx.int_val(config_.max_union_alternatives),
+                prov);
+        }
     }
 }
 
@@ -580,12 +831,9 @@ void LayoutConstraintBuilder::add_coverage_constraints() {
 }
 
 void LayoutConstraintBuilder::add_non_overlap_constraints() {
-    auto& ctx = ctx_.ctx();
-
     z3_log("[Structor/Z3] Adding non-overlap constraints (allow_unions=%s)\n", 
            config_.allow_unions ? "true" : "false");
     int overlap_count = 0;
-    int non_overlap_union_constraints = 0;
 
     // OPTIMIZATION: Use O(n log n) sweep line algorithm for large candidate sets
     // instead of O(n²) pairwise comparison
@@ -621,8 +869,8 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
             
             if (config_.allow_unions) {
                 ::z3::expr non_overlap =
-                    (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
-                    (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
+                    (fv1.offset + ctx_.uint_val(c1.size) <= fv2.offset) ||
+                    (fv2.offset + ctx_.uint_val(c2.size) <= fv1.offset);
 
                 ::z3::expr same_union =
                     fv1.is_union_member && fv2.is_union_member &&
@@ -637,15 +885,13 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
                 ConstraintProvenance prov;
                 prov.description.sprnt("Non-overlap or union at 0x%llX",
                     static_cast<unsigned long long>(c1.offset));
-                prov.is_soft = true;
+                prov.is_soft = false;
                 prov.kind = ConstraintProvenance::Kind::NonOverlap;
-                prov.weight = config_.weight_minimize_fields;
-
-                constraint_tracker_.add_soft(solver_, constraint, prov, config_.weight_minimize_fields);
+                constraint_tracker_.add_hard(solver_, constraint, prov);
             } else {
                 ::z3::expr non_overlap =
-                    (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
-                    (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
+                    (fv1.offset + ctx_.uint_val(c1.size) <= fv2.offset) ||
+                    (fv2.offset + ctx_.uint_val(c2.size) <= fv1.offset);
 
                 ::z3::expr constraint = ::z3::implies(
                     fv1.selected && fv2.selected,
@@ -662,35 +908,6 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
             }
         }
         
-        // For non-overlapping pairs in union mode, add different-groups constraints
-        // Build a set of overlapping pairs for quick lookup using FlatHashSet
-        if (config_.allow_unions) {
-            FlatHashSet<uint64_t> overlap_set;
-            overlap_set.reserve(overlapping_pairs.size());
-            for (const auto& [i, j] : overlapping_pairs) {
-                uint32_t lo = static_cast<uint32_t>(std::min(i, j));
-                uint32_t hi = static_cast<uint32_t>(std::max(i, j));
-                overlap_set.insert((static_cast<uint64_t>(hi) << 32) | lo);
-            }
-            
-            // Add different-groups for non-overlapping pairs
-            for (size_t i = 0; i < n; ++i) {
-                for (size_t j = i + 1; j < n; ++j) {
-                    uint64_t key = (static_cast<uint64_t>(j) << 32) | i;
-                    if (!overlap_set.contains(key)) {
-                        const auto& fv1 = field_vars_[i];
-                        const auto& fv2 = field_vars_[j];
-                        
-                        ::z3::expr different_groups = 
-                            !fv1.is_union_member || !fv2.is_union_member ||
-                            (fv1.union_group != fv2.union_group);
-                        
-                        solver_.add(::z3::implies(fv1.selected && fv2.selected, different_groups));
-                        ++non_overlap_union_constraints;
-                    }
-                }
-            }
-        }
     } else {
         // Small set - use O(n²) which has lower constant factors
         for (size_t i = 0; i < n; ++i) {
@@ -703,22 +920,14 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
                 bool could_overlap = c1.overlaps(c2);
 
                 if (!could_overlap) {
-                    if (config_.allow_unions) {
-                        ::z3::expr different_groups = 
-                            !fv1.is_union_member || !fv2.is_union_member ||
-                            (fv1.union_group != fv2.union_group);
-                        
-                        solver_.add(::z3::implies(fv1.selected && fv2.selected, different_groups));
-                        ++non_overlap_union_constraints;
-                    }
                     continue;
                 }
                 ++overlap_count;
 
                 if (config_.allow_unions) {
                     ::z3::expr non_overlap =
-                        (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
-                        (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
+                        (fv1.offset + ctx_.uint_val(c1.size) <= fv2.offset) ||
+                        (fv2.offset + ctx_.uint_val(c2.size) <= fv1.offset);
 
                     ::z3::expr same_union =
                         fv1.is_union_member && fv2.is_union_member &&
@@ -733,15 +942,13 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
                     ConstraintProvenance prov;
                     prov.description.sprnt("Non-overlap or union at 0x%llX",
                         static_cast<unsigned long long>(c1.offset));
-                    prov.is_soft = true;
+                    prov.is_soft = false;
                     prov.kind = ConstraintProvenance::Kind::NonOverlap;
-                    prov.weight = config_.weight_minimize_fields;
-
-                    constraint_tracker_.add_soft(solver_, constraint, prov, config_.weight_minimize_fields);
+                    constraint_tracker_.add_hard(solver_, constraint, prov);
                 } else {
                     ::z3::expr non_overlap =
-                        (fv1.offset + ctx.int_val(static_cast<int>(c1.size)) <= fv2.offset) ||
-                        (fv2.offset + ctx.int_val(static_cast<int>(c2.size)) <= fv1.offset);
+                        (fv1.offset + ctx_.uint_val(c1.size) <= fv2.offset) ||
+                        (fv2.offset + ctx_.uint_val(c2.size) <= fv1.offset);
 
                     ::z3::expr constraint = ::z3::implies(
                         fv1.selected && fv2.selected,
@@ -761,10 +968,6 @@ void LayoutConstraintBuilder::add_non_overlap_constraints() {
     }
     
     z3_log("[Structor/Z3]   Added %d non-overlap constraints for overlapping candidate pairs\n", overlap_count);
-    if (non_overlap_union_constraints > 0) {
-        z3_log("[Structor/Z3]   Added %d constraints preventing non-overlapping fields from sharing union groups\n", 
-               non_overlap_union_constraints);
-    }
 }
 
 void LayoutConstraintBuilder::add_alignment_constraints() {
@@ -775,7 +978,10 @@ void LayoutConstraintBuilder::add_alignment_constraints() {
 
     for (const auto& fv : field_vars_) {
         const auto& cand = candidates_[fv.candidate_id];
-        uint32_t natural_align = ctx_.type_encoder().natural_alignment(cand.type_category);
+        uint32_t natural_align = std::min(
+            ctx_.type_encoder().natural_alignment(cand.type_category),
+            cand.alignment());
+        natural_align = std::max<uint32_t>(1, natural_align);
 
         // Effective alignment = min(natural_align, packing)
         ::z3::expr effective_align = config_.model_packing && packing_var_
@@ -791,7 +997,7 @@ void LayoutConstraintBuilder::add_alignment_constraints() {
 
         if (!always_aligned) {
             // Only add constraint if misaligned
-            ::z3::expr offset_val = ctx.int_val(static_cast<int>(cand.offset));
+            ::z3::expr offset_val = ctx_.int_val(static_cast<int64_t>(cand.offset));
             ::z3::expr constraint = ::z3::implies(
                 fv.selected,
                 ::z3::mod(offset_val, effective_align) == 0);
@@ -817,6 +1023,7 @@ void LayoutConstraintBuilder::add_type_constraints() {
     // that might end up in the same union
 
     z3_log("[Structor/Z3] Adding type consistency constraints\n");
+    auto& ctx = ctx_.ctx();
     int type_constraint_count = 0;
 
     std::vector<size_t> by_offset(field_vars_.size());
@@ -851,9 +1058,68 @@ void LayoutConstraintBuilder::add_type_constraints() {
 
                 // Check type compatibility
                 bool compatible = types_compatible(c1.type_category, c2.type_category);
+                for (int lhs_idx : c1.source_access_indices) {
+                    if (lhs_idx < 0 ||
+                        static_cast<size_t>(lhs_idx) >= pattern_->all_accesses.size()) {
+                        continue;
+                    }
+                    for (int rhs_idx : c2.source_access_indices) {
+                        if (rhs_idx < 0 ||
+                            static_cast<size_t>(rhs_idx) >= pattern_->all_accesses.size()) {
+                            continue;
+                        }
+                        if (!field_access_evidence_compatible(
+                                pattern_->all_accesses[static_cast<size_t>(lhs_idx)],
+                                pattern_->all_accesses[static_cast<size_t>(rhs_idx)])) {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                    if (!compatible) {
+                        break;
+                    }
+                }
                 ++type_constraint_count;
 
                 if (!compatible) {
+                    const bool direct_evidence_alternatives =
+                        c1.offset == c2.offset && c1.size == c2.size &&
+                        !c1.source_access_indices.empty() &&
+                        !c2.source_access_indices.empty() &&
+                        (c1.kind == FieldCandidate::Kind::DirectAccess ||
+                         c1.kind == FieldCandidate::Kind::UnionAlternative) &&
+                        (c2.kind == FieldCandidate::Kind::DirectAccess ||
+                         c2.kind == FieldCandidate::Kind::UnionAlternative);
+
+                    if (direct_evidence_alternatives) {
+                        ConstraintProvenance prov;
+                        prov.description.sprnt(
+                            "Mandatory incompatible storage views at 0x%llX: %s vs %s",
+                            static_cast<unsigned long long>(c1.offset),
+                            type_category_name(c1.type_category),
+                            type_category_name(c2.type_category));
+                        prov.is_soft = false;
+                        prov.kind = ConstraintProvenance::Kind::TypeMatch;
+
+                        if (!config_.allow_unions) {
+                            constraint_tracker_.add_hard(
+                                solver_, ctx.bool_val(false), prov);
+                        } else {
+                            const ::z3::expr mandatory_union =
+                                field_vars_[i].selected &&
+                                field_vars_[j].selected &&
+                                field_vars_[i].is_union_member &&
+                                field_vars_[j].is_union_member &&
+                                field_vars_[i].union_group >= 0 &&
+                                field_vars_[i].union_group ==
+                                    field_vars_[j].union_group;
+                            constraint_tracker_.add_hard(
+                                solver_, mandatory_union, prov);
+                        }
+                        ++statistics_.type_constraints;
+                        continue;
+                    }
+
                     if (config_.allow_unions) {
                         continue;
                     }
@@ -1053,25 +1319,40 @@ void LayoutConstraintBuilder::add_type_preference_constraints() {
 }
 
 void LayoutConstraintBuilder::add_size_bound_constraints() {
-    // Add hard constraint for max struct size
-    // The struct size is max(field.offset + field.size) for all selected fields
-
-    // Since offsets/sizes are fixed, we can just check the bounds
-    sval_t max_end = 0;
-    for (const auto& cand : candidates_) {
-        sval_t end = cand.offset + cand.size;
-        max_end = std::max(max_end, end);
+    sval_t evidence_origin = 0;
+    if (pattern_) {
+        for (const auto& access : pattern_->all_accesses) {
+            evidence_origin = std::min(evidence_origin, access.offset);
+        }
     }
 
-    if (max_end > static_cast<sval_t>(config_.max_struct_size)) {
+    for (size_t i = 0; i < candidates_.size(); ++i) {
+        const auto& candidate = candidates_[i];
+        bool in_bounds = candidate.offset >= evidence_origin;
+        uint64_t span = std::numeric_limits<uint64_t>::max();
+        if (in_bounds &&
+            candidate.offset <= std::numeric_limits<sval_t>::max() -
+                                    static_cast<sval_t>(candidate.size)) {
+            const sval_t end =
+                candidate.offset + static_cast<sval_t>(candidate.size);
+            span = static_cast<uint64_t>(end) -
+                   static_cast<uint64_t>(evidence_origin);
+            in_bounds = span <= config_.max_struct_size;
+        }
+
         ConstraintProvenance prov;
-        prov.description.sprnt("Struct size limit exceeded (max=%u)",
+        prov.description.sprnt(
+            "Structure bound for candidate %zu (span=%llu, max=%u)",
+            i,
+            static_cast<unsigned long long>(span),
             config_.max_struct_size);
         prov.is_soft = false;
         prov.kind = ConstraintProvenance::Kind::SizeMatch;
-
-        // This would make the whole thing UNSAT - issue a warning instead
-        // For now, just log and continue
+        constraint_tracker_.add_hard(
+            solver_,
+            ::z3::implies(field_vars_[i].selected,
+                          ctx_.ctx().bool_val(in_bounds)),
+            prov);
     }
 }
 
@@ -1136,8 +1417,302 @@ void LayoutConstraintBuilder::add_optimization_objectives() {
     }
 }
 
+qvector<uint32_t> LayoutConstraintBuilder::normalized_packing_options() const {
+    qvector<uint32_t> result;
+    if (!config_.model_packing || config_.default_alignment == 0) {
+        return result;
+    }
+
+    for (uint32_t value : config_.packing_options) {
+        const bool is_power_of_two = value != 0 && (value & (value - 1)) == 0;
+        if (!is_power_of_two || value > config_.default_alignment) {
+            continue;
+        }
+        if (std::find(result.begin(), result.end(), value) == result.end()) {
+            result.push_back(value);
+        }
+    }
+
+    // The ABI-default cap is a real domain value even when it is larger than
+    // IDA's explicit #pragma-pack choices.  Without it, alignment=32 would
+    // force every naturally aligned structure into an artificial pack(16).
+    if (is_valid_packing_value(config_.default_alignment) &&
+        std::find(result.begin(), result.end(), config_.default_alignment) ==
+            result.end()) {
+        result.push_back(config_.default_alignment);
+    }
+
+    std::sort(result.begin(), result.end(), std::greater<uint32_t>());
+    return result;
+}
+
+std::optional<::z3::model> LayoutConstraintBuilder::canonicalize_packing_model(
+    const ::z3::model& model,
+    const ::z3::expr_vector& active_assumptions)
+{
+    inferred_packing_.reset();
+    if (!packing_var_) {
+        return model;
+    }
+
+    const qvector<uint32_t> options = normalized_packing_options();
+    if (options.empty()) {
+        return std::nullopt;
+    }
+
+    qvector<uint32_t> physically_valid;
+    for (uint32_t packing : options) {
+        bool valid = true;
+        for (const auto& fv : field_vars_) {
+            if (!get_bool_value(model, fv.selected)) {
+                continue;
+            }
+
+            const auto& candidate = candidates_[fv.candidate_id];
+            const uint32_t natural_alignment = std::max<uint32_t>(
+                1, std::min(
+                    ctx_.type_encoder().natural_alignment(candidate.type_category),
+                    candidate.alignment()));
+            const uint32_t effective_alignment =
+                std::min(natural_alignment, packing);
+            if (candidate.offset % static_cast<sval_t>(effective_alignment) != 0) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) {
+            physically_valid.push_back(packing);
+        }
+    }
+
+    if (physically_valid.empty()) {
+        return std::nullopt;
+    }
+
+    // Pin all decisions from the original model. This makes the packing
+    // canonicalization a metadata refinement, never a second layout choice.
+    solver_.push();
+    for (const auto& fv : field_vars_) {
+        solver_.add(fv.selected == ctx_.ctx().bool_val(get_bool_value(model, fv.selected)));
+        solver_.add(
+            fv.is_union_member ==
+            ctx_.ctx().bool_val(get_bool_value(model, fv.is_union_member)));
+        solver_.add(
+            fv.union_group ==
+            ctx_.ctx().int_val(static_cast<int>(get_int_value(model, fv.union_group))));
+    }
+
+    std::optional<::z3::model> canonical_model;
+    for (uint32_t packing : physically_valid) {
+        solver_.push();
+        solver_.add(*packing_var_ == static_cast<int>(packing));
+        if (check_solver_with_deadline(active_assumptions) == ::z3::sat) {
+            canonical_model = solver_.get_model();
+            inferred_packing_ = packing;
+            solver_.pop();
+            break;
+        }
+        solver_.pop();
+    }
+    solver_.pop();
+
+    return canonical_model;
+}
+
+::z3::check_result LayoutConstraintBuilder::check_solver_with_deadline(
+    const ::z3::expr_vector& assumptions) {
+    last_unknown_reason_.clear();
+    if (solve_deadline_) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= *solve_deadline_) {
+            solve_deadline_exhausted_ = true;
+            last_unknown_reason_ = "aggregate solver deadline exceeded";
+            return ::z3::unknown;
+        }
+
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            *solve_deadline_ - now);
+        const unsigned timeout_ms = static_cast<unsigned>(std::max<int64_t>(
+            1, remaining.count() + 1));
+        ::z3::params params(ctx_.ctx());
+        params.set("timeout", timeout_ms);
+        if (ctx_.config().max_memory_mb != 0) {
+            params.set("max_memory", ctx_.config().max_memory_mb);
+        }
+        if (ctx_.config().produce_unsat_cores) {
+            params.set("unsat_core", true);
+        }
+        solver_.set(params);
+    }
+
+    ++statistics_.solve_iterations;
+    const auto result = solver_.check(assumptions);
+    if (result == ::z3::unknown) {
+        last_unknown_reason_ = Z3Context::get_unknown_reason(solver_);
+        if (solve_deadline_ &&
+            std::chrono::steady_clock::now() >= *solve_deadline_) {
+            solve_deadline_exhausted_ = true;
+            last_unknown_reason_ = "aggregate solver deadline exceeded";
+        }
+    }
+    return result;
+}
+
+::z3::check_result LayoutConstraintBuilder::check_optimizer_with_deadline(
+    ::z3::optimize& optimizer) {
+    last_unknown_reason_.clear();
+    if (solve_deadline_) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= *solve_deadline_) {
+            solve_deadline_exhausted_ = true;
+            last_unknown_reason_ = "aggregate solver deadline exceeded";
+            return ::z3::unknown;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            *solve_deadline_ - now);
+        ::z3::params params(ctx_.ctx());
+        params.set("timeout", static_cast<unsigned>(std::max<int64_t>(
+            1, remaining.count() + 1)));
+        optimizer.set(params);
+    }
+
+    ++statistics_.solve_iterations;
+    const auto result = optimizer.check();
+    if (result == ::z3::unknown) {
+        if (const char* reason = Z3_optimize_get_reason_unknown(
+                ctx_.ctx(), optimizer)) {
+            last_unknown_reason_ = reason;
+        }
+        if (solve_deadline_ &&
+            std::chrono::steady_clock::now() >= *solve_deadline_) {
+            solve_deadline_exhausted_ = true;
+            last_unknown_reason_ = "aggregate solver deadline exceeded";
+        }
+    }
+    return result;
+}
+
+Z3Result LayoutConstraintBuilder::solve_weighted_maxsmt(
+    std::chrono::steady_clock::time_point start_time) {
+    auto optimizer = ctx_.make_optimizer();
+    optimizer.add(solver_.assertions());
+
+    const ::z3::expr_vector hard_literals = constraint_tracker_.get_hard_literals();
+    optimizer.add(hard_literals);
+
+    const ::z3::expr_vector soft_literals = constraint_tracker_.get_soft_literals();
+    for (unsigned i = 0; i < soft_literals.size(); ++i) {
+        const ConstraintProvenance* provenance =
+            constraint_tracker_.get_provenance(soft_literals[i]);
+        const unsigned weight = static_cast<unsigned>(std::max(
+            1, provenance ? provenance->weight : 1));
+        optimizer.add_soft(soft_literals[i], weight);
+    }
+
+    // Deterministic secondary objectives are evaluated only after the exact
+    // weighted preference optimum.
+    auto& ctx = ctx_.ctx();
+    ::z3::expr selected_count = ctx.int_val(0);
+    ::z3::expr union_count = ctx.int_val(0);
+    ::z3::expr canonical_rank = ctx.int_val(0);
+    ::z3::expr canonical_weight = ctx.int_val(1);
+    for (size_t i = 0; i < field_vars_.size(); ++i) {
+        const auto& fv = field_vars_[i];
+        selected_count = selected_count +
+            ::z3::ite(fv.selected, ctx.int_val(1), ctx.int_val(0));
+        union_count = union_count +
+            ::z3::ite(fv.selected && fv.is_union_member,
+                      ctx.int_val(1), ctx.int_val(0));
+        canonical_rank = canonical_rank +
+            ::z3::ite(fv.selected,
+                      canonical_weight,
+                      ctx.int_val(0));
+        canonical_weight = canonical_weight * ctx.int_val(2);
+    }
+    optimizer.minimize(selected_count);
+    optimizer.minimize(union_count);
+    optimizer.minimize(canonical_rank);
+
+    const auto check = check_optimizer_with_deadline(optimizer);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time);
+    statistics_.solve_time = elapsed;
+
+    if (check == ::z3::unknown) {
+        const std::string reason = last_unknown_reason_.empty()
+            ? "weighted Max-SMT optimizer returned unknown"
+            : last_unknown_reason_;
+        return Z3Result::make_unknown(
+            reason.c_str(),
+            elapsed);
+    }
+    if (check == ::z3::unsat) {
+        qvector<ConstraintProvenance> core;
+        return Z3Result::make_unsat(std::move(core), elapsed);
+    }
+
+    ::z3::model optimized_model = optimizer.get_model();
+    auto canonical_model = canonicalize_packing_model(
+        optimized_model, hard_literals);
+    if (!canonical_model) {
+        const auto final_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
+        const std::string reason = last_unknown_reason_.empty()
+            ? "unable to derive a canonical packing assignment"
+            : last_unknown_reason_;
+        return Z3Result::make_unknown(
+            reason.c_str(),
+            final_elapsed);
+    }
+
+    qvector<ConstraintProvenance> dropped;
+    for (unsigned i = 0; i < soft_literals.size(); ++i) {
+        if (get_bool_value(optimized_model, soft_literals[i])) {
+            continue;
+        }
+        if (const ConstraintProvenance* provenance =
+                constraint_tracker_.get_provenance(soft_literals[i])) {
+            ConstraintProvenance copy = *provenance;
+            copy.tracking_literal = soft_literals[i];
+            dropped.push_back(std::move(copy));
+        }
+    }
+
+    statistics_.relaxations_performed = static_cast<unsigned>(dropped.size());
+    detect_union_groups(*canonical_model);
+    const auto final_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time);
+    statistics_.solve_time = final_elapsed;
+
+    Z3Result result = dropped.empty()
+        ? Z3Result::make_sat(std::move(*canonical_model), final_elapsed)
+        : Z3Result::make_sat_relaxed(
+              std::move(*canonical_model), std::move(dropped), final_elapsed);
+    result.iterations = statistics_.solve_iterations;
+    result.constraints_relaxed = statistics_.relaxations_performed;
+    return result;
+}
+
 Z3Result LayoutConstraintBuilder::solve() {
     auto start_time = std::chrono::steady_clock::now();
+
+    if (config_.enable_maxsmt && ctx_.config().max_memory_mb != 0) {
+        return Z3Result::make_unknown(
+            "configured memory limit cannot be enforced by the MaxSMT optimizer",
+            std::chrono::milliseconds{0});
+    }
+
+    solve_deadline_.reset();
+    solve_deadline_exhausted_ = false;
+    last_unknown_reason_.clear();
+    if (ctx_.config().timeout_ms != 0) {
+        solve_deadline_ = start_time +
+            std::chrono::milliseconds(ctx_.config().timeout_ms);
+    }
+
+    if (config_.enable_maxsmt) {
+        return solve_weighted_maxsmt(start_time);
+    }
 
     z3_log("[Structor/Z3] Solving constraints...\n");
     z3_log("[Structor/Z3] Solver assertions: %u\n", solver_.assertions().size());
@@ -1149,25 +1724,28 @@ Z3Result LayoutConstraintBuilder::solve() {
     z3_log("[Structor/Z3] Assumptions (tracking literals): %u\n", assumptions.size());
 
     // First attempt: solve with all constraints assumed active
-    auto result = solver_.check(assumptions);
+    auto result = check_solver_with_deadline(assumptions);
 
     auto end_time = std::chrono::steady_clock::now();
     auto solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         end_time - start_time);
 
     statistics_.solve_time = solve_time;
-    ++statistics_.solve_iterations;
-
     if (result == ::z3::sat) {
         z3_log("[Structor/Z3] SAT - solution found in %lldms\n",
                static_cast<long long>(solve_time.count()));
 
-        ::z3::model model = solver_.get_model();
-
-        // Extract packing if modeled
-        if (packing_var_) {
-            inferred_packing_ = static_cast<uint32_t>(get_int_value(model, *packing_var_));
-            z3_log("[Structor/Z3] Inferred packing: %u\n", *inferred_packing_);
+        auto canonical_model = canonicalize_packing_model(solver_.get_model(), assumptions);
+        if (!canonical_model) {
+            const char* reason = last_unknown_reason_.empty()
+                ? "unable to derive a canonical packing assignment"
+                : last_unknown_reason_.c_str();
+            return Z3Result::make_unknown(
+                reason, solve_time);
+        }
+        ::z3::model model = std::move(*canonical_model);
+        if (inferred_packing_) {
+            z3_log("[Structor/Z3] Canonical packing: %u\n", *inferred_packing_);
         }
 
         // Detect union groups
@@ -1176,16 +1754,25 @@ Z3Result LayoutConstraintBuilder::solve() {
             z3_log("[Structor/Z3] Detected %zu union groups\n", union_resolutions_.size());
         }
 
-        return Z3Result::make_sat(std::move(model), solve_time);
+        Z3Result sat_result = Z3Result::make_sat(std::move(model), solve_time);
+        sat_result.iterations = statistics_.solve_iterations;
+        return sat_result;
     }
     else if (result == ::z3::unsat) {
+        if (!config_.relax_on_unsat || config_.max_relaxation_iterations == 0) {
+            return Z3Result::make_unsat(
+                constraint_tracker_.analyze_unsat_core(solver_.unsat_core()),
+                solve_time);
+        }
         z3_log("[Structor/Z3] UNSAT - attempting relaxation...\n");
         // Try relaxation
         return solve_with_relaxation();
     }
     else {
         // Get the actual reason for unknown
-        std::string reason = Z3Context::get_unknown_reason(solver_);
+        std::string reason = last_unknown_reason_.empty()
+            ? Z3Context::get_unknown_reason(solver_)
+            : last_unknown_reason_;
         z3_log("[Structor/Z3] UNKNOWN result after %lldms: %s\n",
                static_cast<long long>(solve_time.count()), reason.c_str());
         
@@ -1207,13 +1794,13 @@ Z3Result LayoutConstraintBuilder::solve_with_relaxation() {
         active_assumptions.insert(all_literals[i].to_string());
     }
 
-    constexpr int MAX_RELAXATION_ITERATIONS = 10;
+    const uint32_t max_iterations = config_.max_relaxation_iterations;
 
-    z3_log("[Structor/Z3] Starting constraint relaxation (max %d iterations)\n",
-           MAX_RELAXATION_ITERATIONS);
+    z3_log("[Structor/Z3] Starting constraint relaxation (max %u iterations)\n",
+           max_iterations);
     z3_log("[Structor/Z3] Initial assumptions: %zu\n", active_assumptions.size());
 
-    for (int iteration = 0; iteration < MAX_RELAXATION_ITERATIONS; ++iteration) {
+    for (uint32_t iteration = 0; iteration < max_iterations; ++iteration) {
         // Get UNSAT core from the last check (which used assumptions)
         auto core = solver_.unsat_core();
         auto core_provenances = constraint_tracker_.analyze_unsat_core(core);
@@ -1255,7 +1842,14 @@ Z3Result LayoutConstraintBuilder::solve_with_relaxation() {
         // Sort by weight (ascending) - relax lowest weight constraints first
         std::sort(relaxable.begin(), relaxable.end(),
             [](const ConstraintProvenance& a, const ConstraintProvenance& b) {
-                return a.weight < b.weight;
+                if (a.weight != b.weight) {
+                    return a.weight < b.weight;
+                }
+                const std::string a_literal = a.tracking_literal
+                    ? a.tracking_literal->to_string() : std::string();
+                const std::string b_literal = b.tracking_literal
+                    ? b.tracking_literal->to_string() : std::string();
+                return a_literal < b_literal;
             });
 
         // Relax the lowest-weight soft constraint by removing from assumptions
@@ -1283,18 +1877,41 @@ Z3Result LayoutConstraintBuilder::solve_with_relaxation() {
         z3_log("[Structor/Z3]   Remaining assumptions: %u\n", current_assumptions.size());
 
         // Re-solve with reduced assumptions
-        auto result = solver_.check(current_assumptions);
+        auto result = check_solver_with_deadline(current_assumptions);
+
+        if (result == ::z3::unknown) {
+            auto end_time = std::chrono::steady_clock::now();
+            auto solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                end_time - start_time);
+            Z3Result unknown = Z3Result::make_unknown(
+                last_unknown_reason_.empty()
+                    ? Z3Context::get_unknown_reason(solver_).c_str()
+                    : last_unknown_reason_.c_str(),
+                solve_time);
+            unknown.dropped_constraints = std::move(dropped_constraints);
+            unknown.iterations = statistics_.solve_iterations;
+            return unknown;
+        }
 
         if (result == ::z3::sat) {
             z3_log("[Structor/Z3] Relaxation succeeded after dropping %zu constraints\n",
                    dropped_constraints.size());
 
-            ::z3::model model = solver_.get_model();
-
-            // Extract packing if modeled
-            if (packing_var_) {
-                inferred_packing_ = static_cast<uint32_t>(get_int_value(model, *packing_var_));
+            auto canonical_model = canonicalize_packing_model(
+                solver_.get_model(), current_assumptions);
+            if (!canonical_model) {
+                auto end_time = std::chrono::steady_clock::now();
+                auto solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end_time - start_time);
+                Z3Result unknown = Z3Result::make_unknown(
+                    last_unknown_reason_.empty()
+                        ? "unable to derive a canonical packing assignment"
+                        : last_unknown_reason_.c_str(),
+                    solve_time);
+                unknown.dropped_constraints = std::move(dropped_constraints);
+                return unknown;
             }
+            ::z3::model model = std::move(*canonical_model);
 
             // Detect union groups
             detect_union_groups(model);
@@ -1304,8 +1921,10 @@ Z3Result LayoutConstraintBuilder::solve_with_relaxation() {
                 end_time - start_time);
 
             // Return SAT with dropped constraints info
-            Z3Result sat_result = Z3Result::make_sat(std::move(model), solve_time);
-            sat_result.dropped_constraints = std::move(dropped_constraints);
+            Z3Result sat_result = Z3Result::make_sat_relaxed(
+                std::move(model), std::move(dropped_constraints), solve_time);
+            sat_result.iterations = statistics_.solve_iterations;
+            sat_result.constraints_relaxed = statistics_.relaxations_performed;
             return sat_result;
         }
         // If still UNSAT, continue relaxing
@@ -1320,6 +1939,8 @@ Z3Result LayoutConstraintBuilder::solve_with_relaxation() {
     Z3Result unsat_result = Z3Result::make_unsat(
         constraint_tracker_.analyze_unsat_core(solver_.unsat_core()), solve_time);
     unsat_result.dropped_constraints = std::move(dropped_constraints);
+    unsat_result.iterations = statistics_.solve_iterations;
+    unsat_result.constraints_relaxed = statistics_.relaxations_performed;
     return unsat_result;
 }
 
@@ -1351,7 +1972,17 @@ SynthStruct LayoutConstraintBuilder::extract_struct(const ::z3::model& model) {
     // Sort by offset
     std::sort(selected_fields.begin(), selected_fields.end(),
         [](const auto& a, const auto& b) {
-            return a.second.offset < b.second.offset;
+            if (a.second.offset != b.second.offset) {
+                return a.second.offset < b.second.offset;
+            }
+            if (a.second.size != b.second.size) {
+                return a.second.size > b.second.size;
+            }
+            if (a.second.type_category != b.second.type_category) {
+                return static_cast<int>(a.second.type_category) <
+                       static_cast<int>(b.second.type_category);
+            }
+            return a.first < b.first;
         });
     
     // Log selected fields
@@ -1430,7 +2061,12 @@ SynthStruct LayoutConstraintBuilder::extract_struct(const ::z3::model& model) {
 
     std::sort(result.fields.begin(), result.fields.end(),
               [](const SynthField& a, const SynthField& b) {
-                  return a.offset < b.offset;
+                  if (a.offset != b.offset) return a.offset < b.offset;
+                  if (a.size != b.size) return a.size > b.size;
+                  if (a.is_union_candidate != b.is_union_candidate) {
+                      return a.is_union_candidate;
+                  }
+                  return std::string(a.name.c_str()) < std::string(b.name.c_str());
               });
 
     // Set struct properties
@@ -1462,7 +2098,9 @@ SynthStruct LayoutConstraintBuilder::extract_struct(const ::z3::model& model) {
                 fields_with_padding.push_back(SynthField::create_padding(current_end, gap_size));
             }
             fields_with_padding.push_back(field);
-            current_end = field.offset + static_cast<sval_t>(field.size);
+            current_end = std::max(
+                current_end,
+                field.offset + static_cast<sval_t>(field.size));
         }
 
         result.fields = std::move(fields_with_padding);
@@ -1542,6 +2180,7 @@ SynthField LayoutConstraintBuilder::create_union_field(
     const qvector<int>& overlapping_ids,
     const ::z3::model& model)
 {
+    (void)model;
     SynthField union_field;
     union_field.is_union_candidate = true;
 
@@ -1576,7 +2215,11 @@ SynthField LayoutConstraintBuilder::create_union_field(
 
     union_field.offset = min_offset;
     union_field.size = static_cast<uint32_t>(max_end - min_offset);
-    union_field.name.sprnt("union_%s", make_offset_suffix(min_offset).c_str());
+    set_generated_name(union_field.name,
+                       union_field.naming,
+                       qstring().sprnt("union_%s", make_offset_suffix(min_offset).c_str()),
+                       GeneratedNameKind::UnionField,
+                       NameConfidence::High);
     z3_log("[Structor/Z3] Created union: offset=0x%llX, size=%u, name='%s'\n",
            static_cast<unsigned long long>(union_field.offset), union_field.size,
            union_field.name.c_str());
@@ -1587,19 +2230,56 @@ SynthField LayoutConstraintBuilder::create_union_field(
 
     // For now, use the largest member's type as the representative field type,
     // but preserve all alternatives so persistence can materialize a real union.
+    qvector<int> ordered_ids = overlapping_ids;
+    std::sort(ordered_ids.begin(), ordered_ids.end(), [&](int lhs_idx, int rhs_idx) {
+        const auto& lhs = candidates_[field_vars_[lhs_idx].candidate_id];
+        const auto& rhs = candidates_[field_vars_[rhs_idx].candidate_id];
+        if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+        if (lhs.size != rhs.size) return lhs.size > rhs.size;
+        if (lhs.type_category != rhs.type_category) {
+            return static_cast<int>(lhs.type_category) < static_cast<int>(rhs.type_category);
+        }
+        if (lhs.primary_func_ea != rhs.primary_func_ea) {
+            return lhs.primary_func_ea < rhs.primary_func_ea;
+        }
+        return lhs.id < rhs.id;
+    });
+
     const FieldCandidate* largest = nullptr;
-    for (int idx : overlapping_ids) {
+    std::unordered_map<std::string, size_t> member_name_counts;
+    std::unordered_set<int> recorded_accesses;
+    for (int idx : ordered_ids) {
         const auto& cand = candidates_[field_vars_[idx].candidate_id];
         SynthField alt = field_from_candidate(cand, ctx_.type_encoder(),
                                               pattern_ ? &pattern_->all_accesses : nullptr);
         SynthField::UnionMember member;
         member.name = alt.name;
+        const std::string base_name = member.name.c_str();
+        const size_t duplicate_index = member_name_counts[base_name]++;
+        if (duplicate_index != 0) {
+            member.name.sprnt("%s_alt%zu", base_name.c_str(), duplicate_index);
+        }
+        member.naming = alt.naming;
+        member.offset = cand.offset - min_offset;
         member.size = alt.size;
         member.type = alt.type;
         member.comment = alt.comment;
         union_field.union_members.push_back(std::move(member));
 
-        if (!largest || cand.size > largest->size) {
+        for (int access_idx : cand.source_access_indices) {
+            if (!pattern_ || access_idx < 0 ||
+                static_cast<size_t>(access_idx) >= pattern_->all_accesses.size() ||
+                !recorded_accesses.insert(access_idx).second) {
+                continue;
+            }
+            union_field.source_accesses.push_back(
+                pattern_->all_accesses[static_cast<size_t>(access_idx)]);
+        }
+
+        if (!largest || cand.size > largest->size ||
+            (cand.size == largest->size &&
+             static_cast<int>(cand.type_category) <
+                 static_cast<int>(largest->type_category))) {
             largest = &cand;
         }
     }

@@ -22,7 +22,6 @@
         "propagated_to": [
           "_main",
           "_modify_mixed",
-          "_printf",
           "_read_mixed"
         ],
         "failed_sites": [],
@@ -31,10 +30,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_read_mixed",
           "size": 32,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_read_mixed",
           "source_var": "a1",
           "field_count": 8,

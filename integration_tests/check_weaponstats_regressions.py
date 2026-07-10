@@ -80,6 +80,12 @@ def run_weaponstats_case(repo_root: Path, plugin_path: Path, idump_path: str) ->
         require(result_path.exists(), "missing exported synthesis result", output)
 
         raw_result = json.loads(result_path.read_text(encoding="utf-8"))
+        require(
+            raw_result.get("success") is True,
+            "weaponstats regression: synthesis reported failure: "
+            f"{raw_result.get('error_message')!r}",
+            output,
+        )
         normalized = normalize_result(raw_result)
         structure = normalized.get("structure")
         require(

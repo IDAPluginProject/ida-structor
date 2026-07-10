@@ -11,6 +11,9 @@ on:
 env:
   IDA_SDK_REPO: HexRaysSA/ida-sdk
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -18,44 +21,44 @@ jobs:
       matrix:
         include:
           # IDA stable builds
-          - os: macos-latest
+          - os: macos-15-intel
             name: macos-x86_64
             cmake_arch: x86_64
-            ida_branch: ""
+            ida_ref: 70e29758997745524e917e296fbbfeef5faf9c57
             ida_suffix: ""
-          - os: macos-latest
+          - os: macos-15
             name: macos-arm64
             cmake_arch: arm64
-            ida_branch: ""
+            ida_ref: 70e29758997745524e917e296fbbfeef5faf9c57
             ida_suffix: ""
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             name: linux-x86_64
-            ida_branch: ""
+            ida_ref: 70e29758997745524e917e296fbbfeef5faf9c57
             ida_suffix: ""
-          - os: windows-latest
+          - os: windows-2022
             name: windows-x86_64
             cmake_arch: x64
-            ida_branch: ""
+            ida_ref: 70e29758997745524e917e296fbbfeef5faf9c57
             ida_suffix: ""
           # IDA 9.3.1 release builds
-          - os: macos-latest
+          - os: macos-15-intel
             name: macos-x86_64
             cmake_arch: x86_64
-            ida_branch: releases/9.3.1
+            ida_ref: acacbbcc8fa349d919cc185d88b1ab3710ca252d
             ida_suffix: "-ida931"
-          - os: macos-latest
+          - os: macos-15
             name: macos-arm64
             cmake_arch: arm64
-            ida_branch: releases/9.3.1
+            ida_ref: acacbbcc8fa349d919cc185d88b1ab3710ca252d
             ida_suffix: "-ida931"
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             name: linux-x86_64
-            ida_branch: releases/9.3.1
+            ida_ref: acacbbcc8fa349d919cc185d88b1ab3710ca252d
             ida_suffix: "-ida931"
-          - os: windows-latest
+          - os: windows-2022
             name: windows-x86_64
             cmake_arch: x64
-            ida_branch: releases/9.3.1
+            ida_ref: acacbbcc8fa349d919cc185d88b1ab3710ca252d
             ida_suffix: "-ida931"
 
     runs-on: ${{ matrix.os }}
@@ -63,28 +66,22 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
+          persist-credentials: false
 
-      - name: Checkout IDA SDK (stable)
-        if: matrix.ida_branch == ''
-        uses: actions/checkout@v4
+      - name: Checkout pinned IDA SDK
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: ${{ env.IDA_SDK_REPO }}
+          ref: ${{ matrix.ida_ref }}
           path: ida-sdk
-
-      - name: Checkout IDA SDK (beta)
-        if: matrix.ida_branch != ''
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.IDA_SDK_REPO }}
-          ref: ${{ matrix.ida_branch }}
-          path: ida-sdk
+          persist-credentials: false
 
       - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: ${{ matrix.cmake_arch }}
 
@@ -101,17 +98,9 @@ jobs:
             brew install ccache
           fi
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install ccache ninja -y --no-progress
-          "C:\ProgramData\chocolatey\bin" >> $env:GITHUB_PATH
-          ccache --version
-          ninja --version
-
       - name: Cache ccache
-        uses: actions/cache@v4
+        if: runner.os != 'Windows'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.ccache
           key: ccache-v1-${{ runner.os }}-${{ matrix.name }}${{ matrix.ida_suffix }}-${{ hashFiles('CMakeLists.txt', 'test/CMakeLists.txt', 'include/**', 'src/**', '.github/workflows/build.yml') }}
@@ -126,15 +115,6 @@ jobs:
           echo "CCACHE_COMPRESS=true" >> $GITHUB_ENV
           echo "CCACHE_MAXSIZE=1G" >> $GITHUB_ENV
 
-      - name: Set ccache environment (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "CCACHE_DIR=$env:USERPROFILE\.ccache" >> $env:GITHUB_ENV
-          "CCACHE_BASEDIR=${{ github.workspace }}" >> $env:GITHUB_ENV
-          "CCACHE_COMPRESS=true" >> $env:GITHUB_ENV
-          "CCACHE_MAXSIZE=1G" >> $env:GITHUB_ENV
-
       - name: Configure CMake (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -146,6 +126,8 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }} \
+            -DBUILD_TESTS=ON \
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=ON \
             -DIDA_SDK_DIR=${{ github.workspace }}/ida-sdk/src
 
       - name: Configure CMake (Linux)
@@ -158,6 +140,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_TESTS=ON \
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=ON \
             -DIDA_SDK_DIR=${{ github.workspace }}/ida-sdk/src
 
       - name: Configure CMake (Windows)
@@ -166,11 +150,10 @@ jobs:
         run: |
           mkdir build -Force
           cd build
-          ccache --zero-stats
           cmake .. -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DBUILD_TESTS=ON `
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=ON `
             "-DIDA_SDK_DIR=${{ github.workspace }}/ida-sdk/src"
 
       - name: Build (Unix)
@@ -183,91 +166,228 @@ jobs:
         if: runner.os != 'Windows'
         run: ccache --show-stats || true
 
-      - name: Show ccache stats (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ccache --show-stats
-
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: |
           cd build
           cmake --build . --config Release
 
-      - name: Find built plugin (Unix)
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error
+
+      - name: Rebuild and stage hook-free production plugin (Unix)
         if: runner.os != 'Windows'
-        id: find_plugin_unix
         run: |
+          rm -rf stage artifacts
+          cmake -S . -B build \
+            -DBUILD_TESTS=OFF \
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=OFF
+          cmake --build build --config Release --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          cmake --install build --config Release --component Runtime \
+            --prefix "${{ github.workspace }}/stage"
+
           if [ "${{ runner.os }}" = "macOS" ]; then
-            PLUGIN_FILE=$(find build -name "structor.dylib" -type f | head -1)
+            PLUGIN_FILE="${{ github.workspace }}/stage/plugins/structor.dylib"
             EXT="dylib"
           else
-            PLUGIN_FILE=$(find build -name "structor.so" -type f | head -1)
+            PLUGIN_FILE="${{ github.workspace }}/stage/plugins/structor.so"
             EXT="so"
           fi
 
-          if [ -z "$PLUGIN_FILE" ]; then
-            echo "ERROR: Could not find built plugin"
-            find build -type f -name "structor*"
+          if [ ! -f "$PLUGIN_FILE" ]; then
+            echo "ERROR: staged production plugin is absent: $PLUGIN_FILE"
+            find stage -type f -print || true
             exit 1
           fi
 
-          echo "plugin_file=$PLUGIN_FILE" >> $GITHUB_OUTPUT
-          echo "extension=$EXT" >> $GITHUB_OUTPUT
-          echo "Found plugin: $PLUGIN_FILE"
+          for marker in \
+            STRUCTOR_INTEGRATION_TESTING \
+            STRUCTOR_TEST_PERSISTENCE_FAULT \
+            fault_global_tinfo_rollback; do
+            if strings "$PLUGIN_FILE" | grep -F -- "$marker"; then
+              echo "ERROR: production plugin contains live-test marker: $marker"
+              exit 1
+            fi
+          done
 
-      - name: Find built plugin (Windows)
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            if otool -l "$PLUGIN_FILE" | grep -q 'LC_RPATH'; then
+              echo "ERROR: production plugin contains LC_RPATH"
+              otool -l "$PLUGIN_FILE"
+              exit 1
+            fi
+            if otool -L "$PLUGIN_FILE" | grep -Eiq 'z3[^[:space:]]*\.dylib'; then
+              echo "ERROR: production plugin dynamically depends on Z3"
+              otool -L "$PLUGIN_FILE"
+              exit 1
+            fi
+          else
+            if readelf -d "$PLUGIN_FILE" | grep -Eq '\((RPATH|RUNPATH)\)'; then
+              echo "ERROR: production plugin contains RPATH/RUNPATH"
+              readelf -d "$PLUGIN_FILE"
+              exit 1
+            fi
+            if readelf -d "$PLUGIN_FILE" | grep -Eiq '\(NEEDED\).*z3.*\.so'; then
+              echo "ERROR: production plugin dynamically depends on Z3"
+              readelf -d "$PLUGIN_FILE"
+              exit 1
+            fi
+
+            check_symbol_ceiling() {
+              namespace="$1"
+              ceiling="$2"
+              versions=$(objdump -T "$PLUGIN_FILE" | sed -nE "s/.*\\(${namespace}_([0-9.]+)\\).*/\\1/p" | sort -Vu)
+              if [ -z "$versions" ]; then
+                echo "ERROR: no ${namespace} versions found; ABI ceiling parser produced no evidence"
+                exit 1
+              fi
+              for version in $versions; do
+                highest=$(printf '%s\n%s\n' "$ceiling" "$version" | sort -V | tail -n 1)
+                if [ "$highest" != "$ceiling" ]; then
+                  echo "ERROR: ${namespace}_${version} exceeds ${namespace}_${ceiling}"
+                  exit 1
+                fi
+              done
+            }
+            check_symbol_ceiling GLIBC 2.35
+            check_symbol_ceiling GLIBCXX 3.4.30
+          fi
+
+          mkdir -p artifacts
+          cp "$PLUGIN_FILE" "artifacts/structor${{ matrix.ida_suffix }}_${{ matrix.name }}.${EXT}"
+
+      - name: Rebuild and stage hook-free production plugin (Windows)
         if: runner.os == 'Windows'
-        id: find_plugin_windows
         shell: pwsh
         run: |
-          $plugin = Get-ChildItem -Path build -Recurse -Filter "structor.dll" | Select-Object -First 1
-          if ($null -eq $plugin) {
-            Write-Error "Could not find built plugin"
-            Get-ChildItem -Path build -Recurse -Filter "structor*"
+          Remove-Item -Recurse -Force stage, artifacts -ErrorAction SilentlyContinue
+          cmake -S . -B build `
+            -DBUILD_TESTS=OFF `
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=OFF
+          cmake --build build --config Release
+          cmake --install build --config Release --component Runtime `
+            --prefix "${{ github.workspace }}/stage"
+
+          $plugin = "${{ github.workspace }}/stage/plugins/structor.dll"
+          if (-not (Test-Path -LiteralPath $plugin -PathType Leaf)) {
+            Write-Error "Staged production plugin is absent: $plugin"
+            Get-ChildItem -Path stage -Recurse -File -ErrorAction SilentlyContinue
             exit 1
           }
-          echo "plugin_file=$($plugin.FullName)" >> $env:GITHUB_OUTPUT
-          echo "extension=dll" >> $env:GITHUB_OUTPUT
-          Write-Host "Found plugin: $($plugin.FullName)"
 
-      - name: Prepare artifact (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p artifacts
-          cp "${{ steps.find_plugin_unix.outputs.plugin_file }}" "artifacts/structor${{ matrix.ida_suffix }}_${{ matrix.name }}.${{ steps.find_plugin_unix.outputs.extension }}"
+          $ascii = [System.Text.Encoding]::ASCII.GetString(
+            [System.IO.File]::ReadAllBytes($plugin))
+          foreach ($marker in @(
+              "STRUCTOR_INTEGRATION_TESTING",
+              "STRUCTOR_TEST_PERSISTENCE_FAULT",
+              "fault_global_tinfo_rollback")) {
+            if ($ascii.Contains($marker)) {
+              Write-Error "Production plugin contains live-test marker: $marker"
+              exit 1
+            }
+          }
 
-      - name: Prepare artifact (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p artifacts
-          cp "${{ steps.find_plugin_unix.outputs.plugin_file }}" "artifacts/structor${{ matrix.ida_suffix }}_${{ matrix.name }}.${{ steps.find_plugin_unix.outputs.extension }}"
+          $dependents = (dumpbin /nologo /dependents $plugin | Out-String)
+          if ($dependents -match '(?im)^\s*((VCRUNTIME|MSVCP|CONCRT|vcomp|ucrtbased)[^\s]*|[^\s]*z3[^\s]*)\.dll\s*$') {
+            Write-Error "Production plugin dynamically imports an MSVC runtime or Z3"
+            Write-Host $dependents
+            exit 1
+          }
+          $headers = (dumpbin /nologo /headers $plugin | Out-String)
+          if ($headers -notmatch '(?i)subsystem.*Windows GUI') {
+            Write-Error "Production plugin is not linked with the WINDOWS subsystem"
+            Write-Host $headers
+            exit 1
+          }
 
-      - name: Prepare artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
           New-Item -ItemType Directory -Force -Path artifacts
-          Copy-Item "${{ steps.find_plugin_windows.outputs.plugin_file }}" "artifacts/structor${{ matrix.ida_suffix }}_${{ matrix.name }}.${{ steps.find_plugin_windows.outputs.extension }}"
+          Copy-Item $plugin "artifacts/structor${{ matrix.ida_suffix }}_${{ matrix.name }}.dll"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: structor${{ matrix.ida_suffix }}-${{ matrix.name }}
           path: artifacts/
           retention-days: 30
 
-  release:
+  live-contracts:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    runs-on: [self-hosted, macOS, ARM64, structor-ida-live]
+    name: Licensed live contract gate
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout pinned IDA SDK
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: ${{ env.IDA_SDK_REPO }}
+          ref: 70e29758997745524e917e296fbbfeef5faf9c57
+          path: ida-sdk
+          persist-credentials: false
+
+      - name: Assert licensed live-test prerequisites
+        shell: bash
+        run: |
+          command -v idump
+          test -d "$HOME/.idapro"
+          find "$HOME/.idapro" -maxdepth 1 -type f \
+            \( -name 'ida.reg' -o -name '*.hexlic' -o -name '*.lic' \) \
+            -print -quit | grep -q .
+
+      - name: Configure hook-enabled live build
+        shell: bash
+        run: |
+          cmake -S . -B build-live \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_TESTS=ON \
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=ON \
+            -DIDA_SDK_DIR="${{ github.workspace }}/ida-sdk/src"
+
+      - name: Build live-test plugin and tests
+        shell: bash
+        run: cmake --build build-live --config Release --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Require and execute exact live suite
+        shell: bash
+        run: |
+          ctest --test-dir build-live --build-config Release -N \
+            | grep -q 'full_integrity_suite_live'
+          ctest --test-dir build-live --build-config Release \
+            --output-on-failure --no-tests=error \
+            -R '^full_integrity_suite_live$'
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, live-contracts]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify release tag equals project version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          project_version=$(sed -nE 's/^project\(structor VERSION ([0-9]+\.[0-9]+\.[0-9]+) LANGUAGES CXX\)$/\1/p' CMakeLists.txt)
+          if [ -z "$project_version" ] || [ "$tag_version" != "$project_version" ]; then
+            echo "ERROR: release tag version '$tag_version' != project version '$project_version'"
+            exit 1
+          fi
+
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
 
@@ -276,10 +396,11 @@ jobs:
           mkdir -p release
           # Copy all plugin files
           find artifacts -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.dll" \) -exec cp {} release/ \;
+          cp THIRD_PARTY_NOTICES.md release/
           ls -la release/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@26994186c0ac3ef5cae75ac16aa32e8153525f77
         with:
           files: release/*
           generate_release_notes: true

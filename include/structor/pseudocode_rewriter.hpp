@@ -3,10 +3,15 @@
 #include "synth_types.hpp"
 #include "config.hpp"
 #include "utils.hpp"
+#include <memory>
 
 namespace structor {
 
-/// Rewrites pseudocode expressions to use synthesized structure field names
+/// Reports pseudocode expressions that would render as recovered field
+/// accesses after the corresponding type is applied. Hex-Rays ctree is not a
+/// durable rewrite store; persistent expression rendering is driven by lvar
+/// and global type application. This helper may add a verified summary comment
+/// but never reports a planned expression as applied.
 class PseudocodeRewriter {
 public:
     explicit PseudocodeRewriter(const SynthOptions& opts = Config::instance().options())
@@ -57,7 +62,7 @@ private:
 
     void apply_user_cmts(cfunc_t* cfunc, const SynthStruct& synth_struct, int var_idx);
 
-    const SynthOptions& options_;
+    SynthOptions options_;
 };
 
 // ============================================================================
@@ -110,14 +115,11 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_ptr_deref(cexpr_t* expr) {
     transform.insn_ea = expr->ea;
     transform.original_expr = utils::expr_to_string(expr, cfunc_);
 
-    // Transform to memptr access
-    // Create new expression: var->field_name at offset
-    // Note: We modify the expression in place where possible,
-    // but the decompiler will rebuild it on refresh
-
-    // Record the transform for the decompiler to apply via user_cmts
+    // Record a diagnostic plan. No ctree mutation is performed here.
     transform.rewritten_expr.sprnt("a%d->%s", var_idx_, field->name.c_str());
-    transform.success = true;
+    transform.success = false;
+    transform.failure_reason =
+        "Expression plan only; apply the recovered type for durable rendering";
 
     transforms_.push_back(std::move(transform));
     return true;
@@ -129,8 +131,14 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_memptr_access(cexpr_t* exp
         return false;
     }
 
-    sval_t total_offset = arith.offset + expr->m;
-    const SynthField* field = find_field_at(total_offset);
+    const auto member_offset = checked_sval_from_u64(expr->m);
+    const auto total_offset = member_offset.has_value()
+        ? checked_sval_add(arith.offset, *member_offset)
+        : std::nullopt;
+    if (!total_offset.has_value()) {
+        return false;
+    }
+    const SynthField* field = find_field_at(*total_offset);
     if (!field || field->is_padding) {
         return false;
     }
@@ -139,7 +147,9 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_memptr_access(cexpr_t* exp
     transform.insn_ea = expr->ea;
     transform.original_expr = utils::expr_to_string(expr, cfunc_);
     transform.rewritten_expr.sprnt("a%d->%s", var_idx_, field->name.c_str());
-    transform.success = true;
+    transform.success = false;
+    transform.failure_reason =
+        "Expression plan only; apply the recovered type for durable rendering";
 
     transforms_.push_back(std::move(transform));
     return true;
@@ -155,7 +165,23 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_array_access(cexpr_t* expr
     if (expr->y->op == cot_num) {
         tinfo_t elem_type = expr->x->type.get_pointed_object();
         if (!elem_type.empty()) {
-            offset += expr->y->numval() * elem_type.get_size();
+            const size_t element_size = elem_type.get_size();
+            const auto index = checked_sval_from_u64(expr->y->numval());
+            if (element_size == BADSIZE ||
+                element_size > static_cast<size_t>(
+                    std::numeric_limits<sval_t>::max()) ||
+                !index.has_value()) {
+                return false;
+            }
+            const auto scaled = checked_sval_mul(
+                *index, static_cast<sval_t>(element_size));
+            const auto total = scaled.has_value()
+                ? checked_sval_add(offset, *scaled)
+                : std::nullopt;
+            if (!total.has_value()) {
+                return false;
+            }
+            offset = *total;
         }
     }
 
@@ -168,7 +194,9 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_array_access(cexpr_t* expr
     transform.insn_ea = expr->ea;
     transform.original_expr = utils::expr_to_string(expr, cfunc_);
     transform.rewritten_expr.sprnt("a%d->%s", var_idx_, field->name.c_str());
-    transform.success = true;
+    transform.success = false;
+    transform.failure_reason =
+        "Expression plan only; apply the recovered type for durable rendering";
 
     transforms_.push_back(std::move(transform));
     return true;
@@ -189,7 +217,10 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_vtable_call(cexpr_t* expr)
 
     if (slot_expr->op == cot_add) {
         if (slot_expr->y && slot_expr->y->op == cot_num) {
-            slot_offset = slot_expr->y->numval();
+            const auto converted =
+                checked_sval_from_u64(slot_expr->y->numval());
+            if (!converted.has_value()) return false;
+            slot_offset = *converted;
         }
         vtbl_deref = slot_expr->x;
     }
@@ -199,7 +230,14 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_vtable_call(cexpr_t* expr)
     auto arith = utils::extract_ptr_arith(vtbl_deref->x);
     if (!arith.valid || arith.var_idx != var_idx_) return false;
 
-    int slot_idx = slot_offset / get_ptr_size();
+    if (slot_offset < 0 ||
+        slot_offset % static_cast<sval_t>(get_ptr_size()) != 0 ||
+        slot_offset / static_cast<sval_t>(get_ptr_size()) >
+            std::numeric_limits<int>::max()) {
+        return false;
+    }
+    int slot_idx = static_cast<int>(
+        slot_offset / static_cast<sval_t>(get_ptr_size()));
     const VTableSlot* slot = find_vtable_slot(slot_idx);
     if (!slot) return false;
 
@@ -207,7 +245,9 @@ inline bool PseudocodeRewriter::ExprRewriter::rewrite_vtable_call(cexpr_t* expr)
     transform.insn_ea = expr->ea;
     transform.original_expr = utils::expr_to_string(expr, cfunc_);
     transform.rewritten_expr.sprnt("a%d->vtbl->%s(...)", var_idx_, slot->name.c_str());
-    transform.success = true;
+    transform.success = false;
+    transform.failure_reason =
+        "Expression plan only; apply the recovered type for durable rendering";
 
     transforms_.push_back(std::move(transform));
     return true;
@@ -219,7 +259,9 @@ inline const SynthField* PseudocodeRewriter::ExprRewriter::find_field_at(sval_t 
             return &field;
         }
         // Also check if offset falls within field range
-        if (offset >= field.offset && offset < field.offset + static_cast<sval_t>(field.size)) {
+        const auto field_end = checked_interval_end(field.offset, field.size);
+        if (field_end.has_value() && offset >= field.offset &&
+            offset < *field_end) {
             return &field;
         }
     }
@@ -269,7 +311,8 @@ inline RewriteResult PseudocodeRewriter::rewrite(
     // Apply user comments for field names at specific locations
     apply_user_cmts(cfunc, synth_struct, var_idx);
 
-    result.refresh_required = !result.transforms.empty();
+    // Planned expressions alone do not justify claiming a ctree refresh.
+    result.refresh_required = false;
 
     return result;
 }
@@ -321,9 +364,15 @@ inline void PseudocodeRewriter::apply_user_cmts(
 
     // Work with our own copy - don't touch cfunc->user_cmts directly.
     // restore_user_cmts returns a newly allocated map from IDB.
-    user_cmts_t* cmts = restore_user_cmts(cfunc->entry_ea);
+    const auto free_comments = +[](user_cmts_t* comments) noexcept {
+        if (comments != nullptr) {
+            try { user_cmts_free(comments); } catch (...) {}
+        }
+    };
+    std::unique_ptr<user_cmts_t, decltype(free_comments)> cmts(
+        restore_user_cmts(cfunc->entry_ea), free_comments);
     if (!cmts) {
-        cmts = user_cmts_new();
+        cmts.reset(user_cmts_new());
         if (!cmts) {
             return;
         }
@@ -341,12 +390,14 @@ inline void PseudocodeRewriter::apply_user_cmts(
         cmt.cat_sprnt(", %zu vtable slots", synth_struct.vtable->slot_count());
     }
 
-    // Use operator[] for insert - avoids std::map::insert() tree corruption issues
-    // when the map's internal state is questionable
+    // Never replace a user-owned comment. Structor only occupies an unused
+    // location; repeated runs preserve the first generated annotation too.
+    if (cmts->find(loc) != cmts->end()) {
+        return;
+    }
     cmts->operator[](loc) = citem_cmt_t(cmt.c_str());
 
-    save_user_cmts(cfunc->entry_ea, cmts);
-    user_cmts_free(cmts);
+    save_user_cmts(cfunc->entry_ea, cmts.get());
 }
 
 } // namespace structor

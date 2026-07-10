@@ -1330,6 +1330,7 @@ private:
     TypeFixerConfig config_;
     qvector<qstring> diagnostics_;
     std::unordered_map<ea_t, cfuncptr_t> cfunc_cache_;
+    bool last_apply_rollback_failed_ = false;
     
     /// Infer type for a variable by analyzing access patterns
     [[nodiscard]] tinfo_t infer_variable_type(cfunc_t* cfunc, int var_idx, TypeConfidence& out_confidence);
@@ -1352,7 +1353,9 @@ private:
     /// Try to synthesize a structure if the variable has pointer accesses
     [[nodiscard]] std::optional<tid_t> try_synthesize_structure(
         cfunc_t* cfunc,
-        int var_idx);
+        int var_idx,
+        const SynthOptions& opts,
+        StructurePersistence& persistence);
     
     /// Report progress if callback is set
     void report_progress(int var_idx, const char* var_name, const char* status);
@@ -1405,11 +1408,60 @@ inline TypeFixResult TypeFixer::fix_function_types(cfunc_t* cfunc) {
     }
     
     result.total_variables = static_cast<unsigned>(lvars->size());
-    
-    // Process each variable
-    for (size_t i = 0; i < lvars->size(); ++i) {
-        int var_idx = static_cast<int>(i);
-        lvar_t& var = lvars->at(i);
+    result.variable_fixes.reserve(lvars->size());
+    result.warnings.reserve(lvars->size());
+    result.diagnostics.reserve(lvars->size());
+
+    struct StableVariableTarget {
+        lvar_locator_t locator;
+        qstring initial_name;
+        bool initial_is_argument = false;
+    };
+    std::vector<StableVariableTarget> stable_targets;
+    stable_targets.reserve(lvars->size());
+    for (const auto& var : *lvars) {
+        StableVariableTarget target;
+        target.locator = static_cast<const lvar_locator_t&>(var);
+        target.initial_name = var.name;
+        target.initial_is_argument = var.is_arg_var();
+        stable_targets.push_back(std::move(target));
+    }
+
+    // Every mutation may invalidate the decompilation and reorder lvars.
+    // Re-decompile and resolve the SDK locator for each target; never reuse a
+    // stale lvar pointer or substitute a same-index variable.
+    for (const auto& target : stable_targets) {
+        hexrays_failure_t target_hf;
+        cfuncptr_t current_cfunc = decompile(
+            get_func(result.func_ea), &target_hf, DECOMP_NO_WAIT);
+        lvars_t* current_lvars = current_cfunc
+            ? current_cfunc->get_lvars()
+            : nullptr;
+        int var_idx = -1;
+        if (current_lvars != nullptr &&
+            current_lvars->find(target.locator) != nullptr) {
+            for (size_t i = 0; i < current_lvars->size(); ++i) {
+                if (static_cast<const lvar_locator_t&>(current_lvars->at(i)) ==
+                    target.locator) {
+                    var_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (var_idx < 0) {
+            VariableTypeFix unresolved;
+            unresolved.var_idx = -1;
+            unresolved.var_name = target.initial_name;
+            unresolved.is_argument = target.initial_is_argument;
+            unresolved.skip_reason =
+                "Stable variable locator no longer resolves";
+            result.fixes_skipped++;
+            result.variable_fixes.push_back(std::move(unresolved));
+            continue;
+        }
+        cfunc = current_cfunc;
+        lvars = current_lvars;
+        lvar_t& var = lvars->at(static_cast<size_t>(var_idx));
         
         // Check if we should analyze this variable
         if (!should_analyze(cfunc, var_idx)) {
@@ -1452,17 +1504,31 @@ inline TypeFixResult TypeFixer::fix_function_types(cfunc_t* cfunc) {
             continue;
         }
         
-        // Check if we should synthesize a structure
-        if (config_.synthesize_structures && 
+        std::unique_ptr<StructurePersistence> synthesized_persistence;
+        std::optional<StructurePersistence::Transaction> synthesized_transaction;
+
+        // Check if we should synthesize a structure. Persistence remains
+        // provisional until the required source-variable type is applied.
+        if (!config_.dry_run && config_.synthesize_structures &&
             (fix.comparison.primary_reason == DifferenceReason::VoidPointerToTyped ||
              fix.comparison.primary_reason == DifferenceReason::StructureDetected ||
              fix.comparison.primary_reason == DifferenceReason::VTableDetected ||
              fix.comparison.primary_reason == DifferenceReason::GenericToStructPtr)) {
             
-            auto struct_tid = try_synthesize_structure(cfunc, var_idx);
+            SynthOptions synth_opts = Config::instance().options();
+            synth_opts.interactive_mode = false;
+            synth_opts.auto_open_struct = false;
+            synth_opts.highlight_changes = false;
+            synthesized_persistence =
+                std::make_unique<StructurePersistence>(synth_opts);
+            synthesized_transaction =
+                synthesized_persistence->begin_transaction();
+            auto struct_tid = synthesized_transaction.has_value()
+                ? try_synthesize_structure(
+                    cfunc, var_idx, synth_opts, *synthesized_persistence)
+                : std::nullopt;
             if (struct_tid) {
                 fix.synthesized_struct_tid = *struct_tid;
-                result.structures_synthesized++;
                 
                 // Get the struct type
                 tinfo_t struct_type;
@@ -1470,15 +1536,35 @@ inline TypeFixResult TypeFixer::fix_function_types(cfunc_t* cfunc) {
                     qstring struct_name;
                     struct_type.get_type_name(&struct_name);
                     if (!struct_name.empty() && struct_name.find("_window") != qstring::npos) {
+                        (void)synthesized_transaction->rollback();
+                        synthesized_transaction.reset();
+                        synthesized_persistence.reset();
+                        fix.synthesized_struct_tid = BADADDR;
                         fix.skip_reason = "Window view kept local";
                         result.fixes_skipped++;
                         result.variable_fixes.push_back(std::move(fix));
                         continue;
                     }
 
-                    // Create pointer to the synthesized struct
-                    inferred_type.create_ptr(struct_type);
+                    // Create pointer to the synthesized struct.
+                    if (!inferred_type.create_ptr(struct_type)) {
+                        (void)synthesized_transaction->rollback();
+                        synthesized_transaction.reset();
+                        synthesized_persistence.reset();
+                        fix.synthesized_struct_tid = BADADDR;
+                    }
+                } else {
+                    (void)synthesized_transaction->rollback();
+                    synthesized_transaction.reset();
+                    synthesized_persistence.reset();
+                    fix.synthesized_struct_tid = BADADDR;
                 }
+            } else {
+                if (synthesized_transaction.has_value()) {
+                    (void)synthesized_transaction->rollback();
+                }
+                synthesized_transaction.reset();
+                synthesized_persistence.reset();
             }
         }
         
@@ -1487,14 +1573,47 @@ inline TypeFixResult TypeFixer::fix_function_types(cfunc_t* cfunc) {
             report_progress(var_idx, var.name.c_str(), "applying fix");
             
             PropagationResult prop_result;
-            if (apply_fix(cfunc, var_idx, inferred_type, 
-                         config_.propagate_fixes ? &prop_result : nullptr)) {
+            bool applied = apply_fix(
+                cfunc, var_idx, inferred_type,
+                config_.propagate_fixes ? &prop_result : nullptr);
+            if (applied && synthesized_transaction.has_value()) {
+                applied = synthesized_transaction->commit();
+                if (applied) {
+                    result.structures_synthesized++;
+                }
+            }
+            if (applied) {
                 fix.applied = true;
                 fix.propagation = std::move(prop_result);
                 result.fixes_applied++;
                 result.propagated_count += fix.propagation.success_count;
             } else {
-                fix.skip_reason = "Failed to apply type";
+                if (synthesized_transaction.has_value() &&
+                    synthesized_transaction->active()) {
+                    if (last_apply_rollback_failed_) {
+                        const bool retained = synthesized_transaction->commit();
+                        if (retained) {
+                            result.structures_synthesized++;
+                            fix.skip_reason =
+                                "Failed to apply type and lvar rollback failed; "
+                                "synthesized type retained";
+                        } else {
+                            fix.synthesized_struct_tid = BADADDR;
+                            fix.skip_reason =
+                                "Failed to apply type, lvar rollback failed, and "
+                                "synthesized type retention failed";
+                        }
+                    } else {
+                        const bool rolled_back =
+                            synthesized_transaction->rollback();
+                        fix.synthesized_struct_tid = BADADDR;
+                        fix.skip_reason = rolled_back
+                            ? "Failed to apply type; synthesized type rolled back"
+                            : "Failed to apply type and synthesized type rollback failed";
+                    }
+                } else if (fix.skip_reason.empty()) {
+                    fix.skip_reason = "Failed to apply type";
+                }
                 result.fixes_skipped++;
             }
         } else {
@@ -1506,9 +1625,15 @@ inline TypeFixResult TypeFixer::fix_function_types(cfunc_t* cfunc) {
     }
 
     if (config_.collect_missing_argument_warnings) {
-        qvector<qstring> missing_arg_warnings = collect_missing_argument_warnings(cfunc);
-        for (auto& warning : missing_arg_warnings) {
-            result.warnings.push_back(std::move(warning));
+        hexrays_failure_t warning_hf;
+        cfuncptr_t warning_cfunc = decompile(
+            get_func(result.func_ea), &warning_hf, DECOMP_NO_WAIT);
+        if (warning_cfunc) {
+            qvector<qstring> missing_arg_warnings =
+                collect_missing_argument_warnings(warning_cfunc);
+            for (auto& warning : missing_arg_warnings) {
+                result.warnings.push_back(std::move(warning));
+            }
         }
     }
 
@@ -2053,38 +2178,45 @@ inline bool TypeFixer::apply_fix(
     const tinfo_t& new_type,
     PropagationResult* out_propagation)
 {
+    last_apply_rollback_failed_ = false;
     if (!cfunc || new_type.empty()) return false;
     
     lvars_t* lvars = cfunc->get_lvars();
     if (!lvars || var_idx < 0 || static_cast<size_t>(var_idx) >= lvars->size()) {
         return false;
     }
-    
-    lvar_t& var = lvars->at(var_idx);
+    const ea_t entry_ea = cfunc->entry_ea;
+    const lvar_locator_t source_locator =
+        static_cast<const lvar_locator_t&>(
+            lvars->at(static_cast<size_t>(var_idx)));
     
     // Create pointer type if needed
     tinfo_t applied_type = new_type;
     if (!applied_type.is_ptr() && !applied_type.is_funcptr()) {
         // For structure types, create a pointer
         if (applied_type.is_struct()) {
-            applied_type.create_ptr(new_type);
+            if (!applied_type.create_ptr(new_type)) {
+                return false;
+            }
         }
     }
     
-    // Apply the type
-    lvar_saved_info_t lsi;
-    lsi.ll = var;
-    lsi.type = applied_type;
-    
-    if (!modify_user_lvar_info(cfunc->entry_ea, MLI_TYPE, lsi)) {
+    SynthOptions opts = Config::instance().options();
+    opts.max_propagation_depth = config_.max_propagation_depth;
+    TypePropagator propagator(opts, &cfunc_cache_);
+
+    // Route every persistent lvar mutation through the rollback-verified path;
+    // this also synchronizes argument/return prototypes where required.
+    if (!propagator.apply_exact_type(cfunc, var_idx, applied_type)) {
+        last_apply_rollback_failed_ =
+            propagator.last_application_rollback_failed();
         return false;
     }
-    
-    // Update local copy
-    var.set_lvar_type(applied_type);
-    
+    cfunc_cache_.erase(entry_ea);
+
     // Propagate if requested
-    bool allow_propagation = config_.propagate_fixes;
+    bool allow_propagation = config_.propagate_fixes &&
+        (applied_type.is_ptr() || applied_type.is_funcptr());
     if (allow_propagation && applied_type.is_ptr()) {
         tinfo_t pointed = applied_type.get_pointed_object();
         qstring pointed_name;
@@ -2095,14 +2227,41 @@ inline bool TypeFixer::apply_fix(
     }
 
     if (out_propagation && allow_propagation) {
-        SynthOptions opts = Config::instance().options();
-        opts.max_propagation_depth = config_.max_propagation_depth;
-        TypePropagator propagator(opts, &cfunc_cache_);
-        *out_propagation = propagator.propagate(
-            cfunc->entry_ea,
-            var_idx,
-            applied_type,
-            PropagationDirection::Both);
+        try {
+            hexrays_failure_t propagation_hf;
+            cfuncptr_t propagation_cfunc = decompile(
+                get_func(entry_ea), &propagation_hf, DECOMP_NO_WAIT);
+            lvars_t* propagation_lvars = propagation_cfunc
+                ? propagation_cfunc->get_lvars()
+                : nullptr;
+            int propagation_var_idx = -1;
+            if (propagation_lvars != nullptr &&
+                propagation_lvars->find(source_locator) != nullptr) {
+                for (size_t i = 0; i < propagation_lvars->size(); ++i) {
+                    if (static_cast<const lvar_locator_t&>(
+                            propagation_lvars->at(i)) == source_locator) {
+                        propagation_var_idx = static_cast<int>(i);
+                        break;
+                    }
+                }
+            }
+            if (propagation_var_idx < 0) {
+                diagnostics_.push_back(
+                    qstring("optional propagation source locator no longer resolves"));
+                return true;
+            }
+            *out_propagation = propagator.propagate(
+                entry_ea,
+                propagation_var_idx,
+                applied_type,
+                PropagationDirection::Both);
+        } catch (...) {
+            try {
+                diagnostics_.push_back(
+                    qstring("optional propagation raised after source type application"));
+            } catch (...) {
+            }
+        }
     }
     
     return true;
@@ -2157,15 +2316,11 @@ inline bool TypeFixer::should_apply_fix(const TypeComparisonResult& comparison) 
 
 inline std::optional<tid_t> TypeFixer::try_synthesize_structure(
     cfunc_t* cfunc,
-    int var_idx)
+    int var_idx,
+    const SynthOptions& opts,
+    StructurePersistence& persistence)
 {
-    if (!cfunc) return std::nullopt;
-    
-    // Use the existing synthesis infrastructure
-    SynthOptions opts = Config::instance().options();
-    opts.interactive_mode = false;
-    opts.auto_open_struct = false;
-    opts.highlight_changes = false;
+    if (!cfunc || !persistence.transaction_active()) return std::nullopt;
     
     AccessCollector collector(opts);
     AccessPattern pattern = collector.collect(cfunc, var_idx);
@@ -2179,12 +2334,13 @@ inline std::optional<tid_t> TypeFixer::try_synthesize_structure(
     LayoutSynthesizer synthesizer(opts);
     SynthesisResult synth_result = synthesizer.synthesize(pattern, opts);
     
-    if (synth_result.structure.fields.empty()) {
+    if (synth_result.error != SynthError::Success ||
+        synth_result.structure.fields.empty() ||
+        synth_result.structure.size == 0) {
         return std::nullopt;
     }
     
     // Persist to IDB
-    StructurePersistence persistence(opts);
     tid_t struct_tid = persistence.create_struct(synth_result.structure);
     
     return struct_tid != BADADDR ? std::optional<tid_t>(struct_tid) : std::nullopt;
@@ -2192,7 +2348,15 @@ inline std::optional<tid_t> TypeFixer::try_synthesize_structure(
 
 inline void TypeFixer::report_progress(int var_idx, const char* var_name, const char* status) {
     if (config_.progress_callback) {
-        config_.progress_callback(var_idx, var_name, status);
+        try {
+            config_.progress_callback(var_idx, var_name, status);
+        } catch (...) {
+            try {
+                diagnostics_.push_back(
+                    qstring("progress callback raised an exception"));
+            } catch (...) {
+            }
+        }
     }
 }
 

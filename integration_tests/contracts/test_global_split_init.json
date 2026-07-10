@@ -29,10 +29,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_g_device",
           "size": 56,
-          "alignment": 1,
+          "alignment": 4,
+          "packing": null,
           "source_func_name": "_device_header_ctor",
           "source_var": "_g_device",
           "field_count": 3,

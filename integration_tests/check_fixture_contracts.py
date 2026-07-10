@@ -14,7 +14,11 @@ from pathlib import Path
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+COMMAND_TIMEOUT_SECONDS = 300
 FUNCTION_HEADER_RE = re.compile(r"^Function: (?P<name>.+?) \(")
+GUESSED_TYPE_DIAGNOSTIC_RE = re.compile(
+    r"^(?:0x)?[0-9A-Fa-f]+: using guessed type\b"
+)
 
 
 def strip_ansi(text: str) -> str:
@@ -44,7 +48,14 @@ def format_name_list(names: list[str], *, indent: str = "  ") -> str:
 
 
 def run(cmd, *, cwd=None, env=None):
-    return subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
 
 
 def expand_function_filters(functions: list[str]) -> list[str]:
@@ -115,17 +126,26 @@ def prepare_plugin_home(plugin_path: Path, real_home: Path) -> Path:
     return sandbox_home
 
 
-def write_structor_config(sandbox_home: Path, *, debug_mode: bool = False) -> None:
+def write_structor_config(
+    sandbox_home: Path,
+    *,
+    debug_mode: bool = False,
+    overrides: dict | None = None,
+) -> None:
     config_path = sandbox_home / ".idapro" / "structor.cfg"
+    lines = [
+        f"debug_mode={'true' if debug_mode else 'false'}",
+        "auto_fix_types=false",
+        "auto_fix_verbose=false",
+    ]
+    for key, value in sorted((overrides or {}).items()):
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        else:
+            rendered = str(value)
+        lines.append(f"{key}={rendered}")
     config_path.write_text(
-        "\n".join(
-            [
-                f"debug_mode={'true' if debug_mode else 'false'}",
-                "auto_fix_types=false",
-                "auto_fix_verbose=false",
-            ]
-        )
-        + "\n",
+        "\n".join(lines) + "\n",
         encoding="utf-8",
     )
 
@@ -191,6 +211,7 @@ def normalize_result(raw: dict) -> dict:
             "name": structure.get("name"),
             "size": structure.get("size"),
             "alignment": structure.get("alignment"),
+            "packing": structure.get("packing"),
             "source_func_name": structure.get("source_func_name"),
             "source_var": structure.get("source_var"),
             "field_count": structure.get("field_count"),
@@ -201,6 +222,7 @@ def normalize_result(raw: dict) -> dict:
         }
 
     z3 = raw.get("z3", {})
+    resource_limit = raw.get("resource_limit")
     return {
         "success": raw.get("success"),
         "error": raw.get("error"),
@@ -214,6 +236,16 @@ def normalize_result(raw: dict) -> dict:
             "used_z3": z3.get("used_z3"),
             "used_fallback": z3.get("used_fallback"),
         },
+        "resource_limit": (
+            {
+                "kind": resource_limit.get("kind"),
+                "configured_limit": resource_limit.get("configured_limit"),
+                "observed_value": resource_limit.get("observed_value"),
+                "phase": resource_limit.get("phase"),
+            }
+            if isinstance(resource_limit, dict)
+            else None
+        ),
         "structure": normalize_structure(raw.get("structure")),
     }
 
@@ -244,6 +276,7 @@ def extract_pseudocode_blocks(output: str) -> dict[str, str]:
             line = lines[i]
             if (
                 FUNCTION_HEADER_RE.match(line)
+                or GUESSED_TYPE_DIAGNOSTIC_RE.match(line)
                 or line.startswith("USER LVAR INFO FOR ")
                 or line.startswith("Summary")
                 or line.startswith("[*] Done.")
@@ -275,25 +308,204 @@ def render_pseudocode_snapshot(output: str, function_names: list[str]) -> str:
     return "\n\n".join(sections) + "\n"
 
 
+def _require_exact_keys(value: dict, keys: set[str], context: str) -> None:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{context} must be an object")
+    observed = set(value)
+    if observed != keys:
+        raise RuntimeError(
+            f"{context} schema mismatch: expected {sorted(keys)}, "
+            f"observed {sorted(observed)}"
+        )
+
+
+def validate_golden_payload(case: dict, context: str) -> None:
+    if "golden_result" not in case:
+        raise RuntimeError(f"{context} is missing golden_result")
+    if "golden_pseudocode" not in case:
+        raise RuntimeError(f"{context} is missing golden_pseudocode")
+    if not isinstance(case["golden_pseudocode"], str) or not case[
+        "golden_pseudocode"
+    ]:
+        raise RuntimeError(f"{context} golden_pseudocode must be non-empty text")
+
+    result = case["golden_result"]
+    _require_exact_keys(
+        result,
+        {
+            "success",
+            "error",
+            "error_message",
+            "fields_created",
+            "vtable_slots",
+            "propagated_to",
+            "failed_sites",
+            "z3",
+            "resource_limit",
+            "structure",
+        },
+        f"{context} golden_result",
+    )
+    if not isinstance(result["success"], bool):
+        raise RuntimeError(f"{context} golden_result.success must be boolean")
+    if not isinstance(result["propagated_to"], list) or not isinstance(
+        result["failed_sites"], list
+    ):
+        raise RuntimeError(f"{context} result site collections must be arrays")
+    _require_exact_keys(
+        result["z3"],
+        {"status", "used_z3", "used_fallback"},
+        f"{context} golden_result.z3",
+    )
+
+    resource_limit = result["resource_limit"]
+    if resource_limit is not None:
+        _require_exact_keys(
+            resource_limit,
+            {"kind", "configured_limit", "observed_value", "phase"},
+            f"{context} golden_result.resource_limit",
+        )
+
+    structure = result["structure"]
+    if structure is None:
+        return
+    _require_exact_keys(
+        structure,
+        {
+            "name",
+            "size",
+            "alignment",
+            "packing",
+            "source_func_name",
+            "source_var",
+            "field_count",
+            "non_padding_field_count",
+            "provenance",
+            "fields",
+            "vtable",
+        },
+        f"{context} golden_result.structure",
+    )
+    if not isinstance(structure["fields"], list) or not isinstance(
+        structure["provenance"], list
+    ):
+        raise RuntimeError(f"{context} structure fields/provenance must be arrays")
+    field_keys = {
+        "name",
+        "offset",
+        "size",
+        "semantic",
+        "type",
+        "confidence",
+        "is_padding",
+        "is_array",
+        "array_count",
+        "is_union_candidate",
+        "is_bitfield",
+        "bit_offset",
+        "bit_size",
+        "union_members",
+    }
+    union_member_keys = {"name", "offset", "size", "type"}
+    for field_index, field in enumerate(structure["fields"]):
+        field_context = f"{context} field[{field_index}]"
+        _require_exact_keys(field, field_keys, field_context)
+        if not isinstance(field["union_members"], list):
+            raise RuntimeError(f"{field_context}.union_members must be an array")
+        for member_index, member in enumerate(field["union_members"]):
+            _require_exact_keys(
+                member,
+                union_member_keys,
+                f"{field_context}.union_members[{member_index}]",
+            )
+
+    vtable = structure["vtable"]
+    if vtable is not None:
+        _require_exact_keys(
+            vtable,
+            {"name", "slot_count", "slots"},
+            f"{context} golden_result.structure.vtable",
+        )
+        if not isinstance(vtable["slots"], list):
+            raise RuntimeError(f"{context} vtable slots must be an array")
+        for slot_index, slot in enumerate(vtable["slots"]):
+            _require_exact_keys(
+                slot,
+                {"index", "offset", "name", "signature_hint", "type"},
+                f"{context} vtable slot[{slot_index}]",
+            )
+
+
 def load_contracts(contract_dir: Path, selected: list[str]) -> list[dict]:
     if not contract_dir.exists():
         raise RuntimeError(f"contract directory not found: {contract_dir}")
 
+    # Import lazily: the recorder imports this module for shared execution
+    # helpers. At runtime its manifest is the authoritative coverage list.
+    from generate_fixture_contracts import CONTRACT_MANIFEST
+
+    manifest_by_fixture = {
+        entry["fixture"]: entry for entry in CONTRACT_MANIFEST
+    }
+    selected_set = set(selected)
+    unknown_selected = selected_set - set(manifest_by_fixture)
+    if unknown_selected:
+        raise RuntimeError(
+            "fixtures are absent from the contract manifest: "
+            + ", ".join(sorted(unknown_selected))
+        )
+    required_fixtures = selected_set or set(manifest_by_fixture)
+
     contracts = []
     for path in sorted(contract_dir.glob("*.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError(f"contract root must be an object: {path}")
         data["__path"] = path
         fixture = data.get("fixture")
         if selected and fixture not in selected:
             continue
         contracts.append(data)
 
-    if selected:
-        found = {contract["fixture"] for contract in contracts}
-        missing = [name for name in selected if name not in found]
-        if missing:
+    found = {contract["fixture"] for contract in contracts}
+    missing = required_fixtures - found
+    if missing:
+        raise RuntimeError(
+            "missing contract files for manifest fixtures: "
+            + ", ".join(sorted(missing))
+        )
+    if not selected:
+        extras = found - set(manifest_by_fixture)
+        if extras:
             raise RuntimeError(
-                "missing contract files for fixtures: " + ", ".join(sorted(missing))
+                "contract files are absent from the manifest: "
+                + ", ".join(sorted(extras))
+            )
+
+    control_keys = ("name", "synth", "dump_functions", "config", "expect")
+    for contract in contracts:
+        fixture = contract["fixture"]
+        expected_cases = manifest_by_fixture[fixture]["cases"]
+        actual_cases = contract.get("cases", [])
+        expected_names = [case["name"] for case in expected_cases]
+        actual_names = [case.get("name") for case in actual_cases]
+        if actual_names != expected_names:
+            raise RuntimeError(
+                f"contract case manifest mismatch for {fixture}: "
+                f"expected {expected_names}, observed {actual_names}"
+            )
+        for expected, actual in zip(expected_cases, actual_cases):
+            for key in control_keys:
+                expected_value = expected.get(key)
+                actual_value = actual.get(key)
+                if expected_value != actual_value:
+                    raise RuntimeError(
+                        f"contract control mismatch for {fixture}/"
+                        f"{expected['name']} key {key}: expected "
+                        f"{expected_value!r}, observed {actual_value!r}"
+                    )
+            validate_golden_payload(
+                actual, f"{fixture}/{expected['name']}"
             )
 
     return contracts
@@ -387,7 +599,11 @@ def run_case(
 ) -> tuple[dict, str]:
     real_home = Path.home()
     sandbox_home = prepare_plugin_home(plugin_path, real_home)
-    write_structor_config(sandbox_home, debug_mode=debug_mode)
+    write_structor_config(
+        sandbox_home,
+        debug_mode=debug_mode,
+        overrides=case.get("config"),
+    )
 
     binary = repo_root / "integration_tests" / fixture_name
     if not binary.exists():
@@ -547,9 +763,16 @@ def verify_case(
     raw_output: str,
     normalized_result: dict,
     pseudocode_snapshot: str,
+    *,
+    require_goldens: bool = True,
 ) -> None:
     context = f"{contract['fixture']}/{case['name']}"
     expect = case.get("expect", {})
+
+    if require_goldens and "golden_result" not in case:
+        raise AssertionError(f"{context}: missing golden_result")
+    if require_goldens and "golden_pseudocode" not in case:
+        raise AssertionError(f"{context}: missing golden_pseudocode")
 
     if "golden_result" in case:
         require_exact(case["golden_result"], normalized_result, f"{context} result")
@@ -599,6 +822,13 @@ def verify_case(
             f"{context}: expected used_fallback={expect['used_fallback']!r}, got {raw_result.get('z3', {}).get('used_fallback')!r}"
         )
 
+    if "resource_limit_kind" in expect:
+        actual_kind = (raw_result.get("resource_limit") or {}).get("kind")
+        if actual_kind != expect["resource_limit_kind"]:
+            raise AssertionError(
+                f"{context}: expected resource limit kind {expect['resource_limit_kind']!r}, got {actual_kind!r}"
+            )
+
     structure = raw_result.get("structure")
     if expect.get("require_structure", True):
         if not structure:
@@ -622,6 +852,30 @@ def verify_case(
             )
 
         actual_fields = structure.get("fields", [])
+        if "max_array_count" in expect:
+            oversized = [
+                field
+                for field in actual_fields
+                if field.get("is_array")
+                and field.get("array_count", 0) > expect["max_array_count"]
+            ]
+            if oversized:
+                raise AssertionError(
+                    f"{context}: recovered arrays exceed element cap {expect['max_array_count']}: {oversized!r}"
+                )
+
+        if "required_field_offsets" in expect:
+            actual_offsets = {field.get("offset") for field in actual_fields}
+            missing_offsets = [
+                offset
+                for offset in expect["required_field_offsets"]
+                if offset not in actual_offsets
+            ]
+            if missing_offsets:
+                raise AssertionError(
+                    f"{context}: mandatory scalar evidence missing at offsets {missing_offsets!r}"
+                )
+
         if expect.get("ignore_padding", True):
             actual_fields = [
                 field for field in actual_fields if not field.get("is_padding")

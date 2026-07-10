@@ -64,7 +64,7 @@ void ConstraintTracker::add_hard(
     ConstraintProvenance hard_prov = provenance;
     hard_prov.is_soft = false;
 
-    add_tracked(solver, constraint, hard_prov);
+    (void)add_tracked(solver, constraint, hard_prov);
 }
 
 void ConstraintTracker::add_soft(
@@ -77,7 +77,7 @@ void ConstraintTracker::add_soft(
     soft_prov.is_soft = true;
     soft_prov.weight = weight;
 
-    add_tracked(solver, constraint, soft_prov);
+    (void)add_tracked(solver, constraint, soft_prov);
 }
 
 void ConstraintTracker::add_to_optimizer(

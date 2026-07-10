@@ -29,10 +29,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_result",
           "size": 7,
           "alignment": 1,
+          "packing": 1,
           "source_func_name": "_read_whole",
           "source_var": "result",
           "field_count": 3,

@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 BADADDR = (1 << 64) - 1
+COMMAND_TIMEOUT_SECONDS = 300
 
 
 def log(message: str) -> None:
@@ -24,7 +25,14 @@ def hr(char: str = "-", width: int = 78) -> str:
 def run(
     cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
 
 
 def expand_function_filters(functions: list[str]) -> list[str]:
@@ -457,6 +465,34 @@ def check_global_surface(repo_root: Path, plugin_path: Path, idump_path: str) ->
     )
 
 
+def check_global_tinfo_rollback_fault(
+    repo_root: Path, plugin_path: Path, idump_path: str
+) -> None:
+    log(hr("="))
+    log("API: global tinfo verification-failure rollback")
+
+    result = run_api_command(
+        repo_root,
+        plugin_path,
+        idump_path,
+        binary="test_global_pointer_singleton",
+        functions=["publish_state", "use_state"],
+        command="fault_global_tinfo_rollback|g_state_storage",
+    )
+    require(result["success"], "global tinfo rollback fault test failed", result)
+    require(
+        not result["application_reported_success"],
+        "forced verification failure must not report application success",
+        result,
+    )
+    require(result["tinfo_restored"], "prior global tinfo was not restored", result)
+    require(
+        result["data_item_restored"],
+        "global data-item metadata was not restored",
+        result,
+    )
+
+
 def check_type_surface(repo_root: Path, plugin_path: Path, idump_path: str) -> None:
     log(hr("="))
     log("API: variable and function type analysis/fixing")
@@ -591,8 +627,10 @@ def check_direct_apply_and_rewrite(
         rewrite,
     )
     require(
-        rewrite["rewrite"]["success_count"] >= 1,
-        "expected at least one rewrite transform",
+        rewrite["rewrite"]["success_count"] == 0
+        and rewrite["rewrite"]["failure_count"] >= 1
+        and not rewrite["rewrite"]["refresh_required"],
+        "expected diagnostic rewrite plans with no false ctree-mutation success",
         rewrite,
     )
 
@@ -618,6 +656,7 @@ def main() -> int:
     check_function_surface(repo_root, plugin_path, args.idump)
     check_unified_and_propagation(repo_root, plugin_path, args.idump)
     check_global_surface(repo_root, plugin_path, args.idump)
+    check_global_tinfo_rollback_fault(repo_root, plugin_path, args.idump)
     check_type_surface(repo_root, plugin_path, args.idump)
     check_direct_apply_and_rewrite(repo_root, plugin_path, args.idump)
     log(hr("="))

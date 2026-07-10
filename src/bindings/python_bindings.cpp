@@ -220,7 +220,7 @@ static error_t idaapi py_get_accesses(idc_value_t* argv, idc_value_t* res) {
 /// IDAPython function: structor_set_option(name, value) -> bool
 static error_t idaapi py_set_option(idc_value_t* argv, idc_value_t* res) {
     const char* opt_name = argv[0].c_str();
-    SynthOptions& opts = Config::instance().mutable_options();
+    SynthOptions opts = Config::instance().options();
 
     bool success = true;
 
@@ -231,7 +231,12 @@ static error_t idaapi py_set_option(idc_value_t* argv, idc_value_t* res) {
     } else if (qstrcmp(opt_name, "min_accesses") == 0) {
         opts.min_accesses = static_cast<int>(argv[1].num);
     } else if (qstrcmp(opt_name, "alignment") == 0) {
-        opts.alignment = static_cast<int>(argv[1].num);
+        const std::int64_t alignment = static_cast<std::int64_t>(argv[1].num);
+        if (!is_valid_abi_alignment(alignment)) {
+            success = false;
+        } else {
+            opts.alignment = static_cast<int>(alignment);
+        }
     } else if (qstrcmp(opt_name, "interactive_mode") == 0) {
         opts.interactive_mode = argv[1].num != 0;
     } else if (qstrcmp(opt_name, "max_propagation_depth") == 0) {
@@ -240,6 +245,10 @@ static error_t idaapi py_set_option(idc_value_t* argv, idc_value_t* res) {
         opts.hotkey = argv[1].c_str();
     } else {
         success = false;
+    }
+
+    if (success) {
+        success = Config::instance().set_options(opts);
     }
 
     res->set_long(success ? 1 : 0);

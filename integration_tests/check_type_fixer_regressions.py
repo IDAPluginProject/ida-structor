@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+COMMAND_TIMEOUT_SECONDS = 300
 
 
 def strip_ansi(text: str) -> str:
@@ -34,6 +35,7 @@ def run(cmd, *, cwd=None, env=None):
         env=env,
         text=True,
         capture_output=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
     )
     return proc
 

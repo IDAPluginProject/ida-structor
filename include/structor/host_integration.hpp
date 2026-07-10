@@ -1,7 +1,9 @@
 #pragma once
 
 #include "config.hpp"
+#include "host_lifecycle.hpp"
 
+#include <atomic>
 #include <unordered_set>
 
 namespace structor {
@@ -14,6 +16,7 @@ struct HostIntegrationOptions {
 
 /// Embeddable Hex-Rays integration for hosts that want Structor's callback-driven
 /// behavior without going through Structor's plugin init path.
+/// Hook lifecycle mutations are synchronously dispatched to IDA's main thread.
 class HostIntegration {
 public:
     explicit HostIntegration(HostIntegrationOptions options = {});
@@ -29,11 +32,11 @@ public:
     void reset_processed_functions();
 
     void set_auto_type_fixing_suppressed(bool suppress) noexcept {
-        auto_type_fixing_suppressed_ = suppress;
+        auto_type_fixing_suppressed_.store(suppress, std::memory_order_release);
     }
 
     [[nodiscard]] bool auto_type_fixing_suppressed() const noexcept {
-        return auto_type_fixing_suppressed_;
+        return auto_type_fixing_suppressed_.load(std::memory_order_acquire);
     }
 
     void handle_ctree_maturity(cfunc_t* cfunc, ctree_maturity_t maturity);
@@ -44,9 +47,9 @@ private:
     void process_decompilation_complete(cfunc_t* cfunc);
 
     HostIntegrationOptions options_;
-    bool hexrays_hooked_ = false;
-    bool shutdown_ = false;
-    bool auto_type_fixing_suppressed_ = false;
+    detail::HostHookLifecycle hook_lifecycle_;
+    std::atomic_bool auto_type_fixing_suppressed_{false};
+    std::unordered_set<ea_t> processing_functions_;
     std::unordered_set<ea_t> processed_functions_;
 };
 

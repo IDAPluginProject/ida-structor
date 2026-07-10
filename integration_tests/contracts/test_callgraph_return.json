@@ -36,10 +36,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_result",
-          "size": 113,
-          "alignment": 1,
+          "size": 120,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_process_root",
           "source_var": "result",
           "field_count": 13,
@@ -63,20 +65,33 @@
               "union_members": []
             },
             {
-              "name": "f32_8",
+              "name": "union_8",
               "offset": 8,
               "size": 4,
-              "semantic": "float",
-              "type": "float",
+              "semantic": "unknown",
+              "type": "unsigned __int32",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "unsigned __int32"
+                },
+                {
+                  "name": "f32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "float"
+                }
+              ]
             },
             {
               "name": "u16_C",
@@ -241,9 +256,9 @@
             {
               "name": "part_60",
               "offset": 96,
-              "size": 17,
+              "size": 24,
               "semantic": "struct",
-              "type": "auto_part_60",
+              "type": "auto_process_root_part_60",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
@@ -258,7 +273,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> process_root\nauto_result *__fastcall process_root(auto_result *result) {\n    sink ^= result->u64_0;\n    sink ^= LODWORD(result->f32_8);\n    sink ^= result->u16_C;\n    sink ^= result->u8_18;\n    sink ^= result->u64_38;\n    sink ^= result->u32_48;\n    return result;\n}\n<<<\n\n>>> sibling_reader\nauto_result *__fastcall sibling_reader(auto_result *result) {\n    sink ^= result->u8_51;\n    sink ^= result->u64_40;\n    return result;\n}\n<<<\n\n>>> make_sub\nauto_part_60 *__fastcall make_sub(auto_result *a1) {\n    return &a1->part_60;\n}\n<<<\n"
+      "golden_pseudocode": ">>> process_root\nauto_result *__fastcall process_root(auto_result *result) {\n    sink ^= result->u64_0;\n    sink ^= result->union_8.u32_8;\n    sink ^= result->u16_C;\n    sink ^= result->u8_18;\n    sink ^= result->u64_38;\n    sink ^= result->u32_48;\n    return result;\n}\n<<<\n\n>>> sibling_reader\nauto_result *__fastcall sibling_reader(auto_result *result) {\n    sink ^= result->u8_51;\n    sink ^= result->u64_40;\n    return result;\n}\n<<<\n\n>>> make_sub\nauto_process_root_part_60 *__fastcall make_sub(auto_result *a1) {\n    return &a1->part_60;\n}\n<<<\n"
     },
     {
       "name": "process_sub",
@@ -293,10 +308,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_result_view_60",
-          "size": 113,
-          "alignment": 1,
+          "size": 120,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_process_sub",
           "source_var": "result",
           "field_count": 16,
@@ -320,20 +337,33 @@
               "union_members": []
             },
             {
-              "name": "f32_8",
+              "name": "union_8",
               "offset": 8,
               "size": 4,
-              "semantic": "float",
-              "type": "float",
+              "semantic": "unknown",
+              "type": "unsigned __int32",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "unsigned __int32"
+                },
+                {
+                  "name": "f32_8",
+                  "offset": 0,
+                  "size": 4,
+                  "type": "float"
+                }
+              ]
             },
             {
               "name": "u16_C",
@@ -563,7 +593,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> process_sub\nauto_result_view_60_tail_60 *__shifted(auto_result_view_60, 0x60) __fastcall process_sub(\n    auto_result_view_60_tail_60 *__shifted(auto_result_view_60, 0x60) result) {\n    sink ^= ADJ(ptr: result)->u32_60;\n    sink ^= ADJ(ptr: result)->u64_68;\n    sink ^= ADJ(ptr: result)->u8_70;\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> process_sub\nunsigned __int32 *__shifted(auto_result_view_60, 0x60) __fastcall process_sub(\n    unsigned __int32 *__shifted(auto_result_view_60, 0x60) result) {\n    sink ^= ADJ(ptr: result)->u32_60;\n    sink ^= ADJ(ptr: result)->u64_68;\n    sink ^= ADJ(ptr: result)->u8_70;\n    return result;\n}\n<<<\n"
     }
   ]
 }

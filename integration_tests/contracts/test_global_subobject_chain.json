@@ -17,6 +17,7 @@
         "fields_created": 6,
         "vtable_slots": 0,
         "propagated_to": [
+          "_child_ctor",
           "_manager_ctor"
         ],
         "failed_sites": [],
@@ -25,10 +26,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_g_manager",
           "size": 80,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_manager_ctor",
           "source_var": "_g_manager",
           "field_count": 6,
@@ -138,7 +141,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> manager_ctor\n__int64 __fastcall manager_ctor(auto_g_manager *a1) {\n    __int64 result; // x0\n\n    a1->u32_0 = 1296125511;\n    a1->u32_4 = 85;\n    result = child_ctor(result: (__int64)&a1->child, a2: 9u);\n    a1->u64_48 = 0xFEEDFACECAFEBEEFLL;\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> manager_ctor\n__int64 __fastcall manager_ctor(auto_g_manager *a1) {\n    __int64 result; // x0\n\n    a1->u32_0 = 1296125511;\n    a1->u32_4 = 85;\n    result = child_ctor(result: &a1->child, a2: 9u);\n    a1->u64_48 = 0xFEEDFACECAFEBEEFLL;\n    return result;\n}\n<<<\n"
     }
   ]
 }

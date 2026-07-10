@@ -49,15 +49,14 @@ struct FieldCandidate {
 
     /// Check if this candidate overlaps with another
     [[nodiscard]] bool overlaps(const FieldCandidate& other) const noexcept {
-        if (offset >= other.offset + static_cast<sval_t>(other.size)) return false;
-        if (other.offset >= offset + static_cast<sval_t>(size)) return false;
-        return true;
+        return checked_intervals_overlap(
+            offset, size, other.offset, other.size);
     }
 
     /// Check if this candidate contains another
     [[nodiscard]] bool contains(const FieldCandidate& other) const noexcept {
-        return offset <= other.offset &&
-               offset + static_cast<sval_t>(size) >= other.offset + static_cast<sval_t>(other.size);
+        return checked_interval_contains(
+            offset, size, other.offset, other.size);
     }
 
     /// Check if this is an array candidate
@@ -65,9 +64,29 @@ struct FieldCandidate {
         return kind == Kind::ArrayElement || kind == Kind::ArrayField;
     }
 
-    /// Get end offset (exclusive)
+    /// The array-element cap applies only to optional aggregate candidates;
+    /// scalar/direct candidates remain eligible regardless of this predicate.
+    [[nodiscard]] bool within_array_element_limit(
+        std::uint32_t maximum) const noexcept {
+        return !array_element_count.has_value() ||
+               *array_element_count <= maximum;
+    }
+
+    [[nodiscard]] bool meets_optional_confidence_threshold(
+        std::uint8_t minimum_percent) const noexcept {
+        return type_confidence_percent(confidence) >= minimum_percent;
+    }
+
+    /// Get the checked end offset (exclusive).
+    [[nodiscard]] std::optional<sval_t> checked_end_offset() const noexcept {
+        return checked_interval_end(offset, size);
+    }
+
+    /// Get end offset (exclusive), saturating invalid intervals.  Production
+    /// builder preflight rejects the saturated case before any range scan.
     [[nodiscard]] sval_t end_offset() const noexcept {
-        return offset + static_cast<sval_t>(size);
+        return checked_end_offset().value_or(
+            std::numeric_limits<sval_t>::max());
     }
 
     /// Get alignment requirement
@@ -86,7 +105,14 @@ struct CandidateGenerationConfig {
     bool generate_padding_candidates = true;   // Padding between fields
     uint32_t max_covering_size = 64;           // Max size for covering candidates
     uint32_t min_array_elements = 3;           // Minimum elements for array detection
+    bool detect_symbolic_arrays = true;         // Use affine Z3 array detection
+    uint32_t max_array_stride = 4096;           // Maximum inferred element stride
     bool merge_adjacent_same_type = true;      // Merge adjacent same-type fields
+    uint32_t max_accesses = 10000;              // Hard evidence-observation cap
+    uint32_t max_candidates = 1000;             // Hard unique candidate cap
+    uint32_t max_array_elements = 1024;         // Per-array element cap
+    uint32_t max_structure_size = 0x10000;      // Rebased evidence-span cap
+    std::uint8_t min_confidence_percent = 20;   // Optional candidate threshold
 };
 
 /// Result of candidate overlap analysis

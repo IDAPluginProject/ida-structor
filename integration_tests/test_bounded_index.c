@@ -29,6 +29,22 @@ void read_indexed(void *p, int idx) {
 }
 
 __attribute__((noinline))
+void read_inclusive(void *p, int idx) {
+    uint8_t *b = (uint8_t *)p;
+    if ((unsigned)idx <= 3) {
+        sink ^= *(uint32_t *)(b + 0x04 + idx * 4);
+    }
+}
+
+__attribute__((noinline))
+void read_reversed_bound(void *p, int idx) {
+    uint8_t *b = (uint8_t *)p;
+    if (4U > (unsigned)idx) {
+        sink ^= *(uint32_t *)(b + 0x04 + idx * 4);
+    }
+}
+
+__attribute__((noinline))
 void read_marks(void *p) {
     uint8_t *b = (uint8_t *)p;
     sink ^= *(uint16_t *)(b + 0x14);
@@ -40,6 +56,8 @@ int main(void) {
     init_indexed(&arr);
     read_indexed(&arr, 0);
     read_indexed(&arr, 2);
+    read_inclusive(&arr, 1);
+    read_reversed_bound(&arr, 0);
     read_marks(&arr);
     printf("sink=%llx\n", (unsigned long long)sink);
     return 0;

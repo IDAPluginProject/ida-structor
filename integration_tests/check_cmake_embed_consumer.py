@@ -9,10 +9,20 @@ import tempfile
 from pathlib import Path
 
 
+COMMAND_TIMEOUT_SECONDS = 900
+
+
 def run(
     cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
 
 
 def require_success(proc: subprocess.CompletedProcess[str], description: str) -> None:
@@ -67,7 +77,10 @@ target_link_libraries(consumer_smoke PRIVATE structor::core)
 
 int main() {
     auto& api = structor::StructorAPI::instance();
-    (void)api;
+    structor::SynthOptions options;
+    if (!api.set_options(options)) {
+        return 1;
+    }
 
     structor::HostIntegration integration;
     integration.set_auto_type_fixing_suppressed(true);
@@ -76,7 +89,7 @@ int main() {
     integration.shutdown();
 
     if (std::string_view(structor::materialization_mode_str(structor::MaterializationMode::Persist)) != "persist") {
-        return 1;
+        return 2;
     }
 
     return 0;

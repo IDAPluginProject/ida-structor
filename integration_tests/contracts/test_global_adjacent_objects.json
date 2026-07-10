@@ -28,10 +28,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
-          "name": "entry_point_command",
+          "name": "auto_g_dual_arena",
           "size": 24,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_record_ctor",
           "source_var": "_g_dual_arena",
           "field_count": 4,
@@ -108,7 +110,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> build_left\n__int64 build_left() {\n    return record_ctor(a1: &g_dual_arena, a2: 4369, a3: 0xAAAABBBBCCCCDDDDLL);\n}\n<<<\n\n>>> build_right\n__int64 build_right() {\n    return record_ctor(result: (__int64)&dword_100008040, a2: 8738, a3: 0x1111222233334444LL);\n}\n<<<\n\n>>> use_left\nvoid use_left() {\n    sink ^= (unsigned int)g_dual_arena;\n    sink ^= (unsigned int)dword_100008004;\n    sink ^= qword_100008008;\n}\n<<<\n\n>>> use_right\nvoid use_right() {\n    sink ^= (unsigned int)dword_100008040;\n    sink ^= (unsigned int)dword_100008044;\n    sink ^= qword_100008048;\n    sink ^= qword_100008050;\n}\n<<<\n"
+      "golden_pseudocode": ">>> build_left\n__int64 build_left() {\n    return record_ctor(result: &g_dual_arena, a2: 4369, a3: 0xAAAABBBBCCCCDDDDLL);\n}\n<<<\n\n>>> build_right\n__int64 build_right() {\n    return record_ctor(result: (auto_g_dual_arena *)&dword_100008040, a2: 8738, a3: 0x1111222233334444LL);\n}\n<<<\n\n>>> use_left\nvoid use_left() {\n    sink ^= (unsigned int)g_dual_arena;\n    sink ^= (unsigned int)dword_100008004;\n    sink ^= qword_100008008;\n}\n<<<\n\n>>> use_right\nvoid use_right() {\n    sink ^= (unsigned int)dword_100008040;\n    sink ^= (unsigned int)dword_100008044;\n    sink ^= qword_100008048;\n    sink ^= qword_100008050;\n}\n<<<\n"
     }
   ]
 }

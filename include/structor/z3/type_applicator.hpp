@@ -20,8 +20,9 @@ struct TypeApplicationConfig {
     /// Minimum confidence level to apply a type
     TypeConfidence min_confidence = TypeConfidence::Medium;
     
-    /// Whether to propagate types to callers/callees
-    bool propagate_types = true;
+    /// Whether to propagate types to callers/callees. Disabled unless the
+    /// caller explicitly expands mutation beyond the selected function.
+    bool propagate_types = false;
     
     /// Whether to overwrite existing non-default types
     bool overwrite_existing = false;
@@ -35,9 +36,6 @@ struct TypeApplicationConfig {
     /// Whether to apply inferred function signatures
     bool apply_signatures = false;
     
-    /// Maximum propagation depth
-    int max_propagation_depth = 3;
-    
     /// Whether to force decompiler refresh after applying types
     bool force_refresh = true;
     
@@ -49,6 +47,7 @@ struct TypeApplicationConfig {
 /// Result of applying types to a function
 struct TypeApplicationResult {
     ea_t func_ea = BADADDR;
+    qstring error_message;
     
     /// Types successfully applied
     struct AppliedType {
@@ -86,9 +85,17 @@ struct TypeApplicationResult {
     unsigned failed_count = 0;
     unsigned skipped_count = 0;
     unsigned propagated_count = 0;
+    bool signature_requested = false;
+    bool signature_applied = false;
+    bool signature_failed = false;
+    bool signature_rollback_failed = false;
+    bool incomplete = false;
     
     /// Overall success
-    [[nodiscard]] bool success() const { return applied_count > 0 && failed_count == 0; }
+    [[nodiscard]] bool success() const {
+        return (applied_count > 0 || signature_applied) &&
+            failed_count == 0 && !signature_failed && !incomplete;
+    }
     
     /// Get summary string
     [[nodiscard]] qstring summary() const;
@@ -113,6 +120,13 @@ public:
         TypeConfidence confidence,
         qstring* out_reason = nullptr
     );
+
+    /// Reports whether the most recent variable application could not restore
+    /// its saved local/prototype state. Callers that own referenced named
+    /// types must retain them when this is true.
+    [[nodiscard]] bool last_application_rollback_failed() const noexcept {
+        return propagator_.last_application_rollback_failed();
+    }
     
     /// Apply inferred types and propagate across call graph
     [[nodiscard]] TypeApplicationResult apply_and_propagate(
@@ -144,6 +158,7 @@ public:
 private:
     TypeApplicationConfig config_;
     TypePropagator propagator_;
+    bool last_signature_rollback_failed_ = false;
     
     /// Check if a type should be applied based on config and current state
     [[nodiscard]] bool should_apply(

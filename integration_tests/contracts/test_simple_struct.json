@@ -20,7 +20,6 @@
         "vtable_slots": 0,
         "propagated_to": [
           "_main",
-          "_printf",
           "_process_simple"
         ],
         "failed_sites": [],
@@ -29,10 +28,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_process_simple",
           "size": 24,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_process_simple",
           "source_var": "a1",
           "field_count": 4,
@@ -108,6 +109,386 @@
         }
       },
       "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(auto_process_simple *a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", a1->u32_0, a1->u64_8, a1->ptr_10);\n}\n<<<\n\n>>> init_simple\n__int64 __fastcall init_simple(__int64 result) {\n    *(_DWORD *)result = 42;\n    *(_QWORD *)(result + 8) = 0x123456789ABCDEFLL;\n    *(_QWORD *)(result + 16) = 3735928559LL;\n    return result;\n}\n<<<\n"
+    },
+    {
+      "name": "candidate_limit_failure",
+      "synth": {
+        "kind": "function",
+        "target": "process_simple",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "process_simple"
+      ],
+      "config": {
+        "z3_max_candidates": 1
+      },
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "z3_status": "resource_limit",
+        "used_fallback": false,
+        "resource_limit_kind": "candidates"
+      },
+      "golden_result": {
+        "success": false,
+        "error": "Synthesis resource limit exceeded",
+        "error_message": "mandatory direct evidence exceeds the configured candidate limit",
+        "fields_created": 0,
+        "vtable_slots": 0,
+        "propagated_to": [],
+        "failed_sites": [],
+        "z3": {
+          "status": "resource_limit",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": {
+          "kind": "candidates",
+          "configured_limit": 1,
+          "observed_value": 2,
+          "phase": "direct_candidate_generation"
+        },
+        "structure": null
+      },
+      "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(__int64 a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", *(_DWORD *)a1, *(_QWORD *)(a1 + 8), *(const void **)(a1 + 16));\n}\n<<<\n"
+    },
+    {
+      "name": "field_limit_failure",
+      "synth": {
+        "kind": "function",
+        "target": "process_simple",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "process_simple"
+      ],
+      "config": {
+        "z3_max_fields": 1
+      },
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "z3_status": "resource_limit",
+        "used_fallback": false,
+        "resource_limit_kind": "fields"
+      },
+      "golden_result": {
+        "success": false,
+        "error": "Synthesis resource limit exceeded",
+        "error_message": "explicit internal padding exceeds the configured materialized-field limit",
+        "fields_created": 0,
+        "vtable_slots": 0,
+        "propagated_to": [],
+        "failed_sites": [],
+        "z3": {
+          "status": "resource_limit",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": {
+          "kind": "fields",
+          "configured_limit": 1,
+          "observed_value": 4,
+          "phase": "layout_materialization"
+        },
+        "structure": null
+      },
+      "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(__int64 a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", *(_DWORD *)a1, *(_QWORD *)(a1 + 8), *(const void **)(a1 + 16));\n}\n<<<\n"
+    },
+    {
+      "name": "structure_span_limit_failure",
+      "synth": {
+        "kind": "function",
+        "target": "process_simple",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "process_simple"
+      ],
+      "config": {
+        "z3_max_structure_size": 8
+      },
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "z3_status": "resource_limit",
+        "used_fallback": false,
+        "resource_limit_kind": "structure_size"
+      },
+      "golden_result": {
+        "success": false,
+        "error": "Synthesis resource limit exceeded",
+        "error_message": "recovered object span exceeds the configured structure-size limit",
+        "fields_created": 0,
+        "vtable_slots": 0,
+        "propagated_to": [],
+        "failed_sites": [],
+        "z3": {
+          "status": "resource_limit",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": {
+          "kind": "structure_size",
+          "configured_limit": 8,
+          "observed_value": 24,
+          "phase": "synthesis_preflight"
+        },
+        "structure": null
+      },
+      "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(__int64 a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", *(_DWORD *)a1, *(_QWORD *)(a1 + 8), *(const void **)(a1 + 16));\n}\n<<<\n"
+    },
+    {
+      "name": "access_limit_failure",
+      "synth": {
+        "kind": "function",
+        "target": "process_simple",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "process_simple"
+      ],
+      "config": {
+        "z3_max_accesses": 1
+      },
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "z3_status": "resource_limit",
+        "used_fallback": false,
+        "resource_limit_kind": "accesses"
+      },
+      "golden_result": {
+        "success": false,
+        "error": "Synthesis resource limit exceeded",
+        "error_message": "access evidence exceeds the configured synthesis limit",
+        "fields_created": 0,
+        "vtable_slots": 0,
+        "propagated_to": [],
+        "failed_sites": [],
+        "z3": {
+          "status": "resource_limit",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": {
+          "kind": "accesses",
+          "configured_limit": 1,
+          "observed_value": 3,
+          "phase": "synthesis_preflight"
+        },
+        "structure": null
+      },
+      "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(__int64 a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", *(_DWORD *)a1, *(_QWORD *)(a1 + 8), *(const void **)(a1 + 16));\n}\n<<<\n"
+    },
+    {
+      "name": "constraint_pair_limit_failure",
+      "synth": {
+        "kind": "function",
+        "target": "process_simple",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "process_simple"
+      ],
+      "config": {
+        "z3_max_constraint_pairs": 1
+      },
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "z3_status": "resource_limit",
+        "used_fallback": false,
+        "resource_limit_kind": "constraint_pairs"
+      },
+      "golden_result": {
+        "success": false,
+        "error": "Synthesis resource limit exceeded",
+        "error_message": "candidate-pair and union-cardinality relations exceed the configured constraint limit",
+        "fields_created": 0,
+        "vtable_slots": 0,
+        "propagated_to": [],
+        "failed_sites": [],
+        "z3": {
+          "status": "resource_limit",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": {
+          "kind": "constraint_pairs",
+          "configured_limit": 1,
+          "observed_value": 10,
+          "phase": "constraint_build"
+        },
+        "structure": null
+      },
+      "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(__int64 a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", *(_DWORD *)a1, *(_QWORD *)(a1 + 8), *(const void **)(a1 + 16));\n}\n<<<\n"
+    },
+    {
+      "name": "maxsmt_memory_limit_failure",
+      "synth": {
+        "kind": "function",
+        "target": "process_simple",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "process_simple"
+      ],
+      "config": {
+        "z3_enable_maxsmt": true,
+        "z3_memory_limit_mb": 1
+      },
+      "expect": {
+        "success": false,
+        "require_structure": false,
+        "z3_status": "resource_limit",
+        "used_fallback": false,
+        "resource_limit_kind": "solver_memory"
+      },
+      "golden_result": {
+        "success": false,
+        "error": "Synthesis resource limit exceeded",
+        "error_message": "configured per-instance memory limit is unavailable for the MaxSMT optimizer",
+        "fields_created": 0,
+        "vtable_slots": 0,
+        "propagated_to": [],
+        "failed_sites": [],
+        "z3": {
+          "status": "resource_limit",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": {
+          "kind": "solver_memory",
+          "configured_limit": 1,
+          "observed_value": 0,
+          "phase": "solver_configuration"
+        },
+        "structure": null
+      },
+      "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(__int64 a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", *(_DWORD *)a1, *(_QWORD *)(a1 + 8), *(const void **)(a1 + 16));\n}\n<<<\n"
+    },
+    {
+      "name": "confidence_threshold_preserves_direct_evidence",
+      "synth": {
+        "kind": "function",
+        "target": "process_simple",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "process_simple"
+      ],
+      "config": {
+        "z3_min_confidence": 100
+      },
+      "expect": {
+        "success": true,
+        "z3_status": "success",
+        "used_fallback": false,
+        "required_field_offsets": [
+          0,
+          8,
+          16
+        ]
+      },
+      "golden_result": {
+        "success": true,
+        "error": "Success",
+        "error_message": "",
+        "fields_created": 4,
+        "vtable_slots": 0,
+        "propagated_to": [
+          "_main",
+          "_process_simple"
+        ],
+        "failed_sites": [],
+        "z3": {
+          "status": "success",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": null,
+        "structure": {
+          "name": "auto_process_simple",
+          "size": 24,
+          "alignment": 8,
+          "packing": null,
+          "source_func_name": "_process_simple",
+          "source_var": "a1",
+          "field_count": 4,
+          "non_padding_field_count": 3,
+          "provenance": [],
+          "fields": [
+            {
+              "name": "u32_0",
+              "offset": 0,
+              "size": 4,
+              "semantic": "uint",
+              "type": "unsigned __int32",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "__pad_4",
+              "offset": 4,
+              "size": 4,
+              "semantic": "padding",
+              "type": "char[4]",
+              "confidence": "medium",
+              "is_padding": true,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u64_8",
+              "offset": 8,
+              "size": 8,
+              "semantic": "uint",
+              "type": "unsigned __int64",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "ptr_10",
+              "offset": 16,
+              "size": 8,
+              "semantic": "ptr",
+              "type": "void *",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            }
+          ],
+          "vtable": null
+        }
+      },
+      "golden_pseudocode": ">>> process_simple\n__int64 __fastcall process_simple(auto_process_simple *a1) {\n    return printf(a1: \"a=%d, b=%ld, c=%p\\n\", a1->u32_0, a1->u64_8, a1->ptr_10);\n}\n<<<\n"
     }
   ]
 }

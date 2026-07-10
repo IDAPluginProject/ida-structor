@@ -10,24 +10,333 @@
       },
       "dump_functions": [
         "read_indexed",
+        "read_inclusive",
         "read_marks"
       ],
       "golden_result": {
-        "success": false,
-        "error": "No dereferences found for variable",
-        "error_message": "No dereferences found for variable",
-        "fields_created": 0,
+        "success": true,
+        "error": "Success",
+        "error_message": "",
+        "fields_created": 4,
         "vtable_slots": 0,
-        "propagated_to": [],
+        "propagated_to": [
+          "_main",
+          "_read_inclusive",
+          "_read_indexed",
+          "_read_marks",
+          "_read_reversed_bound"
+        ],
         "failed_sites": [],
         "z3": {
-          "status": "not_used",
-          "used_z3": false,
+          "status": "success",
+          "used_z3": true,
           "used_fallback": false
         },
-        "structure": null
+        "resource_limit": null,
+        "structure": {
+          "name": "auto_result",
+          "size": 24,
+          "alignment": 4,
+          "packing": null,
+          "source_func_name": "_read_indexed",
+          "source_var": "result",
+          "field_count": 4,
+          "non_padding_field_count": 3,
+          "provenance": [],
+          "fields": [
+            {
+              "name": "__pad_0",
+              "offset": 0,
+              "size": 4,
+              "semantic": "padding",
+              "type": "char[4]",
+              "confidence": "medium",
+              "is_padding": true,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u32s_4",
+              "offset": 4,
+              "size": 16,
+              "semantic": "array",
+              "type": "unsigned __int32[4]",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": true,
+              "array_count": 4,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u16_14",
+              "offset": 20,
+              "size": 2,
+              "semantic": "uint",
+              "type": "unsigned __int16",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u16_16",
+              "offset": 22,
+              "size": 2,
+              "semantic": "uint",
+              "type": "unsigned __int16",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            }
+          ],
+          "vtable": null
+        }
       },
-      "golden_pseudocode": ">>> read_indexed\n__int64 __fastcall read_indexed(__int64 result, unsigned int a2) {\n    if ( a2 < 4 )\n        sink ^= *(unsigned int *)(result + 4 + (int)(4 * a2));\n    return result;\n}\n\n100008000: using guessed type __int64 sink;\n<<<\n\n>>> read_marks\n__int64 __fastcall read_marks(__int64 result) {\n    sink ^= *(unsigned __int16 *)(result + 20);\n    sink ^= *(unsigned __int16 *)(result + 22);\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> read_indexed\nauto_result *__fastcall read_indexed(auto_result *result, unsigned int a2) {\n    if ( a2 < 4 )\n        sink ^= *(unsigned int *)((char *)result->u32s_4 + (int)(4 * a2));\n    return result;\n}\n<<<\n\n>>> read_inclusive\nauto_result *__fastcall read_inclusive(auto_result *result, unsigned int a2) {\n    if ( a2 <= 3 )\n        sink ^= *(unsigned int *)((char *)result->u32s_4 + (int)(4 * a2));\n    return result;\n}\n<<<\n\n>>> read_marks\nauto_result *__fastcall read_marks(auto_result *result) {\n    sink ^= result->u16_14;\n    sink ^= result->u16_16;\n    return result;\n}\n<<<\n"
+    },
+    {
+      "name": "read_inclusive",
+      "synth": {
+        "kind": "function",
+        "target": "read_inclusive",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "read_inclusive",
+        "read_indexed",
+        "read_marks"
+      ],
+      "golden_result": {
+        "success": true,
+        "error": "Success",
+        "error_message": "",
+        "fields_created": 4,
+        "vtable_slots": 0,
+        "propagated_to": [
+          "_main",
+          "_read_inclusive",
+          "_read_indexed",
+          "_read_marks",
+          "_read_reversed_bound"
+        ],
+        "failed_sites": [],
+        "z3": {
+          "status": "success",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": null,
+        "structure": {
+          "name": "auto_result",
+          "size": 24,
+          "alignment": 4,
+          "packing": null,
+          "source_func_name": "_read_inclusive",
+          "source_var": "result",
+          "field_count": 4,
+          "non_padding_field_count": 3,
+          "provenance": [],
+          "fields": [
+            {
+              "name": "__pad_0",
+              "offset": 0,
+              "size": 4,
+              "semantic": "padding",
+              "type": "char[4]",
+              "confidence": "medium",
+              "is_padding": true,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u32s_4",
+              "offset": 4,
+              "size": 16,
+              "semantic": "array",
+              "type": "unsigned __int32[4]",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": true,
+              "array_count": 4,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u16_14",
+              "offset": 20,
+              "size": 2,
+              "semantic": "uint",
+              "type": "unsigned __int16",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u16_16",
+              "offset": 22,
+              "size": 2,
+              "semantic": "uint",
+              "type": "unsigned __int16",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            }
+          ],
+          "vtable": null
+        }
+      },
+      "golden_pseudocode": ">>> read_inclusive\nauto_result *__fastcall read_inclusive(auto_result *result, unsigned int a2) {\n    if ( a2 <= 3 )\n        sink ^= *(unsigned int *)((char *)result->u32s_4 + (int)(4 * a2));\n    return result;\n}\n<<<\n\n>>> read_indexed\nauto_result *__fastcall read_indexed(auto_result *result, unsigned int a2) {\n    if ( a2 < 4 )\n        sink ^= *(unsigned int *)((char *)result->u32s_4 + (int)(4 * a2));\n    return result;\n}\n<<<\n\n>>> read_marks\nauto_result *__fastcall read_marks(auto_result *result) {\n    sink ^= result->u16_14;\n    sink ^= result->u16_16;\n    return result;\n}\n<<<\n"
+    },
+    {
+      "name": "read_reversed_bound",
+      "synth": {
+        "kind": "function",
+        "target": "read_reversed_bound",
+        "var_idx": 0
+      },
+      "dump_functions": [
+        "read_reversed_bound"
+      ],
+      "golden_result": {
+        "success": true,
+        "error": "Success",
+        "error_message": "",
+        "fields_created": 4,
+        "vtable_slots": 0,
+        "propagated_to": [
+          "_main",
+          "_read_inclusive",
+          "_read_indexed",
+          "_read_marks",
+          "_read_reversed_bound"
+        ],
+        "failed_sites": [],
+        "z3": {
+          "status": "success",
+          "used_z3": true,
+          "used_fallback": false
+        },
+        "resource_limit": null,
+        "structure": {
+          "name": "auto_result",
+          "size": 24,
+          "alignment": 4,
+          "packing": null,
+          "source_func_name": "_read_reversed_bound",
+          "source_var": "result",
+          "field_count": 4,
+          "non_padding_field_count": 3,
+          "provenance": [],
+          "fields": [
+            {
+              "name": "__pad_0",
+              "offset": 0,
+              "size": 4,
+              "semantic": "padding",
+              "type": "char[4]",
+              "confidence": "medium",
+              "is_padding": true,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u32s_4",
+              "offset": 4,
+              "size": 16,
+              "semantic": "array",
+              "type": "unsigned __int32[4]",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": true,
+              "array_count": 4,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u16_14",
+              "offset": 20,
+              "size": 2,
+              "semantic": "uint",
+              "type": "unsigned __int16",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            },
+            {
+              "name": "u16_16",
+              "offset": 22,
+              "size": 2,
+              "semantic": "uint",
+              "type": "unsigned __int16",
+              "confidence": "medium",
+              "is_padding": false,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
+            }
+          ],
+          "vtable": null
+        }
+      },
+      "golden_pseudocode": ">>> read_reversed_bound\nauto_result *__fastcall read_reversed_bound(auto_result *result, unsigned int a2) {\n    if ( a2 < 4 )\n        sink ^= *(unsigned int *)((char *)result->u32s_4 + (int)(4 * a2));\n    return result;\n}\n<<<\n"
     }
   ]
 }

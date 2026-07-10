@@ -4,9 +4,13 @@
 #include "config.hpp"
 #include "utils.hpp"
 #include <queue>
+#include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace structor {
+
+class StructurePersistence;
 
 /// Propagates synthesized types to related functions and variables
 class TypePropagator {
@@ -15,9 +19,11 @@ public:
 
     explicit TypePropagator(
         const SynthOptions& opts = Config::instance().options(),
-        CfuncCache* shared_cfunc_cache = nullptr)
+        CfuncCache* shared_cfunc_cache = nullptr,
+        StructurePersistence* persistence = nullptr)
         : options_(opts)
-        , shared_cfunc_cache_(shared_cfunc_cache) {}
+        , shared_cfunc_cache_(shared_cfunc_cache)
+        , persistence_(persistence) {}
 
     /// Propagate type to related functions
     [[nodiscard]] PropagationResult propagate(
@@ -35,7 +41,37 @@ public:
     /// Apply type to a variable
     [[nodiscard]] bool apply_type(cfunc_t* cfunc, int var_idx, const tinfo_t& type);
 
+    /// Apply the supplied type verbatim. This shares the same persistent and
+    /// in-memory rollback plus function-signature synchronization as
+    /// apply_type(), but does not convert a recovered aggregate view into a
+    /// pointer. It is used by the general type-fixing path.
+    [[nodiscard]] bool apply_exact_type(
+        cfunc_t* cfunc, int var_idx, const tinfo_t& type);
+
+    /// True only when the most recent apply operation could not restore its
+    /// saved lvar/prototype/auxiliary state. Callers owning a named-type
+    /// transaction must retain referenced types instead of deleting them.
+    [[nodiscard]] bool last_application_rollback_failed() const noexcept {
+        return last_application_rollback_failed_;
+    }
+
 private:
+    struct VisitKey {
+        ea_t func_ea = BADADDR;
+        lvar_locator_t locator;
+
+        [[nodiscard]] bool operator<(const VisitKey& other) const {
+            return func_ea < other.func_ea ||
+                (func_ea == other.func_ea && locator < other.locator);
+        }
+    };
+
+    [[nodiscard]] bool apply_type_impl(
+        cfunc_t* cfunc,
+        int var_idx,
+        const tinfo_t& type,
+        bool normalize_structure_view);
+
     struct PropagationWork {
         ea_t        func_ea;
         int         var_idx;
@@ -54,6 +90,7 @@ private:
     struct CallerArgInfo {
         ea_t caller_ea = BADADDR;
         int var_idx = -1;
+        ea_t global_ea = BADADDR;
         bool by_ref = false;
         sval_t member_offset = -1;
     };
@@ -72,12 +109,37 @@ private:
         int depth,
         PropagationResult& result);
 
+    void propagate_return_to_callers(
+        ea_t func_ea,
+        int return_var_idx,
+        const tinfo_t& type,
+        int depth,
+        PropagationResult& result);
+
+    void propagate_callee_args(
+        const qvector<CalleeArgInfo>& callees,
+        const tinfo_t& type,
+        int depth,
+        PropagationResult& result);
+
+    void propagate_global_forward(
+        cfunc_t* cfunc,
+        ea_t global_ea,
+        const tinfo_t& type,
+        int depth,
+        PropagationResult& result);
+
     void find_callees_with_arg(
         cfunc_t* cfunc,
         int var_idx,
         qvector<CalleeArgInfo>& callees);
 
-    void find_callers_with_param(
+    void find_callees_with_global(
+        cfunc_t* cfunc,
+        ea_t global_ea,
+        qvector<CalleeArgInfo>& callees);
+
+    [[nodiscard]] bool find_callers_with_param(
         ea_t func_ea,
         int param_idx,
         qvector<CallerArgInfo>& callers);
@@ -96,21 +158,35 @@ private:
         cfunc_t* cfunc,
         qvector<std::pair<int, sval_t>>& sources);
 
-    void find_callers_with_return(
+    [[nodiscard]] bool find_callers_with_return(
         ea_t func_ea,
         qvector<std::pair<ea_t, int>>& callers);
+
+    [[nodiscard]] bool has_material_return_consumer(ea_t func_ea);
+
+    [[nodiscard]] bool synchronize_function_signature(
+        cfunc_t* cfunc,
+        int var_idx,
+        const tinfo_t& lvar_type);
 
     [[nodiscard]] bool is_parameter(cfunc_t* cfunc, int var_idx);
     [[nodiscard]] int get_param_index(cfunc_t* cfunc, int var_idx);
     [[nodiscard]] cfuncptr_t get_cfunc(ea_t func_ea);
+    [[nodiscard]] std::optional<int> resolve_after_application(
+        ea_t func_ea,
+        const lvar_locator_t& locator);
 
-    const SynthOptions& options_;
-    std::unordered_set<std::uint64_t> visited_;
+    SynthOptions options_;
+    std::set<VisitKey> visited_;
+    std::unordered_set<ea_t> visited_globals_;
     CfuncCache* shared_cfunc_cache_ = nullptr;
+    StructurePersistence* persistence_ = nullptr;
+    bool last_application_rollback_failed_ = false;
     CfuncCache local_cfunc_cache_;
 
-    std::uint64_t make_visit_key(ea_t func_ea, int var_idx) {
-        return (static_cast<std::uint64_t>(func_ea) << 16) | static_cast<std::uint64_t>(var_idx & 0xFFFF);
+    [[nodiscard]] static VisitKey make_visit_key(
+        ea_t func_ea, const lvar_locator_t& locator) {
+        return VisitKey{func_ea, locator};
     }
 };
 

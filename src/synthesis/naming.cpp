@@ -10,7 +10,9 @@
 #include <structor/utils.hpp>
 
 #include <array>
+#include <cerrno>
 #include <cctype>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -118,7 +120,7 @@ bool has_offset_suffix(const qstring& name, const char* prefix) noexcept {
     return is_hex_suffix(suffix);
 }
 
-bool is_generated_overlay_name(const qstring& name) noexcept {
+bool is_generated_overlay_name(const qstring& name) {
     constexpr std::array<const char*, 6> kOverlaySuffixes = {
         "_lo", "_hi", "_u8", "_u16", "_u32", "_u64"
     };
@@ -189,7 +191,7 @@ int name_confidence_priority(NameConfidence confidence) noexcept {
     return 0;
 }
 
-bool is_generated_name(const qstring& name, const NameMetadata* metadata) noexcept {
+bool is_generated_name(const qstring& name, const NameMetadata* metadata) {
     if (metadata && metadata->is_generated()) {
         return true;
     }
@@ -238,7 +240,7 @@ bool is_generated_name(const qstring& name, const NameMetadata* metadata) noexce
            looks_like_hex_auto_name(name);
 }
 
-bool is_semantic_name(const qstring& name, const NameMetadata* metadata) noexcept {
+bool is_semantic_name(const qstring& name, const NameMetadata* metadata) {
     if (name.empty()) {
         return false;
     }
@@ -290,7 +292,7 @@ qstring sanitize_identifier(const qstring& raw, const char* fallback) {
     return cleaned;
 }
 
-bool is_placeholder_identifier(const qstring& name) noexcept {
+bool is_placeholder_identifier(const qstring& name) {
     if (name.empty()) {
         return true;
     }
@@ -367,7 +369,9 @@ qstring make_offset_suffix(sval_t offset) {
     qstring suffix;
     const int64_t signed_offset = static_cast<int64_t>(offset);
     if (signed_offset < 0) {
-        suffix.sprnt("neg_%llx", static_cast<unsigned long long>(-signed_offset));
+        const auto magnitude = std::uint64_t{0} -
+            static_cast<std::uint64_t>(signed_offset);
+        suffix.sprnt("neg_%llx", static_cast<unsigned long long>(magnitude));
     } else {
         suffix.sprnt("%llx", static_cast<unsigned long long>(signed_offset));
     }
@@ -416,6 +420,20 @@ qstring make_auto_root_type_name(ea_t func_ea, const qstring& source_var, int in
 qstring make_substruct_field_name(sval_t offset) {
     qstring name;
     name.sprnt("part_%s", make_offset_suffix(offset).c_str());
+    return name;
+}
+
+qstring make_substruct_type_name(const qstring& parent_name,
+                                 const qstring& field_name,
+                                 sval_t offset) {
+    const qstring parent = parent_name.empty()
+        ? qstring("auto")
+        : sanitize_identifier(parent_name, "object");
+    const qstring field = sanitize_identifier(
+        field_name.empty() ? make_substruct_field_name(offset) : field_name,
+        "part");
+    qstring name;
+    name.sprnt("%s_%s", parent.c_str(), field.c_str());
     return name;
 }
 
@@ -536,14 +554,31 @@ std::optional<sval_t> extract_shifted_view_delta(const qstring& type_name) {
             if (!is_hex_suffix(suffix)) {
                 continue;
             }
-            return -static_cast<sval_t>(strtoull(suffix, nullptr, 16));
+            errno = 0;
+            const unsigned long long parsed = strtoull(suffix, nullptr, 16);
+            const auto magnitude = static_cast<std::uint64_t>(parsed);
+            const auto negative_limit =
+                static_cast<std::uint64_t>(std::numeric_limits<sval_t>::max()) + 1;
+            if (errno == ERANGE || magnitude > negative_limit) {
+                continue;
+            }
+            if (magnitude == negative_limit) {
+                return std::numeric_limits<sval_t>::min();
+            }
+            return static_cast<sval_t>(-static_cast<sval_t>(magnitude));
         }
 
         if (!is_hex_suffix(suffix)) {
             continue;
         }
 
-        return static_cast<sval_t>(strtoull(suffix, nullptr, 16));
+        errno = 0;
+        const unsigned long long parsed = strtoull(suffix, nullptr, 16);
+        if (errno == ERANGE || parsed > static_cast<unsigned long long>(
+                std::numeric_limits<sval_t>::max())) {
+            continue;
+        }
+        return static_cast<sval_t>(parsed);
     }
 
     return std::nullopt;
@@ -1107,8 +1142,10 @@ qstring generate_field_name(sval_t offset, SemanticType semantic, std::uint32_t 
 
     const int64_t signed_offset = static_cast<int64_t>(offset);
     if (signed_offset < 0) {
+        const auto magnitude = std::uint64_t{0} -
+            static_cast<std::uint64_t>(signed_offset);
         name.sprnt("%s_neg_%llX", prefix,
-                   static_cast<unsigned long long>(-signed_offset));
+                   static_cast<unsigned long long>(magnitude));
     } else {
         name.sprnt("%s_%llX", prefix,
                    static_cast<unsigned long long>(signed_offset));

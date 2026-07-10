@@ -1,6 +1,7 @@
 #include <structor/global_object_analyzer.hpp>
 
 #include <structor/access_collector.hpp>
+#include <structor/global_rewrite_index.hpp>
 #include <structor/utils.hpp>
 
 #include <algorithm>
@@ -9,6 +10,14 @@
 namespace structor {
 
 namespace {
+
+[[nodiscard]] bool global_rewrite_thread_is_valid() noexcept {
+#ifndef STRUCTOR_TESTING
+    return is_main_thread();
+#else
+    return true;
+#endif
+}
 
 struct RegisteredGlobalRewrite {
     ea_t root_ea = BADADDR;
@@ -28,14 +37,21 @@ public:
     }
 
     void clear() {
-        entries_.clear();
-        root_index_.clear();
-        alias_index_.clear();
+        const auto key = current_database_key();
+        if (key.has_value()) {
+            databases_.erase(*key);
+        }
     }
 
     void register_entry(const GlobalObjectAnalysis& analysis,
                         const SynthStruct& synth_struct,
                         const tinfo_t& struct_type) {
+        const auto key = current_database_key();
+        if (!key.has_value()) {
+            return;
+        }
+        RegistryState& state = databases_[*key];
+
         RegisteredGlobalRewrite entry;
         entry.root_ea = analysis.root_ea;
         entry.root_head_ea = analysis.root_head_ea;
@@ -45,34 +61,87 @@ public:
         entry.ptr_type.create_ptr(struct_type);
         entry.pointer_alias_globals = analysis.pointer_alias_globals;
 
-        const std::size_t index = entries_.size();
-        entries_.push_back(std::move(entry));
-        root_index_[analysis.root_ea] = index;
-        if (analysis.root_head_ea != BADADDR) {
-            root_index_[analysis.root_head_ea] = index;
-        }
-
+        qvector<detail::GlobalRewriteIndex::address_type> zero_delta_aliases;
+        zero_delta_aliases.reserve(analysis.pointer_alias_globals.size());
         for (const auto& [alias_ea, delta] : analysis.pointer_alias_globals) {
             if (delta == 0) {
-                alias_index_[alias_ea] = index;
+                zero_delta_aliases.push_back(alias_ea);
             }
+        }
+        std::sort(zero_delta_aliases.begin(), zero_delta_aliases.end());
+
+        const std::optional<detail::GlobalRewriteIndex::address_type> root_head =
+            analysis.root_head_ea == BADADDR
+                ? std::nullopt
+                : std::optional<detail::GlobalRewriteIndex::address_type>(analysis.root_head_ea);
+        const std::span<const detail::GlobalRewriteIndex::address_type> aliases =
+            zero_delta_aliases.empty()
+                ? std::span<const detail::GlobalRewriteIndex::address_type>()
+                : std::span<const detail::GlobalRewriteIndex::address_type>(
+                      zero_delta_aliases.begin(), zero_delta_aliases.size());
+        const auto update = state.index.upsert(
+            analysis.root_ea,
+            root_head,
+            aliases);
+
+        if (update.replaced) {
+            state.entries[update.index] = std::move(entry);
+        } else {
+            state.entries.push_back(std::move(entry));
         }
     }
 
     [[nodiscard]] const RegisteredGlobalRewrite* find_root(ea_t ea) const {
-        auto it = root_index_.find(ea);
-        return it == root_index_.end() ? nullptr : &entries_[it->second];
+        const RegistryState* state = current_state();
+        if (state == nullptr) {
+            return nullptr;
+        }
+        const auto index = state->index.find_root(ea);
+        return !index || *index >= state->entries.size()
+            ? nullptr
+            : &state->entries[*index];
     }
 
     [[nodiscard]] const RegisteredGlobalRewrite* find_pointer_alias(ea_t ea) const {
-        auto it = alias_index_.find(ea);
-        return it == alias_index_.end() ? nullptr : &entries_[it->second];
+        const RegistryState* state = current_state();
+        if (state == nullptr) {
+            return nullptr;
+        }
+        const auto index = state->index.find_alias(ea);
+        return !index || *index >= state->entries.size()
+            ? nullptr
+            : &state->entries[*index];
     }
 
 private:
-    qvector<RegisteredGlobalRewrite> entries_;
-    std::unordered_map<ea_t, std::size_t> root_index_;
-    std::unordered_map<ea_t, std::size_t> alias_index_;
+    struct RegistryState {
+        qvector<RegisteredGlobalRewrite> entries;
+        detail::GlobalRewriteIndex index;
+    };
+
+    [[nodiscard]] static std::optional<ssize_t> current_database_key() noexcept {
+#ifndef STRUCTOR_TESTING
+        try {
+            const ssize_t key = get_dbctx_id();
+            return key < 0 ? std::nullopt : std::optional<ssize_t>{key};
+        } catch (...) {
+            return std::nullopt;
+        }
+#else
+        return ssize_t{0};
+#endif
+    }
+
+    [[nodiscard]] const RegistryState* current_state() const noexcept {
+        const auto key = current_database_key();
+        if (!key.has_value()) {
+            return nullptr;
+        }
+        const auto found = databases_.find(*key);
+        return found == databases_.end() ? nullptr : &found->second;
+    }
+
+    std::unordered_map<ssize_t, RegistryState> databases_;
 };
 
 enum class AliasOrigin : std::uint8_t {
@@ -133,7 +202,13 @@ struct VarKeyHash {
     return get_ptr_size();
 }
 
-[[nodiscard]] static sval_t scale_constant(const cexpr_t* pointer_expr, sval_t value) {
+[[nodiscard]] static std::optional<sval_t> scale_constant(
+    const cexpr_t* pointer_expr,
+    std::uint64_t raw_value) {
+    const auto value = checked_sval_from_u64(raw_value);
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
     if (!pointer_expr || !pointer_expr->type.is_ptr()) {
         return value;
     }
@@ -147,8 +222,34 @@ struct VarKeyHash {
     if (elem_size == BADSIZE || elem_size == 0) {
         return value;
     }
+    if (elem_size > static_cast<size_t>(
+            std::numeric_limits<sval_t>::max())) {
+        return std::nullopt;
+    }
+    return checked_sval_mul(*value, static_cast<sval_t>(elem_size));
+}
 
-    return value * static_cast<sval_t>(elem_size);
+[[nodiscard]] static std::optional<sval_t> checked_ea_delta(
+    ea_t value,
+    ea_t base) noexcept {
+    using U = std::make_unsigned_t<sval_t>;
+    constexpr U kPositiveLimit =
+        static_cast<U>(std::numeric_limits<sval_t>::max());
+    constexpr U kNegativeLimit = kPositiveLimit + U{1};
+    if (value >= base) {
+        const auto magnitude = static_cast<U>(value - base);
+        return magnitude <= kPositiveLimit
+            ? std::optional<sval_t>{static_cast<sval_t>(magnitude)}
+            : std::nullopt;
+    }
+    const auto magnitude = static_cast<U>(base - value);
+    if (magnitude > kNegativeLimit) {
+        return std::nullopt;
+    }
+    if (magnitude == kNegativeLimit) {
+        return std::numeric_limits<sval_t>::min();
+    }
+    return -static_cast<sval_t>(magnitude);
 }
 
 [[nodiscard]] static ea_t direct_callee_ea(const cexpr_t* call_expr) {
@@ -270,12 +371,16 @@ private:
 
             case cot_obj:
                 if (expr->obj_ea == root_ea_ || expr->obj_ea == root_head_ea_) {
-                    result.delta = static_cast<sval_t>(expr->obj_ea - root_ea_);
+                    const auto delta = checked_ea_delta(expr->obj_ea, root_ea_);
+                    if (!delta.has_value()) return result;
+                    result.delta = *delta;
                     result.origin = AliasOrigin::RootObject;
                     return result;
                 }
                 if (expr->obj_ea != BADADDR && get_item_head(expr->obj_ea) == root_head_ea_) {
-                    result.delta = static_cast<sval_t>(expr->obj_ea - root_ea_);
+                    const auto delta = checked_ea_delta(expr->obj_ea, root_ea_);
+                    if (!delta.has_value()) return result;
+                    result.delta = *delta;
                     result.origin = AliasOrigin::RootObject;
                     return result;
                 }
@@ -294,14 +399,24 @@ private:
                 const AliasInfo left = extract_alias(expr->x);
                 if (left.valid() && expr->y && expr->y->op == cot_num) {
                     result = left;
-                    result.delta += scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
+                    const auto scaled = scale_constant(expr->x, expr->y->numval());
+                    const auto combined = scaled.has_value()
+                        ? checked_sval_add(result.delta, *scaled)
+                        : std::nullopt;
+                    if (!combined.has_value()) return AliasInfo{};
+                    result.delta = *combined;
                     return result;
                 }
 
                 const AliasInfo right = extract_alias(expr->y);
                 if (right.valid() && expr->x && expr->x->op == cot_num) {
                     result = right;
-                    result.delta += scale_constant(expr->y, static_cast<sval_t>(expr->x->numval()));
+                    const auto scaled = scale_constant(expr->y, expr->x->numval());
+                    const auto combined = scaled.has_value()
+                        ? checked_sval_add(result.delta, *scaled)
+                        : std::nullopt;
+                    if (!combined.has_value()) return AliasInfo{};
+                    result.delta = *combined;
                     return result;
                 }
 
@@ -315,7 +430,12 @@ private:
                 }
 
                 result = left;
-                result.delta -= scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
+                const auto scaled = scale_constant(expr->x, expr->y->numval());
+                const auto combined = scaled.has_value()
+                    ? checked_sval_sub(result.delta, *scaled)
+                    : std::nullopt;
+                if (!combined.has_value()) return AliasInfo{};
+                result.delta = *combined;
                 return result;
             }
 
@@ -512,7 +632,13 @@ private:
             return;
         }
 
-        add_direct_access(expr, alias.delta + expr->m);
+        const auto member = checked_sval_from_u64(expr->m);
+        const auto offset = member.has_value()
+            ? checked_sval_add(alias.delta, *member)
+            : std::nullopt;
+        if (offset.has_value()) {
+            add_direct_access(expr, *offset);
+        }
     }
 
     void process_index_access(cexpr_t* expr) {
@@ -525,9 +651,13 @@ private:
             return;
         }
 
-        sval_t offset = alias.delta;
-        const sval_t scaled = scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
-        add_direct_access(expr, offset + scaled);
+        const auto scaled = scale_constant(expr->x, expr->y->numval());
+        const auto offset = scaled.has_value()
+            ? checked_sval_add(alias.delta, *scaled)
+            : std::nullopt;
+        if (offset.has_value()) {
+            add_direct_access(expr, *offset);
+        }
     }
 
     cfunc_t* cfunc_;
@@ -546,9 +676,8 @@ public:
         std::optional<sval_t> return_delta;
     };
 
-    RootVarUsageScanner(cfunc_t* cfunc, int target_var_idx)
+    explicit RootVarUsageScanner(int target_var_idx)
         : ctree_visitor_t(CV_FAST)
-        , cfunc_(cfunc)
         , target_var_idx_(target_var_idx) {}
 
     int idaapi visit_expr(cexpr_t* expr) override {
@@ -639,12 +768,18 @@ private:
             case cot_add: {
                 auto left = resolve_delta(expr->x);
                 if (left.has_value() && expr->y && expr->y->op == cot_num) {
-                    return *left + scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
+                    const auto scaled = scale_constant(expr->x, expr->y->numval());
+                    return scaled.has_value()
+                        ? checked_sval_add(*left, *scaled)
+                        : std::nullopt;
                 }
 
                 auto right = resolve_delta(expr->y);
                 if (right.has_value() && expr->x && expr->x->op == cot_num) {
-                    return *right + scale_constant(expr->y, static_cast<sval_t>(expr->x->numval()));
+                    const auto scaled = scale_constant(expr->y, expr->x->numval());
+                    return scaled.has_value()
+                        ? checked_sval_add(*right, *scaled)
+                        : std::nullopt;
                 }
 
                 return std::nullopt;
@@ -656,7 +791,10 @@ private:
                     return std::nullopt;
                 }
 
-                return *left - scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
+                const auto scaled = scale_constant(expr->x, expr->y->numval());
+                return scaled.has_value()
+                    ? checked_sval_sub(*left, *scaled)
+                    : std::nullopt;
             }
 
             case cot_memptr:
@@ -665,7 +803,10 @@ private:
                 if (!base.has_value()) {
                     return std::nullopt;
                 }
-                return *base + expr->m;
+                const auto member = checked_sval_from_u64(expr->m);
+                return member.has_value()
+                    ? checked_sval_add(*base, *member)
+                    : std::nullopt;
             }
 
             default:
@@ -673,7 +814,6 @@ private:
         }
     }
 
-    cfunc_t* cfunc_;
     int target_var_idx_;
     std::unordered_map<int, sval_t> local_aliases_;
     Result result_;
@@ -786,40 +926,12 @@ private:
         }
 
         for (auto& existing : merged_accesses_) {
-            if (existing.offset != access.offset || existing.size != access.size) {
+            if (existing.offset != access.offset || existing.size != access.size ||
+                !field_access_evidence_compatible(existing, access)) {
                 continue;
             }
 
-            if (existing.access_type == AccessType::Read && access.access_type == AccessType::Write) {
-                existing.access_type = AccessType::ReadWrite;
-            } else if (existing.access_type == AccessType::Write && access.access_type == AccessType::Read) {
-                existing.access_type = AccessType::ReadWrite;
-            }
-
-            if (semantic_priority(access.semantic_type) > semantic_priority(existing.semantic_type)) {
-                existing.semantic_type = access.semantic_type;
-            }
-
-            if (!access.inferred_type.empty()) {
-                existing.inferred_type = resolve_type_conflict(existing.inferred_type, access.inferred_type);
-            }
-
-            if (access.is_vtable_access) {
-                existing.is_vtable_access = true;
-                existing.vtable_slot = access.vtable_slot;
-            }
-
-            for (auto value : access.observed_constants) {
-                existing.add_observed_constant(value);
-            }
-
-            existing.is_call_argument = existing.is_call_argument || access.is_call_argument;
-
-            if (!access.bitfields.empty()) {
-                for (const auto& bf : access.bitfields) {
-                    existing.add_bitfield(bf);
-                }
-            }
+            merge_field_access_evidence(existing, access);
 
             return false;
         }
@@ -896,26 +1008,27 @@ private:
             return false;
         }
 
-        RootVarUsageScanner scanner(cfunc, var_idx);
+        RootVarUsageScanner scanner(var_idx);
         scanner.apply_to(&cfunc->body, nullptr);
 
         bool progress = false;
         for (const auto& [alias_ea, delta] : scanner.result().pointer_alias_globals) {
-            const sval_t total_delta = actual_delta + delta;
-            if (total_delta < 0) {
+            const auto total_delta = checked_sval_add(actual_delta, delta);
+            if (!total_delta.has_value() || *total_delta < 0) {
                 continue;
             }
 
-            auto [it, inserted] = pointer_alias_globals_.emplace(alias_ea, total_delta);
+            auto [it, inserted] = pointer_alias_globals_.emplace(alias_ea, *total_delta);
             if (inserted) {
                 progress = true;
             }
         }
 
         if (scanner.result().return_delta.has_value()) {
-            const sval_t total_delta = actual_delta + *scanner.result().return_delta;
-            if (total_delta >= 0) {
-                auto [it, inserted] = source_returners_.emplace(func_ea, total_delta);
+            const auto total_delta = checked_sval_add(
+                actual_delta, *scanner.result().return_delta);
+            if (total_delta.has_value() && *total_delta >= 0) {
+                auto [it, inserted] = source_returners_.emplace(func_ea, *total_delta);
                 if (inserted) {
                     progress = true;
                 }
@@ -943,7 +1056,10 @@ private:
 
         bool progress = false;
         for (const auto& [seed_func_ea, delta] : unified.function_deltas) {
-            progress |= merge_function_delta(seed_func_ea, seed_delta + delta);
+            const auto total = checked_sval_add(seed_delta, delta);
+            if (total.has_value()) {
+                progress |= merge_function_delta(seed_func_ea, *total);
+            }
         }
 
         for (const auto& fn_pattern : unified.per_function_patterns) {
@@ -956,16 +1072,23 @@ private:
 
         for (const auto& access : unified.all_accesses) {
             FieldAccess normalized = access;
-            normalized.offset += seed_delta;
-            progress |= merge_access(std::move(normalized));
+            const auto offset = checked_sval_add(normalized.offset, seed_delta);
+            if (offset.has_value()) {
+                normalized.offset = *offset;
+                progress |= merge_access(std::move(normalized));
+            }
         }
 
         for (const auto& fv : analyzer.equivalence_class().variables) {
-            const sval_t actual_delta = seed_delta + fv.base_delta;
-            if (actual_delta == 0) {
+            const auto actual_delta = checked_sval_add(
+                seed_delta, fv.base_delta);
+            if (!actual_delta.has_value()) {
+                continue;
+            }
+            if (*actual_delta == 0) {
                 progress |= add_zero_delta_variable(fv);
             }
-            progress |= scan_var_usage(fv.func_ea, fv.var_idx, actual_delta);
+            progress |= scan_var_usage(fv.func_ea, fv.var_idx, *actual_delta);
         }
 
         return progress;
@@ -1021,29 +1144,36 @@ private:
 
     [[nodiscard]] UnifiedAccessPattern build_pattern() {
         UnifiedAccessPattern pattern;
+        qvector<FieldAccess> bounded_accesses;
+        bounded_accesses.reserve(merged_accesses_.size());
+        for (auto& access : merged_accesses_) {
+            if (checked_interval_end(access.offset, access.size).has_value()) {
+                bounded_accesses.push_back(std::move(access));
+            }
+        }
+        merged_accesses_ = std::move(bounded_accesses);
         if (merged_accesses_.empty()) {
             return pattern;
         }
 
-        std::sort(merged_accesses_.begin(), merged_accesses_.end(), [](const FieldAccess& a, const FieldAccess& b) {
-            if (a.offset != b.offset) {
-                return a.offset < b.offset;
-            }
-            if (a.size != b.size) {
-                return a.size < b.size;
-            }
-            return a.source_func_ea < b.source_func_ea;
-        });
+        std::sort(merged_accesses_.begin(), merged_accesses_.end(),
+                  canonical_field_access_less);
 
         pattern.all_accesses = merged_accesses_;
         pattern.global_min_offset = merged_accesses_.front().offset;
-        pattern.global_max_offset = merged_accesses_.front().offset + merged_accesses_.front().size;
+        pattern.global_max_offset = *checked_interval_end(
+            merged_accesses_.front().offset,
+            merged_accesses_.front().size);
 
         std::unordered_map<ea_t, std::size_t> per_func_indices;
         for (const auto& access : merged_accesses_) {
             pattern.global_min_offset = std::min(pattern.global_min_offset, access.offset);
-            pattern.global_max_offset = std::max(pattern.global_max_offset,
-                access.offset + static_cast<sval_t>(access.size));
+            const auto access_end = checked_interval_end(
+                access.offset, access.size);
+            if (access_end.has_value()) {
+                pattern.global_max_offset = std::max(
+                    pattern.global_max_offset, *access_end);
+            }
 
             if (access.is_vtable_access) {
                 pattern.has_vtable = true;
@@ -1216,10 +1346,15 @@ private:
         switch (expr->op) {
             case cot_obj: {
                 if (const auto* entry = GlobalRewriteRegistry::instance().find_root(expr->obj_ea)) {
+                    const auto delta = checked_ea_delta(
+                        expr->obj_ea, entry->root_ea);
+                    if (!delta.has_value()) {
+                        return result;
+                    }
                     result.entry = entry;
                     result.through_pointer = false;
                     result.obj_ea = entry->root_ea;
-                    result.offset = static_cast<sval_t>(expr->obj_ea - entry->root_ea);
+                    result.offset = *delta;
                     return result;
                 }
                 if (const auto* entry = GlobalRewriteRegistry::instance().find_pointer_alias(expr->obj_ea)) {
@@ -1238,13 +1373,23 @@ private:
             case cot_add: {
                 ResolvedGlobalExpr left = resolve_expr(expr->x);
                 if (left.valid() && expr->y && expr->y->op == cot_num) {
-                    left.offset += scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
+                    const auto scaled = scale_constant(expr->x, expr->y->numval());
+                    const auto offset = scaled.has_value()
+                        ? checked_sval_add(left.offset, *scaled)
+                        : std::nullopt;
+                    if (!offset.has_value()) return result;
+                    left.offset = *offset;
                     return left;
                 }
 
                 ResolvedGlobalExpr right = resolve_expr(expr->y);
                 if (right.valid() && expr->x && expr->x->op == cot_num) {
-                    right.offset += scale_constant(expr->y, static_cast<sval_t>(expr->x->numval()));
+                    const auto scaled = scale_constant(expr->y, expr->x->numval());
+                    const auto offset = scaled.has_value()
+                        ? checked_sval_add(right.offset, *scaled)
+                        : std::nullopt;
+                    if (!offset.has_value()) return result;
+                    right.offset = *offset;
                     return right;
                 }
 
@@ -1254,7 +1399,12 @@ private:
             case cot_sub: {
                 ResolvedGlobalExpr left = resolve_expr(expr->x);
                 if (left.valid() && expr->y && expr->y->op == cot_num) {
-                    left.offset -= scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
+                    const auto scaled = scale_constant(expr->x, expr->y->numval());
+                    const auto offset = scaled.has_value()
+                        ? checked_sval_sub(left.offset, *scaled)
+                        : std::nullopt;
+                    if (!offset.has_value()) return result;
+                    left.offset = *offset;
                     return left;
                 }
                 return result;
@@ -1265,7 +1415,12 @@ private:
                 if (!base.valid() || !expr->y || expr->y->op != cot_num) {
                     return result;
                 }
-                base.offset += scale_constant(expr->x, static_cast<sval_t>(expr->y->numval()));
+                const auto scaled = scale_constant(expr->x, expr->y->numval());
+                const auto offset = scaled.has_value()
+                    ? checked_sval_add(base.offset, *scaled)
+                    : std::nullopt;
+                if (!offset.has_value()) return result;
+                base.offset = *offset;
                 return base;
             }
 
@@ -1318,8 +1473,8 @@ private:
 
         if (Config::instance().options().debug_mode) {
             qstring before = utils::expr_to_string(expr, cfunc_);
-            msg("Structor: rewriting global deref in %a: %s -> %s%s at offset 0x%llX\n",
-                cfunc_->entry_ea,
+            msg("Structor: rewriting global deref in 0x%llX: %s -> %s%s at offset 0x%llX\n",
+                static_cast<unsigned long long>(cfunc_->entry_ea),
                 before.c_str(),
                 resolved.entry->root_name.c_str(),
                 resolved.through_pointer ? "->" : ".",
@@ -1366,14 +1521,15 @@ void register_global_rewrite_info(
     const SynthStruct& synth_struct,
     const tinfo_t& struct_type)
 {
-    if (analysis.root_ea == BADADDR || synth_struct.fields.empty() || struct_type.empty()) {
+    if (!global_rewrite_thread_is_valid() ||
+        analysis.root_ea == BADADDR || synth_struct.fields.empty() || struct_type.empty()) {
         return;
     }
     GlobalRewriteRegistry::instance().register_entry(analysis, synth_struct, struct_type);
 }
 
 bool rewrite_registered_global_uses(cfunc_t* cfunc) {
-    if (!cfunc) {
+    if (!global_rewrite_thread_is_valid() || !cfunc) {
         return false;
     }
 
@@ -1386,6 +1542,9 @@ bool rewrite_registered_global_uses(cfunc_t* cfunc) {
 }
 
 void clear_registered_global_rewrite_info() {
+    if (!global_rewrite_thread_is_valid()) {
+        return;
+    }
     GlobalRewriteRegistry::instance().clear();
 }
 

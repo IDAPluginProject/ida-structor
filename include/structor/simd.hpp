@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <vector>
 #include <utility>
+#include <limits>
+#include <stdexcept>
 
 #if defined(_MSC_VER)
     #include <intrin.h>
@@ -853,10 +855,30 @@ inline void batch_coverage_check(
     const int64_t* STRUCTOR_RESTRICT cand_offsets,
     const uint32_t* STRUCTOR_RESTRICT cand_sizes,
     size_t num_candidates,
-    std::vector<std::vector<uint32_t>>& coverage_out) noexcept
+    std::vector<std::vector<uint32_t>>& coverage_out)
 {
+    if ((num_accesses != 0 &&
+         (access_offsets == nullptr || access_sizes == nullptr)) ||
+        (num_candidates != 0 &&
+         (cand_offsets == nullptr || cand_sizes == nullptr))) {
+        throw std::invalid_argument("null interval array");
+    }
+    if (num_candidates > std::numeric_limits<uint32_t>::max()) {
+        throw std::length_error("candidate index exceeds uint32_t");
+    }
     coverage_out.clear();
     coverage_out.resize(num_accesses);
+
+    std::vector<int64_t> candidate_ends(num_candidates);
+    std::vector<uint8_t> candidate_valid(num_candidates, 0);
+    for (size_t ci = 0; ci < num_candidates; ++ci) {
+        if (cand_offsets[ci] <= std::numeric_limits<int64_t>::max() -
+                static_cast<int64_t>(cand_sizes[ci])) {
+            candidate_ends[ci] = cand_offsets[ci] +
+                static_cast<int64_t>(cand_sizes[ci]);
+            candidate_valid[ci] = cand_sizes[ci] != 0;
+        }
+    }
     
     // Prefetch candidate data
     prefetch_range(cand_offsets, num_candidates * sizeof(int64_t));
@@ -864,6 +886,13 @@ inline void batch_coverage_check(
     
     for (size_t ai = 0; ai < num_accesses; ++ai) {
         int64_t a_start = access_offsets[ai];
+        if (access_sizes[ai] == 0) {
+            continue;
+        }
+        if (a_start > std::numeric_limits<int64_t>::max() -
+                static_cast<int64_t>(access_sizes[ai])) {
+            continue;
+        }
         int64_t a_end = a_start + static_cast<int64_t>(access_sizes[ai]);
         
         // Prefetch next access
@@ -888,9 +917,7 @@ inline void batch_coverage_check(
                 int64x2_t v_c_start = vld1q_s64(cand_offsets + ci);
                 
                 // Load and extend candidate sizes to 64-bit
-                uint32_t sizes_arr[2] = {cand_sizes[ci], cand_sizes[ci + 1]};
-                int64x2_t v_c_size = vmovl_s32(vld1_s32(reinterpret_cast<const int32_t*>(sizes_arr)));
-                int64x2_t v_c_end = vaddq_s64(v_c_start, v_c_size);
+                int64x2_t v_c_end = vld1q_s64(candidate_ends.data() + ci);
                 
                 // Check: c_start <= a_start AND c_end >= a_end
                 uint64x2_t le_start = vcleq_s64(v_c_start, v_a_start);
@@ -901,8 +928,12 @@ inline void batch_coverage_check(
                 uint64_t mask0 = vgetq_lane_u64(covers, 0);
                 uint64_t mask1 = vgetq_lane_u64(covers, 1);
                 
-                if (mask0) covering.push_back(static_cast<uint32_t>(ci));
-                if (mask1) covering.push_back(static_cast<uint32_t>(ci + 1));
+                if (mask0 && candidate_valid[ci]) {
+                    covering.push_back(static_cast<uint32_t>(ci));
+                }
+                if (mask1 && candidate_valid[ci + 1]) {
+                    covering.push_back(static_cast<uint32_t>(ci + 1));
+                }
             }
         }
 #elif defined(STRUCTOR_SIMD_AVX2)
@@ -915,14 +946,11 @@ inline void batch_coverage_check(
                 __m256i v_c_start = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i*>(cand_offsets + ci));
                 
-                // Load sizes and extend to 64-bit
-                __m128i v_sizes_32 = _mm_loadu_si128(
-                    reinterpret_cast<const __m128i*>(cand_sizes + ci));
-                __m256i v_c_size = _mm256_cvtepu32_epi64(v_sizes_32);
-                __m256i v_c_end = _mm256_add_epi64(v_c_start, v_c_size);
+                __m256i v_c_end = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(candidate_ends.data() + ci));
                 
                 // Check conditions (using signed comparison for offsets)
-                __m256i le_start = _mm256_cmpgt_epi64(v_a_start, v_c_start);  // NOT(c_start > a_start)
+                __m256i le_start = _mm256_cmpgt_epi64(v_c_start, v_a_start);
                 le_start = _mm256_xor_si256(le_start, _mm256_set1_epi64x(-1)); // invert
                 
                 __m256i ge_end = _mm256_cmpgt_epi64(v_c_end, v_a_end);
@@ -933,10 +961,10 @@ inline void batch_coverage_check(
                 
                 // Extract results using movemask-like operation
                 int mask = _mm256_movemask_pd(_mm256_castsi256_pd(covers));
-                if (mask & 1) covering.push_back(static_cast<uint32_t>(ci));
-                if (mask & 2) covering.push_back(static_cast<uint32_t>(ci + 1));
-                if (mask & 4) covering.push_back(static_cast<uint32_t>(ci + 2));
-                if (mask & 8) covering.push_back(static_cast<uint32_t>(ci + 3));
+                if ((mask & 1) && candidate_valid[ci]) covering.push_back(static_cast<uint32_t>(ci));
+                if ((mask & 2) && candidate_valid[ci + 1]) covering.push_back(static_cast<uint32_t>(ci + 1));
+                if ((mask & 4) && candidate_valid[ci + 2]) covering.push_back(static_cast<uint32_t>(ci + 2));
+                if ((mask & 8) && candidate_valid[ci + 3]) covering.push_back(static_cast<uint32_t>(ci + 3));
             }
         }
 #elif defined(STRUCTOR_SIMD_SSE2)
@@ -952,13 +980,13 @@ inline void batch_coverage_check(
                 // Manual 64-bit comparison for SSE2
                 int64_t c0_start = cand_offsets[ci];
                 int64_t c1_start = cand_offsets[ci + 1];
-                int64_t c0_end = c0_start + cand_sizes[ci];
-                int64_t c1_end = c1_start + cand_sizes[ci + 1];
+                int64_t c0_end = candidate_ends[ci];
+                int64_t c1_end = candidate_ends[ci + 1];
                 
-                if (c0_start <= a_start && c0_end >= a_end) {
+                if (candidate_valid[ci] && c0_start <= a_start && c0_end >= a_end) {
                     covering.push_back(static_cast<uint32_t>(ci));
                 }
-                if (c1_start <= a_start && c1_end >= a_end) {
+                if (candidate_valid[ci + 1] && c1_start <= a_start && c1_end >= a_end) {
                     covering.push_back(static_cast<uint32_t>(ci + 1));
                 }
             }
@@ -968,9 +996,9 @@ inline void batch_coverage_check(
         // Scalar tail
         for (; ci < num_candidates; ++ci) {
             int64_t c_start = cand_offsets[ci];
-            int64_t c_end = c_start + static_cast<int64_t>(cand_sizes[ci]);
+            int64_t c_end = candidate_ends[ci];
             
-            if (c_start <= a_start && c_end >= a_end) {
+            if (candidate_valid[ci] && c_start <= a_start && c_end >= a_end) {
                 covering.push_back(static_cast<uint32_t>(ci));
             }
         }
@@ -986,16 +1014,27 @@ inline void batch_coverage_check(
 inline std::vector<std::pair<uint32_t, uint32_t>> batch_overlap_small(
     const int64_t* STRUCTOR_RESTRICT offsets,
     const uint32_t* STRUCTOR_RESTRICT sizes,
-    size_t n) noexcept
+    size_t n)
 {
     std::vector<std::pair<uint32_t, uint32_t>> result;
     
     if (n < 2) return result;
+    if (offsets == nullptr || sizes == nullptr) {
+        throw std::invalid_argument("null interval array");
+    }
+    if (n > std::numeric_limits<uint32_t>::max()) {
+        throw std::length_error("interval index exceeds uint32_t");
+    }
     
     // Pre-compute end offsets
     std::vector<int64_t> ends(n);
+    std::vector<uint8_t> valid(n, 0);
     for (size_t i = 0; i < n; ++i) {
-        ends[i] = offsets[i] + static_cast<int64_t>(sizes[i]);
+        if (offsets[i] <= std::numeric_limits<int64_t>::max() -
+                static_cast<int64_t>(sizes[i])) {
+            ends[i] = offsets[i] + static_cast<int64_t>(sizes[i]);
+            valid[i] = sizes[i] != 0;
+        }
     }
     
     // Pairwise comparison with SIMD inner loop
@@ -1018,10 +1057,10 @@ inline std::vector<std::pair<uint32_t, uint32_t>> batch_overlap_small(
             uint64x2_t j_lt_iend = vcltq_s64(v_j_start, v_i_end);
             uint64x2_t overlaps = vandq_u64(i_lt_jend, j_lt_iend);
             
-            if (vgetq_lane_u64(overlaps, 0)) {
+            if (valid[i] && valid[j] && vgetq_lane_u64(overlaps, 0)) {
                 result.emplace_back(static_cast<uint32_t>(i), static_cast<uint32_t>(j));
             }
-            if (vgetq_lane_u64(overlaps, 1)) {
+            if (valid[i] && valid[j + 1] && vgetq_lane_u64(overlaps, 1)) {
                 result.emplace_back(static_cast<uint32_t>(i), static_cast<uint32_t>(j + 1));
             }
         }
@@ -1032,7 +1071,8 @@ inline std::vector<std::pair<uint32_t, uint32_t>> batch_overlap_small(
             int64_t j_start = offsets[j];
             int64_t j_end = ends[j];
             
-            if (i_start < j_end && j_start < i_end) {
+            if (valid[i] && valid[j] &&
+                i_start < j_end && j_start < i_end) {
                 result.emplace_back(static_cast<uint32_t>(i), static_cast<uint32_t>(j));
             }
         }

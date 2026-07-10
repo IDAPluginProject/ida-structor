@@ -1,5 +1,11 @@
 #include "structor/z3/context.hpp"
+
+#include <array>
+#include <charconv>
+#include <stdexcept>
+#include <system_error>
 #include "structor/z3/type_encoding.hpp"
+#include <limits>
 #include <stdexcept>
 
 #ifndef STRUCTOR_TESTING
@@ -22,11 +28,10 @@ namespace {
 }
 
 Z3Context::Z3Context(const Z3Config& config)
-    : ctx_(std::make_unique<::z3::context>())
-    , config_(config) {
-    z3_log("[Structor/Z3] Initializing Z3 context (timeout=%ums, memory=%uMB, ptr_size=%u)\n",
+    : config_(config)
+    , ctx_(std::make_unique<::z3::context>()) {
+    z3_log("[Structor/Z3] Initializing Z3 context (timeout=%ums, memory=%uMiB, ptr_size=%u)\n",
            config_.timeout_ms, config_.max_memory_mb, config_.pointer_size);
-    apply_global_params();
 }
 
 Z3Context::~Z3Context() = default;
@@ -34,31 +39,40 @@ Z3Context::~Z3Context() = default;
 Z3Context::Z3Context(Z3Context&&) noexcept = default;
 Z3Context& Z3Context::operator=(Z3Context&&) noexcept = default;
 
-void Z3Context::apply_global_params() {
-    // Apply timeout via global Z3 parameters (more reliable than solver.set)
-    ::z3::set_param("timeout", static_cast<int>(config_.timeout_ms));
-
-    // Note: memory_high_watermark is problematic - it can cause immediate memout
-    // if set incorrectly. Z3's default memory handling is sufficient for our use case.
-    // The memory_max_size parameter (in bytes) could be used for hard limits if needed:
-    //   ::z3::set_param("memory_max_size", static_cast<unsigned>(config_.max_memory_mb) * 1024 * 1024);
-}
-
 ::z3::solver Z3Context::make_solver() {
     ::z3::solver s(*ctx_);
+    ::z3::params p(*ctx_);
 
-    // Configure solver for UNSAT core extraction
-    if (config_.produce_unsat_cores) {
-        ::z3::params p(*ctx_);
-        p.set("unsat_core", true);
-        s.set(p);
-    }
+    // These are solver-instance parameters in Z3 4.15.4. Timeout is measured
+    // in milliseconds. max_memory is measured in MiB and uses UINT_MAX as its
+    // unlimited value. Set that value explicitly for Structor's zero sentinel
+    // so a process-global Z3 default cannot reintroduce a cap.
+    p.set("timeout", config_.timeout_ms);
+    p.set("max_memory", config_.max_memory_mb == 0
+                            ? std::numeric_limits<unsigned>::max()
+                            : config_.max_memory_mb);
+    p.set("unsat_core", config_.produce_unsat_cores);
+    p.set("model", config_.produce_models);
+    s.set(p);
 
     return s;
 }
 
 ::z3::optimize Z3Context::make_optimizer() {
+    if (config_.max_memory_mb != 0) {
+        throw std::invalid_argument(
+            "configured memory limit cannot be enforced by the Z3 optimizer");
+    }
     ::z3::optimize opt(*ctx_);
+    ::z3::params p(*ctx_);
+
+    // Z3 4.15.4 Optimize validates against opt_context's parameter
+    // descriptors. Of Structor's controls, only timeout is accepted locally.
+    // Supplying max_memory, model, or unsat_core would raise Z3_INVALID_ARG;
+    // using process-global parameters instead would couple independent contexts.
+    p.set("timeout", config_.timeout_ms);
+    opt.set(p);
+
     return opt;
 }
 
@@ -87,8 +101,14 @@ void Z3Context::apply_global_params() {
 }
 
 ::z3::expr Z3Context::uint_val(uint64_t v) {
-    // Z3 int_val handles large values correctly
-    return ctx_->int_val(static_cast<int64_t>(v));
+    std::array<char, 32> decimal{};
+    const auto converted = std::to_chars(
+        decimal.data(), decimal.data() + decimal.size() - 1, v);
+    if (converted.ec != std::errc{}) {
+        throw std::runtime_error("failed to encode unsigned Z3 integer");
+    }
+    *converted.ptr = '\0';
+    return ctx_->int_val(decimal.data());
 }
 
 ::z3::expr Z3Context::bool_val(bool v) {
@@ -125,24 +145,6 @@ TypeEncoder& Z3Context::type_encoder() {
         type_encoder_ = std::make_unique<TypeEncoder>(*this);
     }
     return *type_encoder_;
-}
-
-// Z3ParamGuard implementation
-Z3ParamGuard::Z3ParamGuard(const char* param, unsigned value)
-    : param_(param)
-    , old_value_(0) {
-    // Note: Z3 doesn't provide a way to get the current value of a parameter
-    // So we just set the new value and will restore to 0 (default-ish) on destruction
-    ::z3::set_param(param, static_cast<int>(value));
-}
-
-Z3ParamGuard::~Z3ParamGuard() {
-    try {
-        // Restore to a reasonable default
-        ::z3::set_param(param_.c_str(), static_cast<int>(old_value_));
-    } catch (...) {
-        // Ignore errors during destruction
-    }
 }
 
 } // namespace structor::z3

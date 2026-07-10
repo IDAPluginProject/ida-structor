@@ -17,7 +17,7 @@
         "success": true,
         "error": "Success",
         "error_message": "",
-        "fields_created": 3,
+        "fields_created": 4,
         "vtable_slots": 0,
         "propagated_to": [
           "_invoke_handler",
@@ -30,31 +30,46 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_result",
-          "size": 20,
-          "alignment": 1,
+          "size": 24,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_invoke_handler",
           "source_var": "result",
-          "field_count": 3,
+          "field_count": 4,
           "non_padding_field_count": 3,
           "provenance": [],
           "fields": [
             {
-              "name": "fn_0",
+              "name": "union_0",
               "offset": 0,
               "size": 8,
-              "semantic": "funcptr",
-              "type": "__int64 (__fastcall *)(_QWORD, _QWORD)",
+              "semantic": "unknown",
+              "type": "unsigned __int64",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u64_0",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "unsigned __int64"
+                },
+                {
+                  "name": "fn_0",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "__int64 (__fastcall *)(_QWORD, _QWORD)"
+                }
+              ]
             },
             {
               "name": "u64_8",
@@ -87,12 +102,28 @@
               "bit_offset": 0,
               "bit_size": 0,
               "union_members": []
+            },
+            {
+              "name": "__pad_14",
+              "offset": 20,
+              "size": 4,
+              "semantic": "padding",
+              "type": "char[4]",
+              "confidence": "medium",
+              "is_padding": true,
+              "is_array": false,
+              "array_count": 1,
+              "is_union_candidate": false,
+              "is_bitfield": false,
+              "bit_offset": 0,
+              "bit_size": 0,
+              "union_members": []
             }
           ],
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> invoke_handler\nauto_result *__fastcall invoke_handler(auto_result *result) {\n    if ( result->fn_0 )\n        return (auto_result *)result->fn_0(a1: result->u64_8, a2: result->u32_10);\n    return result;\n}\n<<<\n\n>>> setup_handler\n__int64 __fastcall setup_handler(__int64 result, __int64 a2, __int64 a3, int a4) {\n    *(_QWORD *)result = a2;\n    *(_QWORD *)(result + 8) = a3;\n    *(_DWORD *)(result + 16) = a4;\n    *(_DWORD *)(result + 20) = 0;\n    return result;\n}\n<<<\n\n>>> update_and_invoke\nauto_result *__fastcall update_and_invoke(auto_result *a1, unsigned __int32 a2) {\n    a1->u32_10 = a2;\n    return invoke_handler(result: a1);\n}\n<<<\n"
+      "golden_pseudocode": ">>> invoke_handler\nauto_result *__fastcall invoke_handler(auto_result *result) {\n    if ( result->union_0.u64_0 != 0 )\n        return (auto_result *)result->union_0.fn_0(a1: result->u64_8, a2: result->u32_10);\n    return result;\n}\n<<<\n\n>>> setup_handler\n__int64 __fastcall setup_handler(__int64 result, __int64 a2, __int64 a3, int a4) {\n    *(_QWORD *)result = a2;\n    *(_QWORD *)(result + 8) = a3;\n    *(_DWORD *)(result + 16) = a4;\n    *(_DWORD *)(result + 20) = 0;\n    return result;\n}\n<<<\n\n>>> update_and_invoke\nauto_result *__fastcall update_and_invoke(auto_result *a1, unsigned __int32 a2) {\n    a1->u32_10 = a2;\n    return invoke_handler(result: a1);\n}\n<<<\n"
     }
   ]
 }

@@ -10,6 +10,29 @@
 
 namespace structor::z3 {
 
+namespace {
+
+[[nodiscard]] std::optional<int> resolve_lvar_locator(
+    cfunc_t* cfunc,
+    const lvar_locator_t& locator)
+{
+    if (cfunc == nullptr) {
+        return std::nullopt;
+    }
+    lvars_t* lvars = cfunc->get_lvars();
+    if (lvars == nullptr || lvars->find(locator) == nullptr) {
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < lvars->size(); ++i) {
+        if (static_cast<const lvar_locator_t&>(lvars->at(i)) == locator) {
+            return static_cast<int>(i);
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
 // ============================================================================
 // TypeApplicationResult implementation
 // ============================================================================
@@ -17,6 +40,9 @@ namespace structor::z3 {
 qstring TypeApplicationResult::summary() const {
     qstring result;
     result.sprnt("Type Application Results:\n");
+    if (!error_message.empty()) {
+        result.cat_sprnt("  Error: %s\n", error_message.c_str());
+    }
     result.cat_sprnt("  Total variables: %u\n", total_variables);
     result.cat_sprnt("  Applied: %u\n", applied_count);
     result.cat_sprnt("  Failed: %u\n", failed_count);
@@ -71,8 +97,20 @@ TypeApplicationResult TypeApplicator::apply(
     const FunctionTypeInferenceResult& inference_result)
 {
     TypeApplicationResult result;
-    
+    last_signature_rollback_failed_ = false;
+
+    if (!inference_result.success) {
+        result.func_ea = cfunc ? cfunc->entry_ea : BADADDR;
+        if (inference_result.error_message.empty()) {
+            result.error_message = "type inference result is not successful";
+        } else {
+            result.error_message = inference_result.error_message;
+        }
+        return result;
+    }
+
     if (!cfunc) {
+        result.error_message = "null cfunc";
         return result;
     }
     
@@ -84,33 +122,79 @@ TypeApplicationResult TypeApplicator::apply(
     }
     
     result.total_variables = static_cast<unsigned>(inference_result.local_types.size());
-    
+    result.applied.reserve(inference_result.local_types.size());
+    result.failed.reserve(inference_result.local_types.size());
+    result.skipped.reserve(inference_result.local_types.size());
+
+    std::vector<TypeApplicationResult::AppliedType> prepared_applied;
+    std::vector<std::optional<lvar_locator_t>> stable_locators;
+    prepared_applied.reserve(inference_result.local_types.size());
+    stable_locators.reserve(inference_result.local_types.size());
+    for (const auto& ivt : inference_result.local_types) {
+        TypeApplicationResult::AppliedType prepared;
+        prepared.var_idx = ivt.var_idx;
+        prepared.var_name = ivt.var_name;
+        prepared.inferred = ivt.type;
+        prepared.applied = ivt.type.to_tinfo();
+        prepared.confidence = ivt.confidence;
+        prepared_applied.push_back(std::move(prepared));
+        if (ivt.var_idx >= 0 &&
+            static_cast<size_t>(ivt.var_idx) < lvars->size()) {
+            stable_locators.emplace_back(
+                static_cast<const lvar_locator_t&>(
+                    lvars->at(static_cast<size_t>(ivt.var_idx))));
+        } else {
+            stable_locators.emplace_back(std::nullopt);
+        }
+    }
+
     // Apply each inferred type
+    std::size_t inference_index = 0;
+    try {
     for (const auto& ivt : inference_result.local_types) {
         qstring reason;
-        
+        cfuncptr_t current_cfunc = utils::get_cfunc(result.func_ea);
+        const auto current_var_idx = stable_locators[inference_index].has_value()
+            ? resolve_lvar_locator(
+                current_cfunc, *stable_locators[inference_index])
+            : std::nullopt;
+
         // Check if we should apply this type
-        if (!should_apply(cfunc, ivt.var_idx, ivt.type, ivt.confidence, &reason)) {
+        if (!current_cfunc || !current_var_idx.has_value()) {
+            reason = "stable variable locator no longer resolves";
+            TypeApplicationResult::FailedType failed;
+            failed.var_idx = ivt.var_idx;
+            failed.var_name = ivt.var_name;
+            failed.inferred = ivt.type;
+            failed.reason = reason;
+            result.failed.push_back(std::move(failed));
+            ++result.failed_count;
+            result.incomplete = result.incomplete ||
+                stable_locators[inference_index].has_value();
+            ++inference_index;
+            continue;
+        }
+        if (!should_apply(
+                current_cfunc, *current_var_idx,
+                ivt.type, ivt.confidence, &reason)) {
             TypeApplicationResult::SkippedType skipped;
             skipped.var_idx = ivt.var_idx;
             skipped.var_name = ivt.var_name;
             skipped.reason = reason;
             result.skipped.push_back(std::move(skipped));
             result.skipped_count++;
+            ++inference_index;
             continue;
         }
         
         // Try to apply the type
-        bool success = apply_variable(cfunc, ivt.var_idx, ivt.type, ivt.confidence, &reason);
+        bool success = apply_variable(
+            current_cfunc, *current_var_idx,
+            ivt.type, ivt.confidence, &reason);
         
         if (success) {
-            TypeApplicationResult::AppliedType applied;
-            applied.var_idx = ivt.var_idx;
-            applied.var_name = ivt.var_name;
-            applied.inferred = ivt.type;
-            applied.applied = ivt.type.to_tinfo();
-            applied.confidence = ivt.confidence;
-            result.applied.push_back(std::move(applied));
+            result.applied.push_back(
+                std::move(prepared_applied[inference_index]));
             result.applied_count++;
             
             report_application(ivt.var_idx, ivt.var_name.c_str(), true, "applied");
@@ -125,16 +209,39 @@ TypeApplicationResult TypeApplicator::apply(
             
             report_application(ivt.var_idx, ivt.var_name.c_str(), false, reason.c_str());
         }
+        ++inference_index;
+    }
+    } catch (...) {
+        result.incomplete = true;
+        try {
+            result.error_message =
+                "type application stopped after an internal exception";
+        } catch (...) {}
     }
     
     // Apply function signature if configured
-    if (config_.apply_signatures && inference_result.return_type.has_value()) {
-        (void)apply_signature(cfunc, inference_result);
+    const bool has_signature_inference =
+        inference_result.return_type.has_value() ||
+        !inference_result.param_types.empty();
+    cfuncptr_t post_apply_cfunc = utils::get_cfunc(result.func_ea);
+    if (!result.incomplete && config_.apply_signatures &&
+        has_signature_inference) {
+        result.signature_requested = true;
+        result.signature_applied = post_apply_cfunc &&
+            apply_signature(post_apply_cfunc, inference_result);
+        result.signature_failed = !result.signature_applied;
+        result.signature_rollback_failed =
+            last_signature_rollback_failed_;
+        if (result.signature_failed) {
+            result.error_message = "failed to apply inferred function signature";
+        }
     }
     
     // Refresh decompiler if configured
-    if (config_.force_refresh && result.applied_count > 0) {
-        refresh_decompiler(cfunc);
+    if (config_.force_refresh &&
+        (result.applied_count > 0 || result.signature_applied) &&
+        post_apply_cfunc) {
+        refresh_decompiler(post_apply_cfunc);
     }
     
     return result;
@@ -174,6 +281,26 @@ TypeApplicationResult TypeApplicator::apply_and_propagate(
     cfunc_t* cfunc,
     const FunctionTypeInferenceResult& inference_result)
 {
+    const ea_t entry_ea = cfunc ? cfunc->entry_ea : BADADDR;
+    std::vector<std::pair<int, lvar_locator_t>> stable_locators;
+    if (cfunc != nullptr) {
+        lvars_t* lvars = cfunc->get_lvars();
+        if (lvars != nullptr) {
+            stable_locators.reserve(inference_result.local_types.size());
+            for (const auto& inferred : inference_result.local_types) {
+                if (inferred.var_idx >= 0 &&
+                    static_cast<size_t>(inferred.var_idx) < lvars->size()) {
+                    stable_locators.emplace_back(
+                        inferred.var_idx,
+                        static_cast<const lvar_locator_t&>(
+                            lvars->at(static_cast<size_t>(inferred.var_idx))));
+                }
+            }
+        }
+    }
+    PropagationResult combined_propagation;
+    combined_propagation.sites.reserve(MAX_FIELDS);
+
     // First apply types locally
     TypeApplicationResult result = apply(cfunc, inference_result);
     
@@ -182,22 +309,55 @@ TypeApplicationResult TypeApplicator::apply_and_propagate(
     }
     
     // Propagate each applied type
+    try {
     for (const auto& applied : result.applied) {
+        const auto locator_it = std::find_if(
+            stable_locators.begin(), stable_locators.end(),
+            [&](const auto& item) { return item.first == applied.var_idx; });
+        cfuncptr_t current_cfunc = utils::get_cfunc(entry_ea);
+        const auto current_var_idx =
+            locator_it != stable_locators.end()
+            ? resolve_lvar_locator(current_cfunc, locator_it->second)
+            : std::nullopt;
+        if (!current_cfunc || !current_var_idx.has_value()) {
+            ++combined_propagation.failure_count;
+            combined_propagation.mark_incomplete(
+                "applied-variable locator no longer resolves");
+            result.incomplete = true;
+            continue;
+        }
         PropagationResult prop = propagator_.propagate(
-            cfunc->entry_ea,
-            applied.var_idx,
-            applied.applied,
-            PropagationDirection::Both
-        );
+            entry_ea, *current_var_idx, applied.applied,
+            PropagationDirection::Both);
         
         // Merge propagation results
         for (auto& site : prop.sites) {
-            result.propagation.sites.push_back(std::move(site));
+            if (!combined_propagation.can_record_site()) {
+                combined_propagation.mark_incomplete(
+                    "combined propagation site limit exceeded");
+                result.incomplete = true;
+                break;
+            }
+            combined_propagation.sites.push_back(std::move(site));
         }
-        result.propagation.success_count += prop.success_count;
-        result.propagation.failure_count += prop.failure_count;
+        combined_propagation.success_count += prop.success_count;
+        combined_propagation.failure_count += prop.failure_count;
         result.propagated_count += prop.success_count;
+        if (prop.incomplete) {
+            result.incomplete = true;
+            combined_propagation.mark_incomplete(
+                prop.error_message.empty()
+                    ? "nested propagation incomplete"
+                    : prop.error_message.c_str());
+        }
     }
+    } catch (...) {
+        result.incomplete = true;
+        ++combined_propagation.failure_count;
+        combined_propagation.mark_incomplete(
+            "combined propagation raised an unexpected exception");
+    }
+    result.propagation = std::move(combined_propagation);
     
     return result;
 }
@@ -213,6 +373,7 @@ TypeApplicationResult TypeApplicator::infer_and_apply(
     if (!inference_result.success) {
         TypeApplicationResult result;
         result.func_ea = cfunc ? cfunc->entry_ea : BADADDR;
+        result.error_message = inference_result.error_message;
         return result;
     }
     
@@ -270,8 +431,62 @@ bool TypeApplicator::apply_signature(
         return false;
     }
     
-    // Apply the function type using set_tinfo
-    return set_tinfo(cfunc->entry_ea, &new_func_type);
+    const ea_t entry_ea = cfunc->entry_ea;
+    tinfo_t stored_before;
+    bool had_stored_type = false;
+    bool write_attempted = false;
+    const auto rollback = [&]() noexcept {
+        try {
+            if (!had_stored_type) {
+                del_tinfo(entry_ea);
+                tinfo_t residual;
+                const bool restored = !get_tinfo(&residual, entry_ea);
+                (void)mark_cfunc_dirty(entry_ea, false);
+                return restored;
+            }
+            if (!set_tinfo(entry_ea, &stored_before)) {
+                return false;
+            }
+            tinfo_t restored;
+            const bool restored_ok = get_tinfo(&restored, entry_ea) &&
+                restored.equals_to(stored_before);
+            (void)mark_cfunc_dirty(entry_ea, false);
+            return restored_ok;
+        } catch (...) {
+            return false;
+        }
+    };
+    const auto rollback_or_report = [&]() noexcept {
+        const bool restored = rollback();
+        if (!restored) {
+            last_signature_rollback_failed_ = true;
+            msg("Structor: CRITICAL: failed to restore function signature at 0x%llX\n",
+                static_cast<unsigned long long>(entry_ea));
+        }
+        return restored;
+    };
+
+    try {
+        had_stored_type = get_tinfo(&stored_before, entry_ea);
+        write_attempted = true;
+        if (!set_tinfo(entry_ea, &new_func_type)) {
+            (void)rollback_or_report();
+            return false;
+        }
+        tinfo_t observed;
+        if (!get_tinfo(&observed, entry_ea) ||
+            !observed.equals_to(new_func_type)) {
+            (void)rollback_or_report();
+            return false;
+        }
+        (void)mark_cfunc_dirty(entry_ea, false);
+        return true;
+    } catch (...) {
+        if (write_attempted) {
+            (void)rollback_or_report();
+        }
+        return false;
+    }
 }
 
 void TypeApplicator::refresh_decompiler(cfunc_t* cfunc) {
@@ -361,23 +576,20 @@ bool TypeApplicator::apply_tinfo(
         if (out_reason) *out_reason = "invalid variable index";
         return false;
     }
-    
-    lvar_t& var = lvars->at(var_idx);
-    
-    // Prepare lvar_saved_info
-    lvar_saved_info_t lsi;
-    lsi.ll = var;
-    lsi.type = type;
-    
-    // Apply the type
-    if (!modify_user_lvar_info(cfunc->entry_ea, MLI_TYPE, lsi)) {
-        if (out_reason) *out_reason = "modify_user_lvar_info failed";
+
+    // Use the shared rollback-verified path. It snapshots saved-lvar state,
+    // updates the cached lvar only when Hex-Rays accepts the type, synchronizes
+    // affected function signatures, and restores every attempted mutation on
+    // failure.
+    if (!propagator_.apply_exact_type(cfunc, var_idx, type)) {
+        if (out_reason) {
+            *out_reason = propagator_.last_application_rollback_failed()
+                ? "type application failed and rollback failed"
+                : "type application failed and was rolled back";
+        }
         return false;
     }
-    
-    // Update the lvar directly as well
-    var.set_lvar_type(type);
-    
+
     return true;
 }
 
@@ -431,7 +643,12 @@ void TypeApplicator::report_application(
     const char* reason)
 {
     if (config_.application_callback) {
-        config_.application_callback(var_idx, var_name, success, reason);
+        try {
+            config_.application_callback(var_idx, var_name, success, reason);
+        } catch (...) {
+            // Observability callbacks are not part of the mutation contract.
+            // A client exception cannot invalidate already-applied types.
+        }
     }
 }
 

@@ -7,18 +7,48 @@ namespace structor::z3 {
 
 namespace {
 
+std::optional<uint32_t> checked_element_count(
+    sval_t base,
+    sval_t last,
+    uint32_t stride,
+    uint32_t maximum) {
+    if (stride == 0) {
+        return std::nullopt;
+    }
+    const auto span = checked_interval_span(base, last);
+    if (!span) {
+        return std::nullopt;
+    }
+    const std::uint64_t count = *span / stride + 1;
+    if (count == 0 || count > maximum ||
+        count > std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(count);
+}
+
+std::optional<sval_t> checked_subtract_size(
+    sval_t value,
+    uint32_t amount) {
+    if (value < std::numeric_limits<sval_t>::min() +
+                    static_cast<sval_t>(amount)) {
+        return std::nullopt;
+    }
+    return value - static_cast<sval_t>(amount);
+}
+
 double coverage_ratio(const qvector<sval_t>& offsets, sval_t base, uint32_t stride) {
     if (offsets.empty() || stride == 0) {
         return 0.0;
     }
 
-    const std::size_t expected =
-        static_cast<std::size_t>((offsets.back() - base) / static_cast<sval_t>(stride)) + 1;
-    if (expected == 0) {
+    const auto expected = checked_element_count(
+        base, offsets.back(), stride, std::numeric_limits<uint32_t>::max());
+    if (!expected) {
         return 0.0;
     }
 
-    return static_cast<double>(offsets.size()) / static_cast<double>(expected);
+    return static_cast<double>(offsets.size()) / static_cast<double>(*expected);
 }
 
 bool has_excessive_gap(const qvector<sval_t>& offsets, uint32_t stride, int max_gap_ratio) {
@@ -26,9 +56,11 @@ bool has_excessive_gap(const qvector<sval_t>& offsets, uint32_t stride, int max_
         return false;
     }
 
-    const sval_t max_gap = static_cast<sval_t>(std::max(1, max_gap_ratio)) * stride;
+    const std::uint64_t max_gap =
+        static_cast<std::uint64_t>(std::max(1, max_gap_ratio)) * stride;
     for (size_t i = 1; i < offsets.size(); ++i) {
-        if (offsets[i] - offsets[i - 1] > max_gap) {
+        const auto gap = checked_interval_span(offsets[i - 1], offsets[i]);
+        if (!gap || *gap > max_gap) {
             return true;
         }
     }
@@ -106,7 +138,10 @@ ArrayConstraintBuilder::ArrayConstraintBuilder(
     Z3Context& ctx,
     const ArrayDetectionConfig& config)
     : ctx_(ctx)
-    , config_(config) {}
+    , config_(config) {
+    config_.max_elements = std::min(
+        config_.max_elements, ctx_.config().max_array_elements);
+}
 
 qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
     const qvector<FieldAccess>& accesses)
@@ -152,7 +187,7 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
     algorithms::parallel_for_chunks(plans.size(), 2, [&](size_t begin, size_t end) {
         for (size_t plan_idx = begin; plan_idx < end; ++plan_idx) {
             auto& plan = plans[plan_idx];
-            if (static_cast<int>(plan.group.size()) < config_.min_elements) {
+            if (plan.group.size() < config_.min_elements) {
                 continue;
             }
 
@@ -163,7 +198,7 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
             std::sort(plan.offsets.begin(), plan.offsets.end());
             plan.offsets.erase(std::unique(plan.offsets.begin(), plan.offsets.end()), plan.offsets.end());
 
-            if (static_cast<int>(plan.offsets.size()) < config_.min_elements) {
+            if (plan.offsets.size() < config_.min_elements) {
                 continue;
             }
 
@@ -182,13 +217,17 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
             size_t run_start = 0;
             while (run_start + 1 < plan.offsets.size()) {
                 size_t run_end = run_start + 1;
-                while (run_end < plan.offsets.size() &&
-                       plan.offsets[run_end] - plan.offsets[run_end - 1] == static_cast<sval_t>(stride)) {
+                while (run_end < plan.offsets.size()) {
+                    const auto gap = checked_interval_span(
+                        plan.offsets[run_end - 1], plan.offsets[run_end]);
+                    if (!gap || *gap != stride) {
+                        break;
+                    }
                     ++run_end;
                 }
 
                 const size_t run_len = run_end - run_start;
-                if (static_cast<int>(run_len) >= config_.min_elements) {
+                if (run_len >= config_.min_elements) {
                     plan.exact_runs.push_back(ExactStrideRun{stride, run_start, run_end});
                 }
                 run_start = run_end;
@@ -226,8 +265,12 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
                     continue;
                 }
 
-                uint32_t count = static_cast<uint32_t>((plan.offsets.back() - base) / stride) + 1;
-                ArrayCandidate candidate = create_candidate(base, stride, count, plan.group);
+                const auto count = checked_element_count(
+                    base, plan.offsets.back(), stride, config_.max_elements);
+                if (!count) {
+                    continue;
+                }
+                ArrayCandidate candidate = create_candidate(base, stride, *count, plan.group);
 
                 if (is_weak_single_field_struct_array(candidate, plan.group)) {
                     continue;
@@ -324,9 +367,12 @@ ArrayConstraintBuilder::find_arithmetic_progression(const qvector<sval_t>& offse
     // Calculate stride as GCD of all differences
     qvector<uint32_t> diffs;
     for (size_t i = 1; i < offsets.size(); ++i) {
-        sval_t diff = offsets[i] - offsets[i - 1];
-        if (diff <= 0) return std::nullopt;  // Must be strictly increasing
-        diffs.push_back(static_cast<uint32_t>(diff));
+        const auto diff = checked_interval_span(offsets[i - 1], offsets[i]);
+        if (!diff || *diff == 0 ||
+            *diff > std::numeric_limits<uint32_t>::max()) {
+            return std::nullopt;
+        }
+        diffs.push_back(static_cast<uint32_t>(*diff));
     }
 
     uint32_t stride = gcd_vector(diffs);
@@ -338,15 +384,16 @@ ArrayConstraintBuilder::find_arithmetic_progression(const qvector<sval_t>& offse
     sval_t base = offsets[0];
 
     for (const auto& offset : offsets) {
-        sval_t relative = offset - base;
-        if (relative % stride != 0) {
+        const auto relative = checked_interval_span(base, offset);
+        if (!relative || *relative % stride != 0) {
             return std::nullopt;  // Doesn't fit the pattern
         }
     }
 
     // Check for gaps (missing elements)
-    size_t expected_count = static_cast<size_t>((offsets.back() - offsets.front()) / stride) + 1;
-    if (expected_count > config_.max_elements) {
+    const auto expected_count = checked_element_count(
+        offsets.front(), offsets.back(), stride, config_.max_elements);
+    if (!expected_count) {
         return std::nullopt;
     }
 
@@ -355,7 +402,7 @@ ArrayConstraintBuilder::find_arithmetic_progression(const qvector<sval_t>& offse
     }
 
     // Allow some gaps based on config
-    double ratio = static_cast<double>(offsets.size()) / expected_count;
+    double ratio = static_cast<double>(offsets.size()) / *expected_count;
     if (ratio < 1.0 / config_.max_gap_ratio) {
         return std::nullopt;  // Too sparse
     }
@@ -404,22 +451,29 @@ std::optional<std::pair<sval_t, uint32_t>> ArrayConstraintBuilder::find_progress
     if (!check_struct_element_pattern(accesses, stride_hint, inner_offset)) {
         sval_t base = offsets.front();
         for (const auto& offset : offsets) {
-            if ((offset - base) % static_cast<sval_t>(stride_hint) != 0) {
+            const auto relative = checked_interval_span(base, offset);
+            if (!relative || *relative % stride_hint != 0) {
                 return std::nullopt;
             }
         }
         inner_offset = 0;
     }
 
-    sval_t base = offsets.front() - static_cast<sval_t>(inner_offset);
+    const auto base_value = checked_subtract_size(offsets.front(), inner_offset);
+    if (!base_value) {
+        return std::nullopt;
+    }
+    const sval_t base = *base_value;
     for (const auto& offset : offsets) {
-        if ((offset - base) % static_cast<sval_t>(stride_hint) != 0) {
+        const auto relative = checked_interval_span(base, offset);
+        if (!relative || *relative % stride_hint != 0) {
             return std::nullopt;
         }
     }
 
-    size_t expected_count = static_cast<size_t>((offsets.back() - base) / stride_hint) + 1;
-    if (expected_count == 0 || expected_count > config_.max_elements) {
+    const auto expected_count = checked_element_count(
+        base, offsets.back(), stride_hint, config_.max_elements);
+    if (!expected_count) {
         return std::nullopt;
     }
 
@@ -427,7 +481,7 @@ std::optional<std::pair<sval_t, uint32_t>> ArrayConstraintBuilder::find_progress
         return std::nullopt;
     }
 
-    double ratio = static_cast<double>(offsets.size()) / expected_count;
+    double ratio = static_cast<double>(offsets.size()) / *expected_count;
     if (ratio < 1.0 / config_.max_gap_ratio) {
         return std::nullopt;
     }
@@ -490,15 +544,22 @@ void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& c
         const ArrayCandidate& curr = candidates[i];
 
         // Check for overlap
-        sval_t last_end = last.base_offset + last.total_size();
+        const auto last_end = last.checked_end_offset();
+        const auto curr_end = curr.checked_end_offset();
 
-        if (curr.base_offset < last_end && curr.stride == last.stride) {
+        if (last_end && curr_end && curr.base_offset < *last_end &&
+            curr.stride == last.stride && last.stride != 0) {
             // Merge: extend the last array
-            sval_t new_end = std::max(last_end,
-                curr.base_offset + static_cast<sval_t>(curr.total_size()));
-            uint32_t new_count = static_cast<uint32_t>(
-                (new_end - last.base_offset) / last.stride);
-            last.element_count = new_count;
+            const sval_t new_end = std::max(*last_end, *curr_end);
+            const auto merged_span = checked_interval_span(
+                last.base_offset, new_end);
+            if (!merged_span || *merged_span % last.stride != 0 ||
+                *merged_span / last.stride > config_.max_elements) {
+                merged.push_back(curr);
+                continue;
+            }
+            last.element_count = static_cast<uint32_t>(
+                *merged_span / last.stride);
 
             // Merge member offsets using hash-based deduplication
             // Build hash set of existing offsets for O(1) lookup
@@ -546,8 +607,12 @@ ArrayCandidate ArrayConstraintBuilder::create_candidate(
         // Check if stride > access_size (struct element pattern)
         if (stride > first->size) {
             candidate.needs_element_struct = true;
+            const auto relative = checked_interval_span(base, first->offset);
+            if (!relative) {
+                return candidate;
+            }
             candidate.inner_access_offset = static_cast<uint32_t>(
-                (first->offset - base) % stride);
+                *relative % stride);
             candidate.inner_access_size = first->size;
             stats_.struct_element_arrays++;
 
@@ -605,10 +670,10 @@ std::optional<ArrayCandidate> ArrayConstraintBuilder::solve_stride_z3(
         auto hinted = find_progression_with_stride(offsets, accesses, *stride_hint);
         if (hinted.has_value()) {
             auto [base, stride] = *hinted;
-            uint32_t count = static_cast<uint32_t>((offsets.back() - base) / stride) + 1;
-            if (count >= static_cast<uint32_t>(config_.min_elements) &&
-                count <= config_.max_elements) {
-                ArrayCandidate candidate = create_candidate(base, stride, count, accesses);
+            const auto count = checked_element_count(
+                base, offsets.back(), stride, config_.max_elements);
+            if (count && *count >= static_cast<uint32_t>(config_.min_elements)) {
+                ArrayCandidate candidate = create_candidate(base, stride, *count, accesses);
                 if (!is_weak_single_field_struct_array(candidate, accesses)) {
                     return candidate;
                 }
@@ -630,11 +695,16 @@ std::optional<ArrayCandidate> ArrayConstraintBuilder::solve_stride_z3(
         inner_offset = 0;
     }
 
-    sval_t base = offsets[0] - inner_offset;
-    sval_t last = offsets.back();
-    uint32_t count = static_cast<uint32_t>((last - base) / stride) + 1;
+    const auto base_value = checked_subtract_size(offsets[0], inner_offset);
+    if (!base_value) {
+        return std::nullopt;
+    }
+    const sval_t base = *base_value;
+    const sval_t last = offsets.back();
+    const auto count = checked_element_count(
+        base, last, stride, config_.max_elements);
 
-    if (count > config_.max_elements || count < static_cast<uint32_t>(config_.min_elements)) {
+    if (!count || *count < static_cast<uint32_t>(config_.min_elements)) {
         return std::nullopt;
     }
 
@@ -646,7 +716,7 @@ std::optional<ArrayCandidate> ArrayConstraintBuilder::solve_stride_z3(
         return std::nullopt;
     }
 
-    ArrayCandidate candidate = create_candidate(base, stride, count, accesses);
+    ArrayCandidate candidate = create_candidate(base, stride, *count, accesses);
     if (is_weak_single_field_struct_array(candidate, accesses)) {
         return std::nullopt;
     }
@@ -659,9 +729,10 @@ uint32_t ArrayConstraintBuilder::calculate_gcd_stride(const qvector<sval_t>& off
 
     qvector<uint32_t> diffs;
     for (size_t i = 1; i < offsets.size(); ++i) {
-        sval_t diff = offsets[i] - offsets[i - 1];
-        if (diff > 0) {
-            diffs.push_back(static_cast<uint32_t>(diff));
+        const auto diff = checked_interval_span(offsets[i - 1], offsets[i]);
+        if (diff && *diff > 0 &&
+            *diff <= std::numeric_limits<uint32_t>::max()) {
+            diffs.push_back(static_cast<uint32_t>(*diff));
         }
     }
 
@@ -682,11 +753,20 @@ bool ArrayConstraintBuilder::check_struct_element_pattern(
         min_offset = std::min(min_offset, access->offset);
     }
 
-    uint32_t first_inner = static_cast<uint32_t>(accesses[0]->offset - min_offset) % stride;
+    const auto first_relative = checked_interval_span(
+        min_offset, accesses[0]->offset);
+    if (!first_relative) {
+        return false;
+    }
+    uint32_t first_inner = static_cast<uint32_t>(*first_relative % stride);
 
     // Check all accesses have the same inner offset
     for (const auto* access : accesses) {
-        uint32_t this_inner = static_cast<uint32_t>(access->offset - min_offset) % stride;
+        const auto relative = checked_interval_span(min_offset, access->offset);
+        if (!relative) {
+            return false;
+        }
+        uint32_t this_inner = static_cast<uint32_t>(*relative % stride);
         if (this_inner != first_inner) {
             return false;
         }
@@ -708,7 +788,15 @@ tinfo_t ArrayConstraintBuilder::create_element_struct_type(
     //       char __pad_1[stride - inner_offset - inner_type.size()];
     //   };
 
-    uint32_t inner_size = inner_type.empty() ? 4 : static_cast<uint32_t>(inner_type.get_size());
+    const size_t raw_inner_size = inner_type.empty() ? 4 : inner_type.get_size();
+    if (stride == 0 || raw_inner_size == BADSIZE ||
+        raw_inner_size > std::numeric_limits<uint32_t>::max()) {
+        return tinfo_t();
+    }
+    const uint32_t inner_size = static_cast<uint32_t>(raw_inner_size);
+    if (inner_offset > stride || inner_size > stride - inner_offset) {
+        return tinfo_t();
+    }
     uint32_t trailing_pad = stride - inner_offset - inner_size;
 
     // Generate unique name
@@ -724,7 +812,7 @@ tinfo_t ArrayConstraintBuilder::create_element_struct_type(
         udm_t pad_field;
         pad_field.name = "__pad_0";
         pad_field.offset = 0;
-        pad_field.size = inner_offset * 8;  // bits
+        pad_field.size = static_cast<std::uint64_t>(inner_offset) * 8;  // bits
 
         tinfo_t byte_type;
         byte_type.create_simple_type(BT_INT8 | BTMT_CHAR);
@@ -738,8 +826,8 @@ tinfo_t ArrayConstraintBuilder::create_element_struct_type(
     // Accessed field
     udm_t accessed_field;
     accessed_field.name = "value";
-    accessed_field.offset = inner_offset * 8;
-    accessed_field.size = inner_size * 8;
+    accessed_field.offset = static_cast<std::uint64_t>(inner_offset) * 8;
+    accessed_field.size = static_cast<std::uint64_t>(inner_size) * 8;
     accessed_field.type = inner_type.empty() ?
         tinfo_t() : inner_type;
 
@@ -754,8 +842,9 @@ tinfo_t ArrayConstraintBuilder::create_element_struct_type(
     if (trailing_pad > 0) {
         udm_t trail_field;
         trail_field.name = "__pad_1";
-        trail_field.offset = (inner_offset + inner_size) * 8;
-        trail_field.size = trailing_pad * 8;
+        trail_field.offset =
+            static_cast<std::uint64_t>(inner_offset + inner_size) * 8;
+        trail_field.size = static_cast<std::uint64_t>(trailing_pad) * 8;
 
         tinfo_t byte_type;
         byte_type.create_simple_type(BT_INT8 | BTMT_CHAR);

@@ -2,6 +2,13 @@
 /// @brief Unit tests for configuration system
 
 #include <gtest/gtest.h>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <optional>
+#include <string>
 #include "mock_ida.hpp"
 
 #define __HEXRAYS_HPP
@@ -31,6 +38,46 @@ protected:
         Config::instance().reset();
     }
 };
+
+class ScopedHomeDirectory {
+public:
+    explicit ScopedHomeDirectory(const std::filesystem::path& path) {
+        if (const char* current = std::getenv("HOME")) {
+            previous_ = current;
+        }
+#ifdef _WIN32
+        _putenv_s("HOME", path.string().c_str());
+#else
+        setenv("HOME", path.string().c_str(), 1);
+#endif
+    }
+
+    ~ScopedHomeDirectory() {
+#ifdef _WIN32
+        _putenv_s("HOME", previous_.value_or("").c_str());
+#else
+        if (previous_) {
+            setenv("HOME", previous_->c_str(), 1);
+        } else {
+            unsetenv("HOME");
+        }
+#endif
+    }
+
+private:
+    std::optional<std::string> previous_;
+};
+
+bool has_config_save_temporary(const std::filesystem::path& directory) {
+    constexpr const char* prefix = "structor.cfg.tmp.";
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // ============================================================================
 // Default Configuration Tests
@@ -78,6 +125,259 @@ TEST_F(ConfigTest, DefaultGenerateComments) {
 
 TEST_F(ConfigTest, DefaultMaxPropagationDepth) {
     EXPECT_EQ(Config::instance().max_propagation_depth(), 3);
+}
+
+TEST_F(ConfigTest, DefaultSynthesisResourceLimits) {
+    const auto& z3 = Config::instance().options().z3;
+    EXPECT_EQ(z3.memory_limit_mb, 0u);
+    EXPECT_TRUE(z3.enable_maxsmt);
+    EXPECT_EQ(z3.max_accesses, 10000u);
+    EXPECT_EQ(z3.max_candidates, 1000u);
+    EXPECT_EQ(z3.max_fields, 4096u);
+    EXPECT_EQ(z3.max_array_elements, 1024u);
+    EXPECT_TRUE(z3.detect_symbolic_arrays);
+    EXPECT_EQ(z3.max_array_stride, 4096u);
+    EXPECT_EQ(z3.max_structure_size, 0x10000u);
+    EXPECT_EQ(z3.max_constraint_pairs, 500000u);
+    EXPECT_EQ(z3.max_union_alternatives, 8u);
+    EXPECT_EQ(z3.max_relax_iterations, 5u);
+}
+
+TEST_F(ConfigTest, ZeroTimeoutAndMemoryMeanUnlimited) {
+    SynthOptions options;
+    options.z3.timeout_ms = 0;
+    options.z3.memory_limit_mb = 0;
+    EXPECT_EQ(options.z3.timeout_ms, 0u);
+    EXPECT_EQ(options.z3.memory_limit_mb, 0u);
+}
+
+TEST_F(ConfigTest, AbiAlignmentValidationIsPowerOfTwoAndRepresentable) {
+    EXPECT_FALSE(is_valid_abi_alignment(-1));
+    EXPECT_FALSE(is_valid_abi_alignment(0));
+    EXPECT_TRUE(is_valid_abi_alignment(1));
+    EXPECT_TRUE(is_valid_abi_alignment(8));
+    EXPECT_FALSE(is_valid_abi_alignment(3));
+    EXPECT_TRUE(is_valid_abi_alignment(std::int64_t{1} << 30));
+    EXPECT_FALSE(is_valid_abi_alignment(std::int64_t{1} << 31));
+    EXPECT_FALSE(is_valid_abi_alignment(std::numeric_limits<std::int64_t>::max()));
+}
+
+TEST_F(ConfigTest, SetOptionsRejectsInvalidAlignmentAtomically) {
+    Config::instance().mark_clean();
+    SynthOptions invalid = Config::instance().options();
+    invalid.hotkey = "Rejected";
+    invalid.alignment = 6;
+
+    EXPECT_FALSE(Config::instance().set_options(invalid));
+    EXPECT_STREQ(Config::instance().hotkey(), "Shift+S");
+    EXPECT_EQ(Config::instance().alignment(), 8);
+    EXPECT_FALSE(Config::instance().is_dirty());
+}
+
+TEST_F(ConfigTest, SetOptionsAcceptsValidAlignmentAtomically) {
+    Config::instance().mark_clean();
+    SynthOptions valid = Config::instance().options();
+    valid.alignment = 32;
+
+    EXPECT_TRUE(Config::instance().set_options(valid));
+    EXPECT_EQ(Config::instance().alignment(), 32);
+    EXPECT_TRUE(Config::instance().is_dirty());
+}
+
+TEST_F(ConfigTest, SetOptionsRejectsEveryZeroTerminalLimit) {
+    const auto assert_rejected = [](auto mutate) {
+        Config::instance().reset();
+        Config::instance().mark_clean();
+        SynthOptions invalid = Config::instance().options();
+        mutate(invalid.z3);
+        EXPECT_FALSE(Config::instance().set_options(invalid));
+        EXPECT_FALSE(Config::instance().is_dirty());
+    };
+
+    assert_rejected([](Z3Options& z3) { z3.max_accesses = 0; });
+    assert_rejected([](Z3Options& z3) { z3.max_candidates = 0; });
+    assert_rejected([](Z3Options& z3) { z3.max_fields = 0; });
+    assert_rejected([](Z3Options& z3) { z3.max_array_elements = 0; });
+    assert_rejected([](Z3Options& z3) { z3.max_structure_size = 0; });
+    assert_rejected([](Z3Options& z3) { z3.max_constraint_pairs = 0; });
+    assert_rejected([](Z3Options& z3) { z3.max_union_alternatives = 0; });
+}
+
+TEST_F(ConfigTest, SetOptionsRejectsInconsistentArrayBoundsAndNegativeWeights) {
+    SynthOptions invalid = Config::instance().options();
+    invalid.z3.min_array_elements = invalid.z3.max_array_elements + 1;
+    EXPECT_EQ(validate_synth_options(invalid),
+              SynthOptionsValidationError::InvalidArrayBounds);
+    EXPECT_FALSE(Config::instance().set_options(invalid));
+
+    invalid = Config::instance().options();
+    invalid.z3.max_array_stride = 0;
+    EXPECT_EQ(validate_synth_options(invalid),
+              SynthOptionsValidationError::InvalidArrayBounds);
+    EXPECT_FALSE(Config::instance().set_options(invalid));
+
+    invalid = Config::instance().options();
+    invalid.z3.weight_prefer_non_union = -1;
+    EXPECT_EQ(validate_synth_options(invalid),
+              SynthOptionsValidationError::InvalidWeight);
+    EXPECT_FALSE(Config::instance().set_options(invalid));
+}
+
+TEST_F(ConfigTest, InvalidFileLoadIsTransactionalAndRejectsUnknownMode) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto home = std::filesystem::temp_directory_path() /
+        ("structor-config-test-" + std::to_string(nonce));
+    const auto config_dir = home / ".idapro";
+    std::filesystem::create_directories(config_dir);
+    {
+        std::ofstream file(config_dir / "structor.cfg");
+        ASSERT_TRUE(file.is_open());
+        file << "hotkey=PartiallyApplied\n";
+        file << "alignment=16\n";
+        file << "z3_mode=typo\n";
+    }
+
+    {
+        ScopedHomeDirectory scoped_home(home);
+        Config::instance().mark_clean();
+        EXPECT_FALSE(Config::instance().load());
+        EXPECT_STREQ(Config::instance().hotkey(), "Shift+S");
+        EXPECT_EQ(Config::instance().alignment(), 8);
+        EXPECT_FALSE(Config::instance().is_dirty());
+    }
+    std::filesystem::remove_all(home);
+}
+
+TEST_F(ConfigTest, HighBitBooleanByteIsRejectedWithoutCtypeUndefinedBehavior) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto home = std::filesystem::temp_directory_path() /
+        ("structor-config-high-byte-" + std::to_string(nonce));
+    const auto config_dir = home / ".idapro";
+    std::filesystem::create_directories(config_dir);
+    {
+        std::ofstream file(config_dir / "structor.cfg", std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        file << "hotkey=PartiallyApplied\n";
+        file << "debug_mode=";
+        file.put(static_cast<char>(0xFF));
+        file << "\n";
+    }
+
+    {
+        ScopedHomeDirectory scoped_home(home);
+        Config::instance().mark_clean();
+        EXPECT_FALSE(Config::instance().load());
+        EXPECT_STREQ(Config::instance().hotkey(), "Shift+S");
+        EXPECT_FALSE(Config::instance().is_dirty());
+    }
+    std::filesystem::remove_all(home);
+}
+
+TEST_F(ConfigTest, FirstRunLoadPersistsDefaultsAndMarksClean) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto home = std::filesystem::temp_directory_path() /
+        ("structor-config-first-run-" + std::to_string(nonce));
+    std::filesystem::remove_all(home);
+
+    {
+        ScopedHomeDirectory scoped_home(home);
+        Config::instance().mark_clean();
+        ASSERT_FALSE(Config::instance().is_dirty());
+        EXPECT_TRUE(Config::instance().load());
+        EXPECT_FALSE(Config::instance().is_dirty());
+
+        const auto path = Config::config_path();
+        EXPECT_TRUE(std::filesystem::is_regular_file(path));
+        EXPECT_FALSE(has_config_save_temporary(path.parent_path()));
+    }
+    std::filesystem::remove_all(home);
+}
+
+TEST_F(ConfigTest, MissingFileLoadReportsCreationFailureAndRetainsDirty) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto home = std::filesystem::temp_directory_path() /
+        ("structor-config-unwritable-parent-" + std::to_string(nonce));
+    std::filesystem::create_directories(home);
+    {
+        // A regular file in place of the configuration directory makes the
+        // first-run destination structurally unwritable without relying on
+        // platform-specific permission behavior.
+        std::ofstream blocking_parent(home / ".idapro");
+        ASSERT_TRUE(blocking_parent.is_open());
+        blocking_parent << "not a directory";
+    }
+
+    {
+        ScopedHomeDirectory scoped_home(home);
+        Config::instance().mark_clean();
+        ASSERT_FALSE(Config::instance().is_dirty());
+        bool loaded = true;
+        EXPECT_NO_THROW(loaded = Config::instance().load());
+        EXPECT_FALSE(loaded);
+        EXPECT_TRUE(Config::instance().is_dirty());
+    }
+    std::filesystem::remove_all(home);
+}
+
+TEST_F(ConfigTest, FailedAtomicSavePreservesDestinationAndDirtyState) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto home = std::filesystem::temp_directory_path() /
+        ("structor-config-rename-failure-" + std::to_string(nonce));
+    const auto config_dir = home / ".idapro";
+    const auto destination = config_dir / "structor.cfg";
+    std::filesystem::create_directories(destination);
+
+    {
+        ScopedHomeDirectory scoped_home(home);
+        Config::instance().mutable_options().hotkey = "Unsaved";
+        ASSERT_TRUE(Config::instance().is_dirty());
+        bool saved = true;
+        EXPECT_NO_THROW(saved = Config::instance().save());
+        EXPECT_FALSE(saved);
+        EXPECT_TRUE(Config::instance().is_dirty());
+        EXPECT_TRUE(std::filesystem::is_directory(destination));
+        EXPECT_FALSE(has_config_save_temporary(config_dir));
+    }
+    std::filesystem::remove_all(home);
+}
+
+TEST_F(ConfigTest, SuccessfulSaveReplacesExistingFileAfterFinalization) {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto home = std::filesystem::temp_directory_path() /
+        ("structor-config-replace-success-" + std::to_string(nonce));
+    const auto config_dir = home / ".idapro";
+    const auto destination = config_dir / "structor.cfg";
+    std::filesystem::create_directories(config_dir);
+    {
+        std::ofstream stale(destination);
+        ASSERT_TRUE(stale.is_open());
+        stale << "stale=true\n";
+    }
+
+    {
+        ScopedHomeDirectory scoped_home(home);
+        SynthOptions& options = Config::instance().mutable_options();
+        options.hotkey = "Ctrl+Alt+S";
+        options.z3.detect_symbolic_arrays = false;
+        options.z3.max_array_stride = 128;
+        ASSERT_TRUE(Config::instance().is_dirty());
+        EXPECT_TRUE(Config::instance().save());
+        EXPECT_FALSE(Config::instance().is_dirty());
+        EXPECT_FALSE(has_config_save_temporary(config_dir));
+
+        std::ifstream saved(destination);
+        ASSERT_TRUE(saved.is_open());
+        const std::string contents{
+            std::istreambuf_iterator<char>(saved),
+            std::istreambuf_iterator<char>()};
+        EXPECT_NE(contents.find("hotkey=Ctrl+Alt+S"), std::string::npos);
+        EXPECT_NE(contents.find("z3_detect_symbolic_arrays=false"),
+                  std::string::npos);
+        EXPECT_NE(contents.find("z3_max_array_stride=128"),
+                  std::string::npos);
+        EXPECT_EQ(contents.find("stale=true"), std::string::npos);
+    }
+    std::filesystem::remove_all(home);
 }
 
 // ============================================================================

@@ -28,7 +28,10 @@ namespace {
     struct MixedStrideField {
         uint32_t inner_offset = 0;
         uint32_t size = 0;
-        tinfo_t type;
+        // Index of representative type evidence in UnifiedAccessPattern.
+        // Keeping only an integer makes worker-side augmentation independent
+        // of non-THREAD_SAFE tinfo_t copy/destruction operations.
+        int type_access_index = -1;
         qvector<int> access_indices;
     };
 
@@ -132,11 +135,12 @@ namespace {
             collapsed.inner_offset = field.inner_offset;
             if (collapsed.size < field.size) {
                 collapsed.size = field.size;
-                if (!field.type.empty()) {
-                    collapsed.type = field.type;
+                if (field.type_access_index >= 0) {
+                    collapsed.type_access_index = field.type_access_index;
                 }
-            } else if (collapsed.type.empty() && !field.type.empty()) {
-                collapsed.type = field.type;
+            } else if (collapsed.type_access_index < 0 &&
+                       field.type_access_index >= 0) {
+                collapsed.type_access_index = field.type_access_index;
             }
 
             auto& access_set = merged_accesses[field.inner_offset];
@@ -221,6 +225,7 @@ namespace {
 
     bool build_struct_type_from_groups(
         const qvector<MixedStrideField>& fields,
+        const UnifiedAccessPattern& pattern,
         uint32_t stride,
         tinfo_t& out_type)
     {
@@ -260,51 +265,66 @@ namespace {
 
         uint32_t cursor = 0;
 
-        auto is_function_pointer_type = [](const tinfo_t& type) {
-            if (type.empty()) {
+        const auto field_type = [&](const MixedStrideField& field)
+            -> const tinfo_t* {
+            if (field.type_access_index < 0 ||
+                static_cast<std::size_t>(field.type_access_index) >=
+                    pattern.all_accesses.size()) {
+                return nullptr;
+            }
+            const tinfo_t& type = pattern.all_accesses[
+                static_cast<std::size_t>(field.type_access_index)].inferred_type;
+            return type.empty() ? nullptr : &type;
+        };
+
+        auto is_function_pointer_type = [](const tinfo_t* type) {
+            if (type == nullptr || type->empty()) {
                 return false;
             }
-            if (type.is_func()) {
+            if (type->is_func()) {
                 return true;
             }
-            if (type.is_funcptr()) {
+            if (type->is_funcptr()) {
                 return true;
             }
-            if (!type.is_ptr()) {
+            if (!type->is_ptr()) {
                 return false;
             }
-            tinfo_t pointed = type.get_pointed_object();
+            tinfo_t pointed = type->get_pointed_object();
             return !pointed.empty() && pointed.is_func();
         };
 
         int func_field_count = 0;
         for (const auto& field : fields) {
-            if (is_function_pointer_type(field.type)) {
+            if (is_function_pointer_type(field_type(field))) {
                 ++func_field_count;
             }
         }
 
-        auto is_array_mergeable = [](const MixedStrideField& a, const MixedStrideField& b) {
+        auto is_array_mergeable = [&](const MixedStrideField& a, const MixedStrideField& b) {
             if (a.inner_offset + a.size != b.inner_offset) {
                 return false;
             }
             if (a.size != b.size) {
                 return false;
             }
-            if (a.type.empty() != b.type.empty()) {
+            const tinfo_t* a_type = field_type(a);
+            const tinfo_t* b_type = field_type(b);
+            if ((a_type == nullptr) != (b_type == nullptr)) {
                 return false;
             }
-            if (!a.type.empty()) {
-                return a.type.equals_to(b.type);
+            if (a_type != nullptr) {
+                return a_type->equals_to(*b_type);
             }
             return true;
         };
 
-        auto is_byte_field = [](const MixedStrideField& field) {
+        auto is_byte_field = [&](const MixedStrideField& field) {
             if (field.size != 1) {
                 return false;
             }
-            return field.type.empty() || field.type.get_size() == 1;
+            const tinfo_t* type = field_type(field);
+            return type == nullptr || type->get_size() == 1;
         };
 
         for (size_t i = 0; i < fields.size(); ++i) {
@@ -326,12 +346,16 @@ namespace {
 
             udm_t udm;
             udm.offset = static_cast<uint64>(merged.inner_offset) * 8;
+            const tinfo_t* merged_type = field_type(merged);
             if (merged_count > 1) {
+                tinfo_t unknown_type;
                 udm.name = make_array_field_name(merged.inner_offset,
-                                                 merged.type,
+                                                 merged_type == nullptr
+                                                     ? unknown_type
+                                                     : *merged_type,
                                                  SemanticType::Unknown,
                                                  fields[i].size);
-            } else if (is_function_pointer_type(merged.type)) {
+            } else if (is_function_pointer_type(merged_type)) {
                 if (func_field_count == 1) {
                     udm.name = "callback";
                 } else {
@@ -345,17 +369,17 @@ namespace {
 
             if (merged_count > 1) {
                 tinfo_t elem_type;
-                if (!merged.type.empty()) {
-                    elem_type = merged.type;
+                if (merged_type != nullptr) {
+                    elem_type = *merged_type;
                 } else {
                     elem_type.create_simple_type(BT_INT8 | BTMT_USIGNED);
                 }
 
                 udm.type.create_array(elem_type, merged_count);
                 udm.size = merged.size * 8;
-            } else if (!merged.type.empty()) {
-                udm.type = merged.type;
-                udm.size = merged.type.get_size() * 8;
+            } else if (merged_type != nullptr) {
+                udm.type = *merged_type;
+                udm.size = merged_type->get_size() * 8;
             } else {
                 tinfo_t byte_type;
                 byte_type.create_simple_type(BT_INT8 | BTMT_USIGNED);
@@ -451,7 +475,7 @@ namespace {
             }
 
             uint32_t inner = static_cast<uint32_t>(rel % stride);
-            if (inner + access.size > stride) {
+            if (inner > stride || access.size > stride - inner) {
                 continue;
             }
 
@@ -459,8 +483,8 @@ namespace {
             auto& field = by_inner[key];
             field.inner_offset = inner;
             field.size = access.size;
-            if (field.type.empty() && !access.inferred_type.empty()) {
-                field.type = access.inferred_type;
+            if (field.type_access_index < 0 && !access.inferred_type.empty()) {
+                field.type_access_index = static_cast<int>(i);
             }
             field.access_indices.push_back(static_cast<int>(i));
         }
@@ -543,7 +567,11 @@ namespace {
         }
 
         const sval_t array_begin = array.base_offset;
-        const sval_t array_end = array.base_offset + static_cast<sval_t>(array.total_size());
+        const auto checked_array_end = array.checked_end_offset();
+        if (!checked_array_end) {
+            return true;
+        }
+        const sval_t array_end = *checked_array_end;
         for (const auto& other : arrays) {
             if (!other.needs_element_struct || other.base_offset <= array_begin) {
                 continue;
@@ -576,7 +604,13 @@ namespace {
         algorithms::parallel_for_chunks(array.stride, 4, [&](size_t begin, size_t end) {
             for (size_t shift_index = begin; shift_index < end; ++shift_index) {
                 const uint32_t shift = static_cast<uint32_t>(shift_index);
-                const sval_t base = array.base_offset - static_cast<sval_t>(shift);
+                if (array.base_offset <
+                    std::numeric_limits<sval_t>::min() +
+                        static_cast<sval_t>(shift)) {
+                    continue;
+                }
+                const sval_t base =
+                    array.base_offset - static_cast<sval_t>(shift);
                 std::unordered_map<MixedStrideKey, MixedStrideField, MixedStrideKeyHash> groups;
 
                 for (size_t i = 0; i < pattern.all_accesses.size(); ++i) {
@@ -593,7 +627,8 @@ namespace {
                         continue;
                     }
                     uint32_t inner = static_cast<uint32_t>(rel % array.stride);
-                    if (inner + access.size > array.stride) {
+                    if (inner > array.stride ||
+                        access.size > array.stride - inner) {
                         continue;
                     }
 
@@ -601,8 +636,9 @@ namespace {
                     auto& field = groups[key];
                     field.inner_offset = inner;
                     field.size = access.size;
-                    if (field.type.empty() && !access.inferred_type.empty()) {
-                        field.type = access.inferred_type;
+                    if (field.type_access_index < 0 &&
+                        !access.inferred_type.empty()) {
+                        field.type_access_index = static_cast<int>(i);
                     }
                     field.access_indices.push_back(static_cast<int>(i));
                 }
@@ -671,21 +707,43 @@ namespace {
         }
 
         tinfo_t struct_type;
-        if (!build_struct_type_from_groups(best.fields, array.stride, struct_type)) {
+        if (!build_struct_type_from_groups(
+                best.fields, pattern, array.stride, struct_type)) {
             return;
         }
 
-        array.base_offset = best.base;
-        array.element_type = struct_type;
-        array.member_offsets.clear();
+        qvector<sval_t> augmented_offsets;
+        bool valid_offsets = true;
         for (const auto& field : best.fields) {
             for (uint32_t i = 0; i < array.element_count; ++i) {
-                array.member_offsets.push_back(best.base + field.inner_offset + i * array.stride);
+                const std::uint64_t delta =
+                    static_cast<std::uint64_t>(field.inner_offset) +
+                    static_cast<std::uint64_t>(i) * array.stride;
+                if (delta > std::numeric_limits<std::uint32_t>::max()) {
+                    valid_offsets = false;
+                    break;
+                }
+                const auto member_offset = checked_interval_end(
+                    best.base, static_cast<std::uint32_t>(delta));
+                if (!member_offset) {
+                    valid_offsets = false;
+                    break;
+                }
+                augmented_offsets.push_back(*member_offset);
             }
+            if (!valid_offsets) break;
         }
-        std::sort(array.member_offsets.begin(), array.member_offsets.end());
-        array.member_offsets.erase(std::unique(array.member_offsets.begin(), array.member_offsets.end()),
-                                   array.member_offsets.end());
+        if (!valid_offsets) {
+            return;
+        }
+        std::sort(augmented_offsets.begin(), augmented_offsets.end());
+        augmented_offsets.erase(
+            std::unique(augmented_offsets.begin(), augmented_offsets.end()),
+            augmented_offsets.end());
+
+        array.base_offset = best.base;
+        array.element_type = struct_type;
+        array.member_offsets = std::move(augmented_offsets);
     }
 
     std::optional<FieldCandidate> build_struct_array_candidate(
@@ -718,7 +776,7 @@ namespace {
                 continue;
             }
             uint32_t inner = static_cast<uint32_t>(rel % stride);
-            if (inner + access.size > stride) {
+            if (inner > stride || access.size > stride - inner) {
                 continue;
             }
 
@@ -726,8 +784,8 @@ namespace {
             auto& field = by_inner[key];
             field.inner_offset = inner;
             field.size = access.size;
-            if (field.type.empty() && !access.inferred_type.empty()) {
-                field.type = access.inferred_type;
+            if (field.type_access_index < 0 && !access.inferred_type.empty()) {
+                field.type_access_index = static_cast<int>(i);
             }
             field.access_indices.push_back(static_cast<int>(i));
         }
@@ -854,12 +912,18 @@ namespace {
         // Reject spurious "struct arrays" that only explain roughly one
         // access per element. Real arrays-of-structs should expose multiple
         // inner members across repeated elements.
-        if (used_indices.size() < effective_count * 2) {
+        if (used_indices.size() < static_cast<size_t>(effective_count) * 2) {
+            return std::nullopt;
+        }
+
+        if (stride != 0 &&
+            effective_count > std::numeric_limits<uint32_t>::max() / stride) {
             return std::nullopt;
         }
 
         tinfo_t elem_type;
-        if (!build_struct_type_from_groups(repeated, stride, elem_type)) {
+        if (!build_struct_type_from_groups(
+                repeated, pattern, stride, elem_type)) {
             return std::nullopt;
         }
 
@@ -899,8 +963,111 @@ qvector<FieldCandidate> FieldCandidateGenerator::generate(
         return candidates;
     }
 
+    if (config_.max_accesses == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Accesses, 0, pattern.all_accesses.size(),
+            "candidate_generation",
+            "configured access-evidence limit is zero");
+    }
+    if (config_.max_candidates == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Candidates, 0, 0,
+            "candidate_generation",
+            "configured field-candidate limit is zero");
+    }
+    if (config_.max_array_elements == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::ArrayElements, 0, 0,
+            "candidate_generation",
+            "configured array-inference element limit is zero");
+    }
+    if (config_.max_structure_size == 0) {
+        throw ResourceLimitException(
+            ResourceLimitKind::StructureSize, 0, 0,
+            "candidate_generation",
+            "configured structure-size limit is zero");
+    }
+    if (pattern.all_accesses.size() > config_.max_accesses) {
+        throw ResourceLimitException(
+            ResourceLimitKind::Accesses,
+            config_.max_accesses,
+            pattern.all_accesses.size(),
+            "candidate_generation",
+            "access evidence exceeds the configured synthesis limit");
+    }
+
+    sval_t evidence_origin = 0;
+    sval_t evidence_end = 0;
+    for (const auto& access : pattern.all_accesses) {
+        evidence_origin = std::min(evidence_origin, access.offset);
+        const auto end = checked_interval_end(access.offset, access.size);
+        if (!end) {
+            throw ResourceLimitException(
+                ResourceLimitKind::StructureSize,
+                config_.max_structure_size,
+                std::numeric_limits<std::uint64_t>::max(),
+                "candidate_generation",
+                "access evidence interval overflows the signed offset domain");
+        }
+        evidence_end = std::max(evidence_end, *end);
+    }
+    const auto evidence_span = checked_interval_span(
+        evidence_origin, evidence_end);
+    if (!evidence_span || *evidence_span > config_.max_structure_size) {
+        throw ResourceLimitException(
+            ResourceLimitKind::StructureSize,
+            config_.max_structure_size,
+            evidence_span.value_or(std::numeric_limits<std::uint64_t>::max()),
+            "candidate_generation",
+            "recovered object span exceeds the configured structure-size limit");
+    }
+
     // Pre-allocate: estimate ~1.5x accesses for direct + covering + arrays + padding
-    candidates.reserve(pattern.all_accesses.size() * 3 / 2 + 16);
+    const std::uint64_t estimated_candidates =
+        static_cast<std::uint64_t>(pattern.all_accesses.size()) +
+        static_cast<std::uint64_t>(pattern.all_accesses.size()) / 2 + 16;
+    const size_t reserve_count = static_cast<size_t>(std::min<std::uint64_t>(
+        config_.max_candidates, estimated_candidates));
+    candidates.reserve(reserve_count);
+
+    auto enforce_optional_budget = [&]() {
+        qvector<FieldCandidate> mandatory;
+        qvector<FieldCandidate> optional;
+        mandatory.reserve(candidates.size());
+        optional.reserve(candidates.size());
+        for (auto& candidate : candidates) {
+            if (candidate.kind == FieldCandidate::Kind::DirectAccess ||
+                candidate.kind == FieldCandidate::Kind::UnionAlternative) {
+                mandatory.push_back(std::move(candidate));
+            } else if (candidate.within_array_element_limit(
+                           config_.max_array_elements) &&
+                       candidate.meets_optional_confidence_threshold(
+                           config_.min_confidence_percent)) {
+                optional.push_back(std::move(candidate));
+            }
+        }
+
+        if (mandatory.size() > config_.max_candidates) {
+            throw ResourceLimitException(
+                ResourceLimitKind::Candidates,
+                config_.max_candidates,
+                mandatory.size(),
+                "candidate_generation",
+                "mandatory direct evidence exceeds the configured candidate limit");
+        }
+
+        finalize_candidates(optional);
+        const size_t optional_budget = config_.max_candidates - mandatory.size();
+        if (optional.size() > optional_budget) {
+            optional.resize(optional_budget);
+        }
+
+        candidates = std::move(mandatory);
+        for (auto& candidate : optional) {
+            candidates.push_back(std::move(candidate));
+        }
+        finalize_candidates(candidates);
+    };
 
     // Step 1: Generate direct access candidates
     generate_direct_candidates(pattern, candidates);
@@ -910,6 +1077,7 @@ qvector<FieldCandidate> FieldCandidateGenerator::generate(
     // Step 2: Generate covering candidates (larger fields that cover multiple accesses)
     if (config_.generate_covering_candidates) {
         generate_covering_candidates(pattern, candidates);
+        enforce_optional_budget();
         z3_log("[Structor/Z3]   Covering candidates: %zu\n", candidates.size() - direct_count);
     }
 
@@ -917,6 +1085,7 @@ qvector<FieldCandidate> FieldCandidateGenerator::generate(
     // Step 3: Generate array candidates
     if (config_.generate_array_candidates) {
         generate_array_candidates(pattern, candidates);
+        enforce_optional_budget();
         z3_log("[Structor/Z3]   Array candidates: %zu\n", candidates.size() - before_array);
     }
 
@@ -924,6 +1093,7 @@ qvector<FieldCandidate> FieldCandidateGenerator::generate(
     // Step 4: Generate padding candidates
     if (config_.generate_padding_candidates) {
         generate_padding_candidates(candidates, pattern.global_max_offset, candidates);
+        enforce_optional_budget();
         z3_log("[Structor/Z3]   Padding candidates: %zu\n", candidates.size() - before_padding);
     }
 
@@ -1022,14 +1192,18 @@ void FieldCandidateGenerator::generate_direct_candidates(
         if (!access.inferred_type.empty() &&
             (access.inferred_type.is_array() || access.inferred_type.is_struct())) {
             int covered_subaccesses = 0;
-            const sval_t access_end = access.offset + static_cast<sval_t>(access.size);
+            const auto access_end = checked_interval_end(access.offset, access.size);
+            if (!access_end) {
+                continue;
+            }
             for (size_t j = 0; j < pattern.all_accesses.size(); ++j) {
                 if (i == j) {
                     continue;
                 }
                 const auto& other = pattern.all_accesses[j];
-                const sval_t other_end = other.offset + static_cast<sval_t>(other.size);
-                if (other.offset >= access.offset && other_end <= access_end &&
+                const auto other_end = checked_interval_end(other.offset, other.size);
+                if (other_end && other.offset >= access.offset &&
+                    *other_end <= *access_end &&
                     (other.size < access.size || other.offset != access.offset)) {
                     ++covered_subaccesses;
                 }
@@ -1047,10 +1221,20 @@ void FieldCandidateGenerator::generate_direct_candidates(
                 continue;
             }
 
-            if (existing.type_category == new_cat ||
-                new_cat == TypeCategory::Unknown ||
-                existing.type_category == TypeCategory::Unknown ||
-                types_compatible(existing.type_category, new_cat)) {
+            bool compatible_evidence = true;
+            for (int source_idx : existing.source_access_indices) {
+                if (source_idx < 0 ||
+                    static_cast<size_t>(source_idx) >= pattern.all_accesses.size()) {
+                    continue;
+                }
+                if (!field_access_evidence_compatible(
+                        pattern.all_accesses[static_cast<size_t>(source_idx)], access)) {
+                    compatible_evidence = false;
+                    break;
+                }
+            }
+
+            if (compatible_evidence) {
                 existing.source_access_indices.push_back(static_cast<int>(i));
                 if (static_cast<int>(new_cat) > static_cast<int>(existing.type_category)) {
                     existing.type_category = new_cat;
@@ -1058,17 +1242,42 @@ void FieldCandidateGenerator::generate_direct_candidates(
                 if (!access.inferred_type.empty()) {
                     existing.extended_type = ctx_.type_encoder().extract_extended_info(access.inferred_type);
                 }
+                if (existing.primary_func_ea == BADADDR ||
+                    (access.source_func_ea != BADADDR &&
+                     access.source_func_ea < existing.primary_func_ea)) {
+                    existing.primary_func_ea = access.source_func_ea;
+                }
                 merged = true;
                 break;
             }
         }
 
         if (!merged) {
+            if (candidates.size() >= config_.max_candidates) {
+                throw ResourceLimitException(
+                    ResourceLimitKind::Candidates,
+                    config_.max_candidates,
+                    candidates.size() + 1,
+                    "direct_candidate_generation",
+                    "mandatory direct evidence exceeds the configured candidate limit");
+            }
             FieldCandidate candidate = create_from_access(access, static_cast<int>(i));
-            if (std::any_of(candidates.begin(), candidates.end(), [&](const FieldCandidate& existing) {
-                    return existing.offset == candidate.offset &&
-                           existing.size == candidate.size;
-                })) {
+            bool has_same_range_alternative = false;
+            for (auto& existing : candidates) {
+                if (existing.offset != candidate.offset ||
+                    existing.size != candidate.size) {
+                    continue;
+                }
+
+                // Every evidence-backed interpretation of the same storage
+                // range must participate in the union.  Marking only the
+                // newly discovered interpretation lets the solver retain the
+                // first observation as an ordinary scalar and discard the
+                // later alternative.
+                existing.kind = FieldCandidate::Kind::UnionAlternative;
+                has_same_range_alternative = true;
+            }
+            if (has_same_range_alternative) {
                 candidate.kind = FieldCandidate::Kind::UnionAlternative;
             }
             candidates.push_back(std::move(candidate));
@@ -1149,8 +1358,11 @@ void FieldCandidateGenerator::generate_array_candidates(
 {
     constexpr double kMinArrayCoverageRatio = 0.75;
 
-    ArrayDetectionConfig array_config;
-    array_config.min_elements = static_cast<int>(config_.min_array_elements);
+    const ArrayDetectionConfig array_config = make_array_detection_config(
+        config_.min_array_elements,
+        config_.max_array_elements,
+        config_.detect_symbolic_arrays,
+        config_.max_array_stride);
 
     ArrayConstraintBuilder array_builder(ctx_, array_config);
     auto arrays = array_builder.detect_arrays(pattern.all_accesses);
@@ -1170,7 +1382,17 @@ void FieldCandidateGenerator::generate_array_candidates(
 
         for (const auto& detected_array : arrays) {
             ArrayCandidate array = detected_array;
+            if (array.element_count == 0 ||
+                array.element_count > config_.max_array_elements ||
+                !array.checked_total_size() ||
+                !array.checked_end_offset()) {
+                continue;
+            }
+
             augment_struct_array_candidate(array, pattern);
+            if (!array.checked_total_size() || !array.checked_end_offset()) {
+                continue;
+            }
 
         if (array.element_count == 0) {
             continue;
@@ -1191,7 +1413,8 @@ void FieldCandidateGenerator::generate_array_candidates(
                 }
 
                 const uint32_t inner = static_cast<uint32_t>(rel % array.stride);
-                if (inner + access.size > array.stride) {
+                if (inner > array.stride ||
+                    access.size > array.stride - inner) {
                     continue;
                 }
 
@@ -1199,8 +1422,9 @@ void FieldCandidateGenerator::generate_array_candidates(
                 auto& field = raw_groups[key];
                 field.inner_offset = inner;
                 field.size = access.size;
-                if (field.type.empty() && !access.inferred_type.empty()) {
-                    field.type = access.inferred_type;
+                if (field.type_access_index < 0 &&
+                    !access.inferred_type.empty()) {
+                    field.type_access_index = static_cast<int>(i);
                 }
                 field.access_indices.push_back(static_cast<int>(i));
             }
@@ -1238,6 +1462,9 @@ void FieldCandidateGenerator::generate_array_candidates(
         if (elem_size == BADSIZE || elem_size == 0) {
             elem_size = array.stride;
         }
+        if (elem_size > std::numeric_limits<uint32_t>::max()) {
+            continue;
+        }
 
         uint32_t access_size = static_cast<uint32_t>(elem_size);
         if (array.needs_element_struct && array.inner_access_size > 0) {
@@ -1270,7 +1497,11 @@ void FieldCandidateGenerator::generate_array_candidates(
 
         FieldCandidate array_candidate;
         array_candidate.offset = array.base_offset;
-        array_candidate.size = array.total_size();
+        const auto total_size = array.checked_total_size();
+        if (!total_size || array.element_count > config_.max_array_elements) {
+            continue;
+        }
+        array_candidate.size = *total_size;
         array_candidate.kind = FieldCandidate::Kind::ArrayField;
         array_candidate.type_category = ctx_.type_encoder().categorize(array.element_type);
         array_candidate.extended_type = ctx_.type_encoder().extract_extended_info(array.element_type);
@@ -1338,15 +1569,21 @@ void FieldCandidateGenerator::generate_array_candidates(
                     continue;
                 }
 
-                uint32_t count = 1;
+                uint32_t count = 0;
                 sval_t expected = offsets_for_size[i];
                 while (std::binary_search(offsets_for_size.begin(), offsets_for_size.end(), expected)) {
                     ++count;
-                    expected += stride;
+                    const auto next = checked_interval_end(expected, stride);
+                    if (!next) {
+                        break;
+                    }
+                    expected = *next;
                 }
-                --count;
 
                 if (count >= static_cast<uint32_t>(config_.min_array_elements)) {
+                    if (count > config_.max_array_elements) {
+                        continue;
+                    }
                     auto candidate = build_struct_array_candidate(
                         ctx_, pattern, offsets_for_size[i], stride, count);
                     if (candidate.has_value() &&
@@ -1397,6 +1634,10 @@ void FieldCandidateGenerator::generate_array_candidates(
                 uint32_t count = 0;
                 while (indices.count(count) > 0) {
                     ++count;
+                }
+
+                if (count > config_.max_array_elements) {
+                    continue;
                 }
 
                 auto candidate = build_struct_array_candidate(ctx_, pattern, access.offset, stride, count);
@@ -1481,8 +1722,10 @@ void FieldCandidateGenerator::generate_array_candidates(
         }
 
         const size_t run_len = run_end - run_start;
-        const int byte_tail_min = config_.min_array_elements > 2 ? 2 : config_.min_array_elements;
-        if (run_len >= static_cast<size_t>(byte_tail_min)) {
+        const uint32_t byte_tail_min =
+            config_.min_array_elements > 2 ? 2 : config_.min_array_elements;
+        if (run_len >= static_cast<size_t>(byte_tail_min) &&
+            run_len <= config_.max_array_elements) {
             FieldCandidate byte_array;
             byte_array.offset = byte_offsets[run_start];
             byte_array.size = static_cast<uint32_t>(run_len);
@@ -1581,11 +1824,65 @@ void FieldCandidateGenerator::generate_padding_candidates(
 }
 
 void FieldCandidateGenerator::finalize_candidates(qvector<FieldCandidate>& candidates) {
-    // Sort by offset, then by size (smaller first)
+    for (auto& candidate : candidates) {
+        std::sort(candidate.source_access_indices.begin(),
+                  candidate.source_access_indices.end());
+        candidate.source_access_indices.erase(
+            std::unique(candidate.source_access_indices.begin(),
+                        candidate.source_access_indices.end()),
+            candidate.source_access_indices.end());
+    }
+
+    // Canonicalize candidate IDs after generation, including candidates
+    // emitted through array-detection hash tables.  For an equal range, retain
+    // evidence-backed candidates first, then order by the recovered type and
+    // source-function provenance before generated shape.
     std::sort(candidates.begin(), candidates.end(),
         [](const FieldCandidate& a, const FieldCandidate& b) {
             if (a.offset != b.offset) return a.offset < b.offset;
-            return a.size < b.size;
+            if (a.size != b.size) return a.size < b.size;
+
+            const bool a_has_evidence = !a.source_access_indices.empty();
+            const bool b_has_evidence = !b.source_access_indices.empty();
+            if (a_has_evidence != b_has_evidence) return a_has_evidence;
+            if (a.type_category != b.type_category) {
+                return a.type_category < b.type_category;
+            }
+            if (a.extended_type.category != b.extended_type.category) {
+                return a.extended_type.category < b.extended_type.category;
+            }
+            if (a.primary_func_ea != b.primary_func_ea) {
+                return a.primary_func_ea < b.primary_func_ea;
+            }
+            if (a.kind != b.kind) return a.kind < b.kind;
+            if (a.confidence != b.confidence) return a.confidence > b.confidence;
+            if (a.array_element_count != b.array_element_count) {
+                return a.array_element_count < b.array_element_count;
+            }
+            if (a.array_stride != b.array_stride) {
+                return a.array_stride < b.array_stride;
+            }
+            if (a.extended_type.size != b.extended_type.size) {
+                return a.extended_type.size < b.extended_type.size;
+            }
+            if (a.extended_type.pointee_category != b.extended_type.pointee_category) {
+                return a.extended_type.pointee_category < b.extended_type.pointee_category;
+            }
+            if (a.extended_type.element_category != b.extended_type.element_category) {
+                return a.extended_type.element_category < b.extended_type.element_category;
+            }
+            if (a.extended_type.element_count != b.extended_type.element_count) {
+                return a.extended_type.element_count < b.extended_type.element_count;
+            }
+            if (a.extended_type.func_arg_count != b.extended_type.func_arg_count) {
+                return a.extended_type.func_arg_count < b.extended_type.func_arg_count;
+            }
+            if (a.extended_type.udt_tid != b.extended_type.udt_tid) {
+                return a.extended_type.udt_tid < b.extended_type.udt_tid;
+            }
+            return std::lexicographical_compare(
+                a.source_access_indices.begin(), a.source_access_indices.end(),
+                b.source_access_indices.begin(), b.source_access_indices.end());
         });
 
     // Assign IDs
@@ -1652,6 +1949,7 @@ FieldCandidate FieldCandidateGenerator::create_from_access(
     candidate.kind = FieldCandidate::Kind::DirectAccess;
     candidate.type_category = infer_category(access);
     candidate.source_access_indices.push_back(access_index);
+    candidate.primary_func_ea = access.source_func_ea;
 
     // Extract extended type info if available
     if (!access.inferred_type.empty()) {
@@ -1715,8 +2013,9 @@ qvector<qvector<int>> FieldCandidateGenerator::find_array_patterns(
             }
 
             // Check if this extends current progression
-            sval_t expected_offset = candidates[current_group.back()].offset + size;
-            if (offset_idx[i].first == expected_offset) {
+            const auto expected_offset = checked_interval_end(
+                candidates[current_group.back()].offset, size);
+            if (expected_offset && offset_idx[i].first == *expected_offset) {
                 current_group.push_back(offset_idx[i].second);
             } else {
                 // Break in progression
@@ -1744,8 +2043,9 @@ bool FieldCandidateGenerator::is_arithmetic_progression(
     if (offsets.size() < 2) return true;
 
     for (size_t i = 1; i < offsets.size(); ++i) {
-        sval_t actual_stride = offsets[i] - offsets[i - 1];
-        if (actual_stride != static_cast<sval_t>(expected_stride)) {
+        const auto actual_stride = checked_interval_span(
+            offsets[i - 1], offsets[i]);
+        if (!actual_stride || *actual_stride != expected_stride) {
             return false;
         }
     }
@@ -1771,9 +2071,13 @@ OverlapAnalysis FieldCandidateGenerator::analyze_overlaps(
         intervals.reserve(n);
         
         for (size_t i = 0; i < n; ++i) {
+            const auto end = candidates[i].checked_end_offset();
+            if (!end) {
+                continue;
+            }
             intervals.emplace_back(
                 candidates[i].offset,
-                candidates[i].offset + static_cast<int64_t>(candidates[i].size),
+                *end,
                 static_cast<int32_t>(candidates[i].id)
             );
         }

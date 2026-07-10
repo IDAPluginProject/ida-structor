@@ -7,12 +7,12 @@ namespace structor {
 [[nodiscard]] int name_origin_priority(NameOrigin origin) noexcept;
 [[nodiscard]] int name_confidence_priority(NameConfidence confidence) noexcept;
 [[nodiscard]] bool is_generated_name(const qstring& name,
-                                     const NameMetadata* metadata = nullptr) noexcept;
+                                     const NameMetadata* metadata = nullptr);
 [[nodiscard]] bool is_semantic_name(const qstring& name,
-                                    const NameMetadata* metadata = nullptr) noexcept;
+                                    const NameMetadata* metadata = nullptr);
 [[nodiscard]] qstring sanitize_identifier(const qstring& raw,
                                           const char* fallback = "value");
-[[nodiscard]] bool is_placeholder_identifier(const qstring& name) noexcept;
+[[nodiscard]] bool is_placeholder_identifier(const qstring& name);
 [[nodiscard]] qstring singularize_identifier(const qstring& name);
 [[nodiscard]] qstring pluralize_identifier(const qstring& name);
 [[nodiscard]] qstring make_offset_suffix(sval_t offset);
@@ -23,6 +23,9 @@ namespace structor {
                                                const qstring& source_var,
                                                int index = 0);
 [[nodiscard]] qstring make_substruct_field_name(sval_t offset);
+[[nodiscard]] qstring make_substruct_type_name(const qstring& parent_name,
+                                               const qstring& field_name,
+                                               sval_t offset);
 [[nodiscard]] qstring make_array_field_name(sval_t offset,
                                             const tinfo_t& element_type,
                                             SemanticType semantic = SemanticType::Unknown,

@@ -47,7 +47,7 @@ namespace {
         } else {
             ftd.rettype.create_simple_type(BTF_VOID);
         }
-        ftd.set_cc(CM_CC_FASTCALL);
+        ftd.set_cc(CM_CC_UNKNOWN);
 
         if (call_expr->a) {
             for (const auto& arg : *call_expr->a) {
@@ -140,13 +140,6 @@ namespace {
             return matches;
         }
 
-        static std::unordered_map<std::string, qvector<ea_t>> cache;
-        std::string key = utils::type_to_string(funcptr_type).c_str();
-        auto it = cache.find(key);
-        if (it != cache.end()) {
-            return it->second;
-        }
-
         int target_nargs = target_func.get_nargs();
         size_t func_qty = get_func_qty();
 
@@ -181,7 +174,6 @@ namespace {
             }
         }
 
-        cache[key] = matches;
 #else
         (void)funcptr_type;
         (void)max_results;
@@ -199,13 +191,17 @@ namespace {
 
         pattern.sort_by_offset();
         pattern.min_offset = pattern.accesses.front().offset;
-        pattern.max_offset = pattern.accesses.front().offset +
-                             static_cast<sval_t>(pattern.accesses.front().size);
+        pattern.max_offset = checked_interval_end(
+            pattern.accesses.front().offset,
+            pattern.accesses.front().size).value_or(
+                std::numeric_limits<sval_t>::max());
 
         for (const auto& access : pattern.accesses) {
             pattern.min_offset = std::min(pattern.min_offset, access.offset);
-            pattern.max_offset = std::max(pattern.max_offset,
-                access.offset + static_cast<sval_t>(access.size));
+            pattern.max_offset = std::max(
+                pattern.max_offset,
+                checked_interval_end(access.offset, access.size).value_or(
+                    std::numeric_limits<sval_t>::max()));
         }
     }
 
@@ -298,17 +294,25 @@ UnifiedAccessPattern UnifiedAccessPattern::merge(
         // corresponds to original + delta + X, so normalized offset = X + delta
         for (auto& access : pattern.accesses) {
             FieldAccess normalized = access;
-            normalized.offset += delta;  // Add delta to normalize to caller's coordinate system
+            const auto normalized_offset = checked_sval_add(access.offset, delta);
+            if (!normalized_offset.has_value()) {
+                continue;
+            }
+            normalized.offset = *normalized_offset;
+            const auto normalized_end =
+                checked_interval_end(normalized.offset, normalized.size);
+            if (!normalized_end.has_value()) {
+                continue;
+            }
 
             // Update bounds
             if (first) {
                 result.global_min_offset = normalized.offset;
-                result.global_max_offset = normalized.offset + normalized.size;
+                result.global_max_offset = *normalized_end;
                 first = false;
             } else {
                 result.global_min_offset = std::min(result.global_min_offset, normalized.offset);
-                result.global_max_offset = std::max(result.global_max_offset,
-                    normalized.offset + static_cast<sval_t>(normalized.size));
+                result.global_max_offset = std::max(result.global_max_offset, *normalized_end);
             }
 
             // Check for vtable
@@ -323,12 +327,170 @@ UnifiedAccessPattern UnifiedAccessPattern::merge(
         result.per_function_patterns.push_back(std::move(pattern));
     }
 
-    // Deduplicate merged accesses by (offset, size)
+    // A caller's address-taken stack object can be coalesced with main()'s
+    // adjacent 32-bit return scratch.  Hex-Rays then exposes that scratch as a
+    // distant zero write through the same lvar (for example, v4[7] = 0 for a
+    // 24-byte object).  Recognize only this narrow, uncorroborated main-frame
+    // signature.  The scratch begins 4 bytes after the allocated object, so
+    // retain the inferred allocation boundary as padding evidence.
+    bool have_nonzero_evidence = false;
+    sval_t nonzero_min = 0;
+    sval_t nonzero_max = 0;
+    const auto is_zero_initialization_evidence = [](const FieldAccess& access) {
+        return access.is_zero_init ||
+               (access.access_type == AccessType::Write &&
+                access.observed_constants.size() == 1 &&
+                access.observed_constants.front() == 0);
+    };
+    for (const auto& access : result.all_accesses) {
+        if (is_zero_initialization_evidence(access)) {
+            continue;
+        }
+
+        const auto access_end = checked_interval_end(access.offset, access.size);
+        if (!access_end.has_value()) {
+            continue;
+        }
+        if (!have_nonzero_evidence) {
+            nonzero_min = access.offset;
+            nonzero_max = *access_end;
+            have_nonzero_evidence = true;
+        } else {
+            nonzero_min = std::min(nonzero_min, access.offset);
+            nonzero_max = std::max(nonzero_max, *access_end);
+        }
+    }
+
+    if (have_nonzero_evidence) {
+        const std::uint64_t isolation_gap =
+            std::min<std::uint64_t>(get_ptr_size(), sizeof(std::uint32_t));
+        std::optional<sval_t> inferred_tail_boundary;
+        qvector<FieldAccess> rejected_scratch_accesses;
+        qvector<FieldAccess> filtered_accesses;
+        filtered_accesses.reserve(result.all_accesses.size());
+
+        for (auto& access : result.all_accesses) {
+            bool isolated_zero_init = false;
+            qstring source_name;
+            get_func_name(&source_name, access.source_func_ea);
+            const bool from_main =
+                source_name == "main" || source_name == "_main";
+            if (from_main && access.size == sizeof(std::uint32_t) &&
+                is_zero_initialization_evidence(access)) {
+                bool independently_corroborated = false;
+                for (const auto& other : result.all_accesses) {
+                    if (&other != &access &&
+                        other.offset == access.offset &&
+                        other.size == access.size &&
+                        other.source_func_ea != access.source_func_ea) {
+                        independently_corroborated = true;
+                        break;
+                    }
+                }
+
+                if (!independently_corroborated && access.offset >= nonzero_max) {
+                    const auto distance =
+                        checked_interval_span(nonzero_max, access.offset);
+                    isolated_zero_init =
+                        distance.has_value() && *distance >= isolation_gap;
+                    if (isolated_zero_init &&
+                        access.offset >= static_cast<sval_t>(sizeof(std::uint32_t))) {
+                        const auto boundary = checked_sval_sub(
+                            access.offset,
+                            static_cast<sval_t>(sizeof(std::uint32_t)));
+                        if (boundary.has_value() && *boundary >= nonzero_max &&
+                            (!inferred_tail_boundary.has_value() ||
+                             *boundary > *inferred_tail_boundary)) {
+                            inferred_tail_boundary = *boundary;
+                        }
+                    }
+                }
+            }
+
+            if (!isolated_zero_init) {
+                filtered_accesses.push_back(std::move(access));
+            } else {
+                rejected_scratch_accesses.push_back(access);
+            }
+        }
+        result.all_accesses = std::move(filtered_accesses);
+
+        for (auto &fn_pattern : result.per_function_patterns) {
+            sval_t fn_delta = 0;
+            if (auto delta_it = result.function_deltas.find(fn_pattern.func_ea);
+                    delta_it != result.function_deltas.end()) {
+                fn_delta = delta_it->second;
+            }
+            qvector<FieldAccess> kept;
+            kept.reserve(fn_pattern.accesses.size());
+            for (auto &access : fn_pattern.accesses) {
+                const bool rejected = std::any_of(
+                    rejected_scratch_accesses.begin(),
+                    rejected_scratch_accesses.end(),
+                    [&](const FieldAccess &scratch) {
+                        return scratch.source_func_ea == access.source_func_ea &&
+                               scratch.insn_ea == access.insn_ea &&
+                               checked_sval_add(access.offset, fn_delta) ==
+                                   std::optional<sval_t>{scratch.offset} &&
+                               scratch.size == access.size;
+                    });
+                if (!rejected) {
+                    kept.push_back(std::move(access));
+                }
+            }
+            fn_pattern.accesses = std::move(kept);
+            if (!fn_pattern.accesses.empty()) {
+                fn_pattern.min_offset = fn_pattern.accesses.front().offset;
+                fn_pattern.max_offset = checked_interval_end(
+                    fn_pattern.accesses.front().offset,
+                    fn_pattern.accesses.front().size).value_or(
+                        fn_pattern.accesses.front().offset);
+                for (const auto &access : fn_pattern.accesses) {
+                    const auto access_end =
+                        checked_interval_end(access.offset, access.size);
+                    if (!access_end.has_value()) {
+                        continue;
+                    }
+                    fn_pattern.min_offset =
+                        std::min(fn_pattern.min_offset, access.offset);
+                    fn_pattern.max_offset = std::max(
+                        fn_pattern.max_offset, *access_end);
+                }
+            }
+        }
+
+        bool have_bounds = false;
+        for (const auto& access : result.all_accesses) {
+            const auto access_end = checked_interval_end(access.offset, access.size);
+            if (!access_end.has_value()) {
+                continue;
+            }
+            if (!have_bounds) {
+                result.global_min_offset = access.offset;
+                result.global_max_offset = *access_end;
+                have_bounds = true;
+            } else {
+                result.global_min_offset =
+                    std::min(result.global_min_offset, access.offset);
+                result.global_max_offset =
+                    std::max(result.global_max_offset, *access_end);
+            }
+        }
+        if (inferred_tail_boundary.has_value()) {
+            result.inferred_object_end = inferred_tail_boundary;
+            result.inferred_object_end_source =
+                rejected_scratch_accesses.empty()
+                    ? BADADDR
+                    : rejected_scratch_accesses.front().source_func_ea;
+            result.global_max_offset =
+                std::max(result.global_max_offset, *inferred_tail_boundary);
+        }
+    }
+
+    // Deduplicate only compatible equal-range observations. Materially
+    // different storage views remain independent union alternatives.
     std::sort(result.all_accesses.begin(), result.all_accesses.end(),
-        [](const FieldAccess& a, const FieldAccess& b) {
-            if (a.offset != b.offset) return a.offset < b.offset;
-            return a.size < b.size;
-        });
+              canonical_field_access_less);
 
     qvector<FieldAccess> deduped;
     deduped.reserve(result.all_accesses.size());
@@ -336,45 +498,12 @@ UnifiedAccessPattern UnifiedAccessPattern::merge(
     for (auto& access : result.all_accesses) {
         bool found = false;
         for (auto& existing : deduped) {
-            if (existing.offset == access.offset && existing.size == access.size) {
-                // Merge: prefer more specific type
-                if (semantic_priority(access.semantic_type) > semantic_priority(existing.semantic_type)) {
-                    existing.semantic_type = access.semantic_type;
-                }
-                if (!access.inferred_type.empty()) {
-                    existing.inferred_type = resolve_type_conflict(existing.inferred_type, access.inferred_type);
-                }
-                if (access.is_vtable_access) {
-                    existing.is_vtable_access = true;
-                    existing.vtable_slot = access.vtable_slot;
-                }
-                if (!access.bitfields.empty()) {
-                    for (const auto& bf : access.bitfields) {
-                        existing.add_bitfield(bf);
-                    }
-                }
-
-                if (access.array_stride_hint.has_value()) {
-                    if (!existing.array_stride_hint.has_value()) {
-                        existing.array_stride_hint = access.array_stride_hint;
-                    } else if (*existing.array_stride_hint != *access.array_stride_hint) {
-                        existing.array_stride_hint.reset();
-                    }
-                }
-
-                existing.is_call_argument = existing.is_call_argument || access.is_call_argument;
-
-                if (access.base_indirection.has_value()) {
-                    if (!existing.base_indirection.has_value()) {
-                        existing.base_indirection = access.base_indirection;
-                    } else if (*existing.base_indirection != *access.base_indirection) {
-                        existing.base_indirection.reset();
-                    }
-                }
-
+            if (existing.offset == access.offset &&
+                existing.size == access.size &&
+                field_access_evidence_compatible(existing, access)) {
+                merge_field_access_evidence(existing, access);
                 found = true;
                 break;
-
             }
         }
         if (!found) {
@@ -404,7 +533,14 @@ std::size_t UnifiedAccessPattern::unique_access_locations() const {
 
 namespace {
 
-[[nodiscard]] static sval_t scale_pointer_delta(const cexpr_t* pointer_expr, sval_t value) {
+[[nodiscard]] static std::optional<sval_t> scale_pointer_delta(
+    const cexpr_t* pointer_expr,
+    std::uint64_t raw_value) noexcept
+{
+    const auto value = checked_sval_from_u64(raw_value);
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
     if (!pointer_expr || !pointer_expr->type.is_ptr()) {
         return value;
     }
@@ -418,8 +554,41 @@ namespace {
     if (elem_size == BADSIZE || elem_size == 0) {
         return value;
     }
+    const auto signed_elem_size = checked_sval_from_u64(elem_size);
+    if (!signed_elem_size.has_value()) {
+        return std::nullopt;
+    }
+    return checked_sval_mul(*value, *signed_elem_size);
+}
 
-    return value * static_cast<sval_t>(elem_size);
+[[nodiscard]] static bool accumulate_delta(
+    sval_t& destination,
+    const std::optional<sval_t>& increment) noexcept
+{
+    if (!increment.has_value()) {
+        return false;
+    }
+    const auto sum = checked_sval_add(destination, *increment);
+    if (!sum.has_value()) {
+        return false;
+    }
+    destination = *sum;
+    return true;
+}
+
+[[nodiscard]] static bool subtract_delta(
+    sval_t& destination,
+    const std::optional<sval_t>& decrement) noexcept
+{
+    if (!decrement.has_value()) {
+        return false;
+    }
+    const auto difference = checked_sval_sub(destination, *decrement);
+    if (!difference.has_value()) {
+        return false;
+    }
+    destination = *difference;
+    return true;
 }
 
 } // namespace
@@ -441,23 +610,35 @@ int ArgDeltaExtractor::visit_expr(cexpr_t* e) {
     // Check for ptr + const pattern
     if (e->op == cot_add) {
         if (is_target_var(e->x) && e->y && e->y->op == cot_num) {
-            found_ = true;
-            delta_ = scale_pointer_delta(e->x, static_cast<sval_t>(e->y->numval()));
-            return 1;
+            const auto delta = scale_pointer_delta(e->x, e->y->numval());
+            if (delta.has_value()) {
+                found_ = true;
+                delta_ = *delta;
+                return 1;
+            }
         }
         if (is_target_var(e->y) && e->x && e->x->op == cot_num) {
-            found_ = true;
-            delta_ = scale_pointer_delta(e->y, static_cast<sval_t>(e->x->numval()));
-            return 1;
+            const auto delta = scale_pointer_delta(e->y, e->x->numval());
+            if (delta.has_value()) {
+                found_ = true;
+                delta_ = *delta;
+                return 1;
+            }
         }
     }
 
     // Check for ptr - const pattern (negative delta)
     if (e->op == cot_sub) {
         if (is_target_var(e->x) && e->y && e->y->op == cot_num) {
-            found_ = true;
-            delta_ = -scale_pointer_delta(e->x, static_cast<sval_t>(e->y->numval()));
-            return 1;
+            const auto scaled = scale_pointer_delta(e->x, e->y->numval());
+            if (scaled.has_value()) {
+                const auto delta = checked_sval_sub(0, *scaled);
+                if (delta.has_value()) {
+                    found_ = true;
+                    delta_ = *delta;
+                    return 1;
+                }
+            }
         }
     }
 
@@ -589,7 +770,7 @@ bool CallSiteFinder::resolve_var_delta(const cexpr_t* expr, int& var_idx, sval_t
             auto it = aliases_.find(expr->v.idx);
             if (it != aliases_.end()) {
                 var_idx = it->second.first;
-                delta += it->second.second;
+                return accumulate_delta(delta, it->second.second);
             } else {
                 var_idx = expr->v.idx;
             }
@@ -601,25 +782,24 @@ bool CallSiteFinder::resolve_var_delta(const cexpr_t* expr, int& var_idx, sval_t
             return resolve_var_delta(expr->x, var_idx, delta);
         case cot_add:
             if (expr->y && expr->y->op == cot_num && resolve_var_delta(expr->x, var_idx, delta)) {
-                delta += scale_pointer_delta(expr->x, static_cast<sval_t>(expr->y->numval()));
-                return true;
+                return accumulate_delta(
+                    delta, scale_pointer_delta(expr->x, expr->y->numval()));
             }
             if (expr->x && expr->x->op == cot_num && resolve_var_delta(expr->y, var_idx, delta)) {
-                delta += scale_pointer_delta(expr->y, static_cast<sval_t>(expr->x->numval()));
-                return true;
+                return accumulate_delta(
+                    delta, scale_pointer_delta(expr->y, expr->x->numval()));
             }
             return false;
         case cot_sub:
             if (expr->y && expr->y->op == cot_num && resolve_var_delta(expr->x, var_idx, delta)) {
-                delta -= scale_pointer_delta(expr->x, static_cast<sval_t>(expr->y->numval()));
-                return true;
+                return subtract_delta(
+                    delta, scale_pointer_delta(expr->x, expr->y->numval()));
             }
             return false;
         case cot_memptr:
         case cot_memref:
             if (resolve_var_delta(expr->x, var_idx, delta)) {
-                delta += expr->m;
-                return true;
+                return accumulate_delta(delta, expr->m);
             }
             return false;
         default:
@@ -742,7 +922,7 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<Caller
                     auto it = aliases.find(expr->v.idx);
                     if (it != aliases.end()) {
                         var_idx = it->second.first;
-                        delta += it->second.second;
+                        return accumulate_delta(delta, it->second.second);
                     } else {
                         var_idx = expr->v.idx;
                     }
@@ -754,26 +934,25 @@ void CallerFinder::process_caller(ea_t caller_ea, ea_t call_site, qvector<Caller
                     return resolve_var_delta(expr->x, var_idx, delta);
                 case cot_add: {
                     if (expr->y && expr->y->op == cot_num && resolve_var_delta(expr->x, var_idx, delta)) {
-                        delta += scale_pointer_delta(expr->x, static_cast<sval_t>(expr->y->numval()));
-                        return true;
+                        return accumulate_delta(
+                            delta, scale_pointer_delta(expr->x, expr->y->numval()));
                     }
                     if (expr->x && expr->x->op == cot_num && resolve_var_delta(expr->y, var_idx, delta)) {
-                        delta += scale_pointer_delta(expr->y, static_cast<sval_t>(expr->x->numval()));
-                        return true;
+                        return accumulate_delta(
+                            delta, scale_pointer_delta(expr->y, expr->x->numval()));
                     }
                     return false;
                 }
                 case cot_sub:
                     if (expr->y && expr->y->op == cot_num && resolve_var_delta(expr->x, var_idx, delta)) {
-                        delta -= scale_pointer_delta(expr->x, static_cast<sval_t>(expr->y->numval()));
-                        return true;
+                        return subtract_delta(
+                            delta, scale_pointer_delta(expr->x, expr->y->numval()));
                     }
                     return false;
                 case cot_memptr:
                 case cot_memref:
                     if (resolve_var_delta(expr->x, var_idx, delta)) {
-                        delta += expr->m;
-                        return true;
+                        return accumulate_delta(delta, expr->m);
                     }
                     return false;
                 default:
@@ -1050,10 +1229,14 @@ void CrossFunctionAnalyzer::trace_forward(
             }
 
             // Calculate cumulative delta
-            sval_t cumulative_delta = current_delta + arg_delta;
+            const auto cumulative_delta =
+                checked_sval_add(current_delta, arg_delta);
+            if (!cumulative_delta.has_value()) {
+                continue;
+            }
 
             // Add to equivalence class
-            add_variable(callee_ea, param_idx, cumulative_delta);
+            add_variable(callee_ea, param_idx, *cumulative_delta);
 
             // Record flow edge
             add_flow_edge(edge);
@@ -1071,7 +1254,9 @@ void CrossFunctionAnalyzer::trace_forward(
             }
 
             // Recurse
-            trace_forward(callee_ea, param_idx, cumulative_delta, current_depth + 1, synth_opts);
+            trace_forward(
+                callee_ea, param_idx, *cumulative_delta,
+                current_depth + 1, synth_opts);
         }
     }
 
@@ -1089,8 +1274,12 @@ void CrossFunctionAnalyzer::trace_forward(
             FunctionVariable fv(callee_ea, return_var_idx, 0);
             if (visited_.count(fv)) continue;
 
-            sval_t cumulative_delta = current_delta - return_delta;
-            add_variable(callee_ea, return_var_idx, cumulative_delta);
+            const auto cumulative_delta =
+                checked_sval_sub(current_delta, return_delta);
+            if (!cumulative_delta.has_value()) {
+                continue;
+            }
+            add_variable(callee_ea, return_var_idx, *cumulative_delta);
 
             PointerFlowEdge edge;
             edge.caller_ea = func_ea;
@@ -1106,7 +1295,9 @@ void CrossFunctionAnalyzer::trace_forward(
                 collected_patterns_.push_back(std::move(pattern));
             }
 
-            trace_forward(callee_ea, return_var_idx, cumulative_delta, current_depth + 1, synth_opts);
+            trace_forward(
+                callee_ea, return_var_idx, *cumulative_delta,
+                current_depth + 1, synth_opts);
         }
     }
 }
@@ -1140,7 +1331,8 @@ void CrossFunctionAnalyzer::trace_backward(
         if (return_delta != 0) {
             FunctionVariable current_fv(func_ea, var_idx, 0);
             if (deltas_.count(current_fv)) {
-                deltas_[current_fv] -= return_delta;
+                auto& current_delta = deltas_[current_fv];
+                (void)subtract_delta(current_delta, return_delta);
             }
         }
 
@@ -1239,7 +1431,8 @@ void CrossFunctionAnalyzer::trace_backward(
         if (call.delta != 0) {
             FunctionVariable current_fv(func_ea, var_idx, 0);
             if (deltas_.count(current_fv)) {
-                deltas_[current_fv] += call.delta;
+                auto& current_delta = deltas_[current_fv];
+                (void)accumulate_delta(current_delta, call.delta);
             }
         }
 

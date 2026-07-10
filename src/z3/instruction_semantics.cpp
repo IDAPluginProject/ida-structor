@@ -423,7 +423,7 @@ void InstructionSemanticsExtractor::extract_from_ptr_deref(
     
     // Size constraint from access
     uint32_t access_size = static_cast<uint32_t>(expr->type.get_size());
-    if (access_size > 0 && access_size != BADSIZE) {
+    if (access_size > 0) {
         constraints.push_back(
             TypeConstraint::make_has_size(deref_type, access_size, expr->ea)
                 .describe("dereference size")
@@ -1124,15 +1124,6 @@ bool PointerIntegerDiscriminator::compared_against_small_const(
             }
         }
     }
-    return false;
-}
-
-bool PointerIntegerDiscriminator::from_allocation(
-    TypeVariable var,
-    cfunc_t* cfunc) const
-{
-    // Would need to trace data flow to allocation calls
-    // This is a placeholder for the full implementation
     return false;
 }
 

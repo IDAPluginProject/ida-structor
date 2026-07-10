@@ -21,8 +21,7 @@
         "propagated_to": [
           "_access_nested",
           "_main",
-          "_modify_array",
-          "_printf"
+          "_modify_array"
         ],
         "failed_sites": [],
         "z3": {
@@ -30,10 +29,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_access_nested",
           "size": 40,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "_access_nested",
           "source_var": "a1",
           "field_count": 4,
@@ -41,36 +42,62 @@
           "provenance": [],
           "fields": [
             {
-              "name": "ptr_0",
+              "name": "union_0",
               "offset": 0,
               "size": 8,
-              "semantic": "ptr",
-              "type": "void *",
+              "semantic": "unknown",
+              "type": "unsigned __int64",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u64_0",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "unsigned __int64"
+                },
+                {
+                  "name": "ptr_0",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "void *"
+                }
+              ]
             },
             {
-              "name": "ptr_8",
+              "name": "union_8",
               "offset": 8,
               "size": 8,
-              "semantic": "ptr",
-              "type": "void *",
+              "semantic": "unknown",
+              "type": "unsigned __int64",
               "confidence": "medium",
               "is_padding": false,
               "is_array": false,
               "array_count": 1,
-              "is_union_candidate": false,
+              "is_union_candidate": true,
               "is_bitfield": false,
               "bit_offset": 0,
               "bit_size": 0,
-              "union_members": []
+              "union_members": [
+                {
+                  "name": "u64_8",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "unsigned __int64"
+                },
+                {
+                  "name": "ptr_8",
+                  "offset": 0,
+                  "size": 8,
+                  "type": "void *"
+                }
+              ]
             },
             {
               "name": "u32s_10",
@@ -108,7 +135,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> access_nested\n__int64 __fastcall access_nested(auto_access_nested *a1) {\n    return printf(\n               a1: \"inner=%p, data=%p, array=[%d,%d,%d,%d], flags=%lx\\n\",\n               a1->ptr_0,\n               a1->ptr_8,\n               a1->u32s_10[0],\n               a1->u32s_10[1],\n               a1->u32s_10[2],\n               a1->u32s_10[3],\n               a1->u64_20);\n}\n<<<\n\n>>> modify_array\nauto_access_nested *__fastcall modify_array(auto_access_nested *result, int a2, unsigned __int32 a3) {\n    result->u32s_10[a2] = a3;\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> access_nested\n__int64 __fastcall access_nested(auto_access_nested *a1) {\n    return printf(\n               a1: \"inner=%p, data=%p, array=[%d,%d,%d,%d], flags=%lx\\n\",\n               a1->union_0.ptr_0,\n               a1->union_8.ptr_8,\n               a1->u32s_10[0],\n               a1->u32s_10[1],\n               a1->u32s_10[2],\n               a1->u32s_10[3],\n               a1->u64_20);\n}\n<<<\n\n>>> modify_array\nauto_access_nested *__fastcall modify_array(auto_access_nested *result, int a2, unsigned __int32 a3) {\n    result->u32s_10[a2] = a3;\n    return result;\n}\n<<<\n"
     }
   ]
 }

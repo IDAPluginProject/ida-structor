@@ -2,6 +2,7 @@
 /// @brief Unit tests for synth_types.hpp
 
 #include <gtest/gtest.h>
+#include <array>
 #include "mock_ida.hpp"
 
 // Override includes to use mocks
@@ -63,6 +64,33 @@ TEST_F(SynthTypesTest, FieldAccessComparison) {
     EXPECT_FALSE(b < a);
 }
 
+TEST_F(SynthTypesTest, VTableSlotOffsetsRejectTruncation) {
+    FieldAccess access;
+    tinfo_t slot_type;
+
+    EXPECT_TRUE(access.set_vtable_nested_access(0, 0, slot_type));
+    EXPECT_TRUE(access.is_vtable_access);
+    EXPECT_EQ(access.vtable_slot, 0);
+
+    EXPECT_TRUE(access.set_vtable_nested_access(
+        0, inf_is_64bit() ? 16 : 8, slot_type));
+    EXPECT_EQ(access.vtable_slot, 2);
+
+    EXPECT_FALSE(access.set_vtable_nested_access(0, -1, slot_type));
+    EXPECT_FALSE(access.is_vtable_access);
+    EXPECT_EQ(access.vtable_slot, -1);
+    EXPECT_FALSE(access.nested_info.has_value());
+
+    EXPECT_FALSE(access.set_vtable_nested_access(0, 3, slot_type));
+    EXPECT_FALSE(access.is_vtable_access);
+    EXPECT_EQ(access.vtable_slot, -1);
+
+    const sval_t pointer_size = inf_is_64bit() ? 8 : 4;
+    EXPECT_FALSE(access.set_vtable_nested_access(
+        0, static_cast<sval_t>(MAX_VTABLE_SLOTS) * pointer_size, slot_type));
+    EXPECT_FALSE(access.is_vtable_access);
+}
+
 TEST_F(SynthTypesTest, FieldAccessOverlap) {
     FieldAccess a, b, c;
 
@@ -79,6 +107,91 @@ TEST_F(SynthTypesTest, FieldAccessOverlap) {
     EXPECT_TRUE(b.overlaps(a));
     EXPECT_FALSE(a.overlaps(c));
     EXPECT_FALSE(c.overlaps(a));
+}
+
+TEST_F(SynthTypesTest, CheckedIntervalsRejectOverflowAndEmptyOverlap) {
+    constexpr sval_t max = std::numeric_limits<sval_t>::max();
+    constexpr sval_t min = std::numeric_limits<sval_t>::min();
+
+    EXPECT_EQ(checked_interval_end(max - 3, 3), std::optional<sval_t>(max));
+    EXPECT_FALSE(checked_interval_end(max - 3, 4).has_value());
+    EXPECT_EQ(checked_interval_span(min, max),
+              std::optional<std::uint64_t>(
+                  std::numeric_limits<std::uint64_t>::max()));
+
+    FieldAccess invalid;
+    invalid.offset = max;
+    invalid.size = 1;
+    FieldAccess valid;
+    valid.offset = max - 1;
+    valid.size = 1;
+    EXPECT_FALSE(invalid.overlaps(valid));
+    EXPECT_FALSE(valid.overlaps(invalid));
+
+    FieldAccess empty;
+    empty.offset = 0;
+    empty.size = 0;
+    valid.offset = 0;
+    valid.size = 1;
+    EXPECT_FALSE(empty.overlaps(valid));
+    EXPECT_FALSE(valid.overlaps(empty));
+}
+
+TEST_F(SynthTypesTest, CheckedU32ProductCoversArraySizeBoundary) {
+    EXPECT_EQ(checked_u32_product(4096, 1024),
+              std::optional<std::uint32_t>(4194304));
+    EXPECT_EQ(checked_u32_product(std::numeric_limits<std::uint32_t>::max(), 1),
+              std::optional<std::uint32_t>(
+                  std::numeric_limits<std::uint32_t>::max()));
+    EXPECT_FALSE(checked_u32_product(
+        std::numeric_limits<std::uint32_t>::max(), 2).has_value());
+}
+
+TEST_F(SynthTypesTest, CheckedSignedOffsetArithmeticRejectsEveryBoundaryOverflow) {
+    constexpr sval_t min = std::numeric_limits<sval_t>::min();
+    constexpr sval_t max = std::numeric_limits<sval_t>::max();
+
+    EXPECT_EQ(checked_sval_add(max - 1, 1), std::optional<sval_t>(max));
+    EXPECT_FALSE(checked_sval_add(max, 1).has_value());
+    EXPECT_EQ(checked_sval_add(min + 1, -1), std::optional<sval_t>(min));
+    EXPECT_FALSE(checked_sval_add(min, -1).has_value());
+
+    EXPECT_EQ(checked_sval_sub(min + 1, 1), std::optional<sval_t>(min));
+    EXPECT_FALSE(checked_sval_sub(min, 1).has_value());
+    EXPECT_EQ(checked_sval_sub(max - 1, -1), std::optional<sval_t>(max));
+    EXPECT_FALSE(checked_sval_sub(max, -1).has_value());
+
+    EXPECT_EQ(checked_sval_mul(max / 2, 2),
+              std::optional<sval_t>((max / 2) * 2));
+    EXPECT_FALSE(checked_sval_mul(max, 2).has_value());
+    EXPECT_EQ(checked_sval_mul(min, 1), std::optional<sval_t>(min));
+    EXPECT_FALSE(checked_sval_mul(min, -1).has_value());
+    EXPECT_FALSE(checked_sval_from_u64(
+        static_cast<std::uint64_t>(max) + 1).has_value());
+}
+
+TEST_F(SynthTypesTest, AccessPatternSaturatesOverflowingEndForPreflightRejection) {
+    AccessPattern pattern;
+    FieldAccess invalid;
+    invalid.offset = std::numeric_limits<sval_t>::max();
+    invalid.size = 1;
+    pattern.add_access(std::move(invalid));
+
+    EXPECT_EQ(pattern.access_count(), 1u);
+    EXPECT_EQ(pattern.min_offset, std::numeric_limits<sval_t>::max());
+    EXPECT_EQ(pattern.max_offset, std::numeric_limits<sval_t>::max());
+    EXPECT_FALSE(checked_interval_end(
+        pattern.accesses.front().offset,
+        pattern.accesses.front().size).has_value());
+}
+
+TEST_F(SynthTypesTest, AlignOffsetSaturatesOverflowAndRejectsInvalidBoundary) {
+    EXPECT_EQ(align_offset(9, 8), 16);
+    EXPECT_EQ(align_offset(9, 0), std::numeric_limits<sval_t>::max());
+    EXPECT_EQ(align_offset(9, 3), std::numeric_limits<sval_t>::max());
+    EXPECT_EQ(
+        align_offset(std::numeric_limits<sval_t>::max(), 8),
+        std::numeric_limits<sval_t>::max());
 }
 
 // ============================================================================
@@ -212,6 +325,71 @@ TEST_F(SynthTypesTest, AlignOffset) {
     EXPECT_EQ(align_offset(8, 8), 8);
 }
 
+TEST_F(SynthTypesTest, CanonicalPackingSelectsLargestCompatibleCap) {
+    constexpr std::array<std::uint32_t, 5> options{1, 2, 4, 8, 16};
+
+    const std::array naturally_aligned{
+        PackingAlignmentRequirement{0, 4},
+        PackingAlignmentRequirement{8, 8},
+    };
+    EXPECT_EQ(canonical_packing_cap(naturally_aligned, options, 8), 8u);
+
+    const std::array packed_four{
+        PackingAlignmentRequirement{0, 4},
+        PackingAlignmentRequirement{4, 8},
+    };
+    EXPECT_EQ(canonical_packing_cap(packed_four, options, 8), 4u);
+
+    const std::array packed_two{
+        PackingAlignmentRequirement{0, 1},
+        PackingAlignmentRequirement{2, 8},
+    };
+    EXPECT_EQ(canonical_packing_cap(packed_two, options, 8), 2u);
+
+    const std::array packed_one{
+        PackingAlignmentRequirement{0, 1},
+        PackingAlignmentRequirement{3, 4},
+    };
+    EXPECT_EQ(canonical_packing_cap(packed_one, options, 8), 1u);
+}
+
+TEST_F(SynthTypesTest, CanonicalPackingIsPermutationInvariant) {
+    const std::array requirements{
+        PackingAlignmentRequirement{0, 4},
+        PackingAlignmentRequirement{4, 8},
+        PackingAlignmentRequirement{12, 4},
+    };
+    constexpr std::array<std::uint32_t, 7> options_a{1, 8, 4, 2, 16, 4, 3};
+    constexpr std::array<std::uint32_t, 7> options_b{3, 4, 16, 2, 4, 8, 1};
+
+    EXPECT_EQ(canonical_packing_cap(requirements, options_a, 8), 4u);
+    EXPECT_EQ(canonical_packing_cap(requirements, options_b, 8), 4u);
+}
+
+TEST_F(SynthTypesTest, CanonicalPackingHandlesNegativeOffsetsAndEffectiveAlignment) {
+    const std::array requirements{
+        PackingAlignmentRequirement{-4, 8},
+        PackingAlignmentRequirement{4, 4},
+    };
+    constexpr std::array<std::uint32_t, 4> options{1, 2, 4, 8};
+
+    const auto packing = canonical_packing_cap(requirements, options, 8);
+    ASSERT_EQ(packing, 4u);
+    EXPECT_EQ(effective_alignment_for_packing(requirements, *packing), 4u);
+}
+
+TEST_F(SynthTypesTest, CanonicalPackingDistinguishesPackingFromEffectiveAlignment) {
+    const std::array character_only{PackingAlignmentRequirement{0, 1}};
+    constexpr std::array<std::uint32_t, 4> options{8, 4, 2, 1};
+
+    const auto packing = canonical_packing_cap(character_only, options, 8);
+    ASSERT_EQ(packing, 8u);
+    EXPECT_EQ(effective_alignment_for_packing(character_only, *packing), 1u);
+
+    constexpr std::array<std::uint32_t, 2> invalid_options{0, 3};
+    EXPECT_FALSE(canonical_packing_cap(character_only, invalid_options, 8).has_value());
+}
+
 TEST_F(SynthTypesTest, GenerateStructName) {
     qstring name = generate_struct_name(0x401000, 0);
     EXPECT_TRUE(strstr(name.c_str(), "auto_") == name.c_str());
@@ -237,6 +415,10 @@ TEST_F(SynthTypesTest, ArrayAndSubobjectFallbackNames) {
     float_type.create_simple_type(BTF_FLOAT);
 
     EXPECT_STREQ(make_substruct_field_name(0x18).c_str(), "part_18");
+    EXPECT_STREQ(make_substruct_type_name("auto_root", "part_48", 0x48).c_str(),
+                 "auto_root_part_48");
+    EXPECT_STREQ(make_substruct_type_name(qstring(), qstring(), 0x48).c_str(),
+                 "auto_part_48");
     EXPECT_STREQ(make_array_field_name(0x10, empty_type, SemanticType::Unknown, 4).c_str(), "u32s_10");
     EXPECT_STREQ(make_array_field_name(0x28, float_type, SemanticType::Double, 4).c_str(), "f32s_28");
     EXPECT_STREQ(make_array_element_type_name("auto_anchor", "entries_10", 0x10).c_str(),

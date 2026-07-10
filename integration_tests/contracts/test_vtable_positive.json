@@ -21,8 +21,7 @@
         "propagated_to": [
           "__Z18call_vtable_directPv",
           "__Z19call_multiple_slotsPvi",
-          "_main",
-          "_printf"
+          "_main"
         ],
         "failed_sites": [],
         "z3": {
@@ -30,10 +29,12 @@
           "used_z3": true,
           "used_fallback": false
         },
+        "resource_limit": null,
         "structure": {
           "name": "auto_z18call_vtable_directpv",
           "size": 32,
-          "alignment": 1,
+          "alignment": 8,
+          "packing": null,
           "source_func_name": "__Z18call_vtable_directPv",
           "source_var": "a1",
           "field_count": 5,
@@ -130,7 +131,7 @@
                 "offset": 0,
                 "name": "slot_0",
                 "signature_hint": "",
-                "type": "void (*)()"
+                "type": "void (__fastcall *)(const void **)"
               },
               {
                 "index": 1,
@@ -144,7 +145,7 @@
                 "offset": 16,
                 "name": "slot_2",
                 "signature_hint": "",
-                "type": "int (__fastcall *)(_QWORD *a1, unsigned int a2)"
+                "type": "__int64 (__fastcall *)(_QWORD *, _QWORD)"
               },
               {
                 "index": 3,
@@ -157,7 +158,7 @@
           }
         }
       },
-      "golden_pseudocode": ">>> __Z18call_vtable_directPv\n__int64 __fastcall call_vtable_direct(auto_z18call_vtable_directpv *a1) {\n    ((void (__fastcall *)(auto_z18call_vtable_directpv *))a1->vtable->slot_0)(a1);\n    ((void (__fastcall *)(auto_z18call_vtable_directpv *))a1->vtable->slot_1)(a1);\n    printf(a1: \"data: %d\\n\", a1->u32_8);\n    printf(a1: \"data2: %d\\n\", a1->u32_C);\n    return printf(a1: \"ptr: %p\\n\", a1->ptr_10);\n}\n<<<\n\n>>> __Z19call_multiple_slotsPvi\nunsigned __int64 __fastcall call_multiple_slots(auto_z18call_vtable_directpv *a1, unsigned int a2) {\n    int v3; // [xsp+24h] [xbp-1Ch]\n\n    v3 = a1->vtable->slot_2((_QWORD *)a1, a2);\n    return a1->u64_18\n           + (int)(v3 + ((__int64 (__fastcall *)(auto_z18call_vtable_directpv *, _QWORD))a1->vtable->slot_3)(a1, a2: 2 * a2));\n}\n<<<\n"
+      "golden_pseudocode": ">>> __Z18call_vtable_directPv\n__int64 __fastcall call_vtable_direct(auto_z18call_vtable_directpv *a1) {\n    a1->vtable->slot_0(a1: (const void **)&a1->vtable);\n    ((void (__fastcall *)(auto_z18call_vtable_directpv *))a1->vtable->slot_1)(a1);\n    printf(a1: \"data: %d\\n\", a1->u32_8);\n    printf(a1: \"data2: %d\\n\", a1->u32_C);\n    return printf(a1: \"ptr: %p\\n\", a1->ptr_10);\n}\n<<<\n\n>>> __Z19call_multiple_slotsPvi\nunsigned __int64 __fastcall call_multiple_slots(auto_z18call_vtable_directpv *a1, unsigned int a2) {\n    int v3; // [xsp+24h] [xbp-1Ch]\n\n    v3 = a1->vtable->slot_2((_QWORD *)a1, a2);\n    return a1->u64_18\n           + (int)(v3 + ((__int64 (__fastcall *)(auto_z18call_vtable_directpv *, _QWORD))a1->vtable->slot_3)(a1, a2: 2 * a2));\n}\n<<<\n"
     }
   ]
 }

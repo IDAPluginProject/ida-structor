@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ from pathlib import Path
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+COMMAND_TIMEOUT_SECONDS = 300
 
 
 def strip_ansi(text: str) -> str:
@@ -27,7 +29,14 @@ def hr(char: str = "-", width: int = 78) -> str:
 
 
 def run(cmd, *, cwd=None, env=None):
-    return subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
 
 
 def expand_function_filters(function_names: list[str]) -> list[str]:
@@ -139,6 +148,7 @@ def run_idump(
     run_dir = Path(tempfile.mkdtemp(prefix="structor-vtable-binary."))
     sandbox_binary = run_dir / binary.name
     shutil.copy2(binary, sandbox_binary)
+    result_path = sandbox_home / "structor_last_result.json"
 
     try:
         log(f"Fixture binary: {binary.name}")
@@ -147,6 +157,7 @@ def run_idump(
         env = os.environ.copy()
         env["HOME"] = str(sandbox_home)
         env["STRUCTOR_AUTO_SYNTH"] = auto_synth
+        env["STRUCTOR_EXPORT_LAST_RESULT"] = str(result_path)
 
         proc = run(
             [
@@ -162,7 +173,18 @@ def run_idump(
             env=env,
         )
         require_success(proc, f"running idump for {binary.name}")
-        return strip_ansi((proc.stdout or "") + (proc.stderr or ""))
+        output = strip_ansi((proc.stdout or "") + (proc.stderr or ""))
+        if not result_path.exists():
+            raise RuntimeError(
+                f"missing exported synthesis result for {binary.name}\n{output}"
+            )
+        raw_result = json.loads(result_path.read_text(encoding="utf-8"))
+        if raw_result.get("success") is not True:
+            raise RuntimeError(
+                f"vtable synthesis reported failure: "
+                f"{raw_result.get('error_message')!r}\n{output}"
+            )
+        return output
     finally:
         shutil.rmtree(sandbox_home, ignore_errors=True)
         shutil.rmtree(run_dir, ignore_errors=True)

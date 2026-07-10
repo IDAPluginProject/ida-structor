@@ -1,6 +1,7 @@
 #include "structor/z3/type_inference_engine.hpp"
 #include <algorithm>
 #include <chrono>
+#include <stdexcept>
 
 #ifndef STRUCTOR_TESTING
 #include <pro.h>
@@ -89,15 +90,15 @@ TypeInferenceEngine::TypeInferenceEngine(
     , current_constraints_(ctx)
     , type_encoder_(ctx)
 {
-    initialize_analyzers();
+    if (config_.enable_experimental_pipeline) {
+        initialize_analyzers();
+    }
 }
 
 void TypeInferenceEngine::initialize_analyzers() {
     semantics_extractor_ = std::make_unique<InstructionSemanticsExtractor>(
         ctx_, config_.semantics_config);
     alias_analyzer_ = std::make_unique<AliasAnalyzer>(ctx_, config_.alias_config);
-    signedness_inferrer_ = std::make_unique<SignednessInferrer>(ctx_);
-    ptr_int_discriminator_ = std::make_unique<PointerIntegerDiscriminator>(ctx_);
 }
 
 void TypeInferenceEngine::reset_state() {
@@ -108,84 +109,124 @@ void TypeInferenceEngine::reset_state() {
 
 FunctionTypeInferenceResult TypeInferenceEngine::infer_function(cfunc_t* cfunc) {
     FunctionTypeInferenceResult result;
-    
+    last_stats_ = TypeInferenceStats();
+
+    if (!config_.enable_experimental_pipeline) {
+        result.status = TypeInferenceStatus::ExperimentalDisabled;
+        result.error_message =
+            "experimental type-inference pipeline is disabled; set "
+            "TypeInferenceConfig::enable_experimental_pipeline=true for "
+            "explicit per-function experimentation";
+        return result;
+    }
+
     if (!cfunc) {
+        result.status = TypeInferenceStatus::InvalidInput;
         result.error_message = "null cfunc";
         return result;
     }
-    
-    auto total_start = std::chrono::steady_clock::now();
-    
-    reset_state();
-    current_cfunc_ = cfunc;
-    result.func_ea = cfunc->entry_ea;
-    
+    if (ctx_.config().max_memory_mb != 0) {
+        result.status = TypeInferenceStatus::UnsupportedOperation;
+        result.error_message =
+            "configured memory limit cannot be enforced by the type-inference optimizer";
+        return result;
+    }
+
+    const auto total_start = std::chrono::steady_clock::now();
+    const auto finish = [&]() {
+        const auto total_end = std::chrono::steady_clock::now();
+        last_stats_.total_time =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                total_end - total_start);
+        result.stats = last_stats_;
+    };
+
+    try {
+        // Recreate analyzers so mutations made through config() between calls
+        // are reflected instead of silently retaining constructor-time values.
+        initialize_analyzers();
+
+        reset_state();
+        current_cfunc_ = cfunc;
+        result.func_ea = cfunc->entry_ea;
+
 #ifndef STRUCTOR_TESTING
-    qstring func_name;
-    get_func_name(&func_name, cfunc->entry_ea);
-    result.func_name = func_name;
+        qstring func_name;
+        get_func_name(&func_name, cfunc->entry_ea);
+        result.func_name = func_name;
 #endif
-    
-    last_stats_ = TypeInferenceStats();
-    last_stats_.functions_analyzed = 1;
-    
-    report_progress("Starting", 0, "Initializing type inference");
-    
-    // Phase 1: Extract type constraints from ctree
-    if (config_.phase_constraint_extraction) {
-        report_progress("Constraints", 10, "Extracting type constraints");
-        phase_constraint_extraction(cfunc);
-    }
-    
-    // Phase 2: Alias analysis
-    if (config_.phase_alias_analysis) {
-        report_progress("Alias", 30, "Performing alias analysis");
-        phase_alias_analysis(cfunc);
-    }
-    
-    // Phase 3: Generate soft constraints
-    if (config_.phase_soft_constraints) {
-        report_progress("Heuristics", 50, "Generating soft constraints");
-        phase_soft_constraints(cfunc);
-    }
-    
-    // Phase 4: Build Z3 constraints
-    report_progress("Building", 60, "Building Z3 constraints");
-    auto build_start = std::chrono::steady_clock::now();
-    ::z3::optimize opt = build_z3_constraints();
-    auto build_end = std::chrono::steady_clock::now();
-    last_stats_.constraint_building_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        build_end - build_start);
-    
-    // Phase 5: Solve
-    report_progress("Solving", 70, "Solving constraints");
-    ::z3::model model(ctx_.ctx());
-    bool solved = phase_solve(opt, model);
-    
-    if (!solved) {
-        result.error_message = "Failed to solve type constraints";
+
+        last_stats_.functions_analyzed = 1;
+        report_progress("Starting", 0,
+                        "Initializing experimental type inference");
+
+        if (config_.phase_constraint_extraction) {
+            report_progress("Constraints", 10, "Extracting type constraints");
+            phase_constraint_extraction(cfunc);
+        }
+
+        if (config_.phase_alias_analysis) {
+            report_progress("Alias", 30, "Performing alias analysis");
+            phase_alias_analysis(cfunc);
+        }
+
+        if (config_.phase_soft_constraints) {
+            report_progress("Heuristics", 50, "Generating soft constraints");
+            phase_soft_constraints(cfunc);
+        }
+
+        report_progress("Building", 60, "Building Z3 constraints");
+        const auto build_start = std::chrono::steady_clock::now();
+        ::z3::optimize opt = build_z3_constraints();
+        const auto build_end = std::chrono::steady_clock::now();
+        last_stats_.constraint_building_time =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                build_end - build_start);
+
+        report_progress("Solving", 70, "Solving constraints");
+        ::z3::model model(ctx_.ctx());
+        const bool solved = phase_solve(opt, model);
+
+        if (!solved) {
+            result.status = TypeInferenceStatus::SolverFailure;
+            result.error_message =
+                "type-inference constraints were unsatisfiable or the solver "
+                "returned unknown";
+        } else {
+            report_progress("Extracting", 90, "Extracting inferred types");
+            extract_results(model, result);
+            result.status = TypeInferenceStatus::Success;
+            result.success = true;
+        }
+
+        report_progress("Complete", 100,
+                        result.success ? "Experimental type inference complete"
+                                       : "Experimental type inference failed");
+    } catch (const std::exception& exception) {
+        result.status = TypeInferenceStatus::InternalError;
         result.success = false;
-    } else {
-        // Phase 6: Extract results
-        report_progress("Extracting", 90, "Extracting inferred types");
-        extract_results(model, result);
-        result.success = true;
+        result.error_message.sprnt(
+            "experimental type-inference exception: %s", exception.what());
+        reset_state();
+    } catch (...) {
+        result.status = TypeInferenceStatus::InternalError;
+        result.success = false;
+        result.error_message =
+            "unknown exception in experimental type-inference pipeline";
+        reset_state();
     }
-    
-    auto total_end = std::chrono::steady_clock::now();
-    last_stats_.total_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-        total_end - total_start);
-    
-    result.stats = last_stats_;
-    
-    report_progress("Complete", 100, "Type inference complete");
-    
+
+    finish();
     return result;
 }
 
 InferredVariableType TypeInferenceEngine::infer_variable(cfunc_t* cfunc, int var_idx) {
     auto full_result = infer_function(cfunc);
-    
+
+    if (!full_result.success) {
+        throw std::runtime_error(full_result.error_message.c_str());
+    }
+
     for (const auto& vt : full_result.local_types) {
         if (vt.var_idx == var_idx) {
             return vt;
@@ -204,13 +245,16 @@ std::vector<FunctionTypeInferenceResult> TypeInferenceEngine::infer_cross_functi
 {
     std::vector<FunctionTypeInferenceResult> results;
     results.reserve(cfuncs.size());
-    
-    // For now, just analyze each function independently
-    // Full cross-function analysis would need the CrossFunctionAnalyzer
+
     for (auto* cfunc : cfuncs) {
-        results.push_back(infer_function(cfunc));
+        FunctionTypeInferenceResult result;
+        result.func_ea = cfunc ? cfunc->entry_ea : BADADDR;
+        result.status = TypeInferenceStatus::UnsupportedOperation;
+        result.error_message =
+            "interprocedural type-inference fixed-point analysis is not implemented";
+        results.push_back(std::move(result));
     }
-    
+
     return results;
 }
 
@@ -345,16 +389,8 @@ bool TypeInferenceEngine::phase_solve(::z3::optimize& opt, ::z3::model& out_mode
         return true;
     }
     
-    // If unknown (timeout), we can still try to get a partial model
-    if (result == ::z3::unknown) {
-        try {
-            out_model = opt.get_model();
-            return true;  // Partial success
-        } catch (...) {
-            return false;
-        }
-    }
-    
+    // Unknown (including timeout) is not evidence of satisfiability. Never
+    // expose a partial model as successful inferred type information.
     return false;
 }
 
@@ -430,33 +466,31 @@ TypeScheme::instantiate(
     int call_site_id, 
     std::function<TypeVariable(int, const char*)> make_var) const
 {
-    std::unordered_map<int, TypeVariable> fresh_vars;
-    
-    // Create fresh type variables for each type parameter
-    for (const auto& param : type_params) {
-        qstring name;
-        name.sprnt("%s_%d", param.name.c_str(), call_site_id);
-        fresh_vars[param.id] = make_var(param.id, name.c_str());
+    (void)call_site_id;
+    (void)make_var;
+    if (!type_params.empty()) {
+        throw std::logic_error(
+            "polymorphic TypeScheme instantiation is unsupported because "
+            "InferredType has no type-parameter representation");
     }
-    
-    // TODO: Substitute type parameters in body with fresh variables
-    // For now, just return the body as-is
-    return {body, fresh_vars};
+
+    return {body, {}};
 }
 
 // ============================================================================
 // PolymorphicFunctionDetector implementation
 // ============================================================================
 
-PolymorphicFunctionDetector::PolymorphicFunctionDetector(Z3Context& ctx) : ctx_(ctx) {
-    register_known_functions();
+PolymorphicFunctionDetector::PolymorphicFunctionDetector(Z3Context& ctx) {
+    (void)ctx;
 }
 
-bool PolymorphicFunctionDetector::is_polymorphic(ea_t func_ea) {
-    return known_polymorphic_.count(func_ea) > 0;
+bool PolymorphicFunctionDetector::is_polymorphic(ea_t func_ea) const {
+    return known_schemes_.find(func_ea) != known_schemes_.end();
 }
 
-std::optional<TypeScheme> PolymorphicFunctionDetector::get_type_scheme(ea_t func_ea) {
+std::optional<TypeScheme> PolymorphicFunctionDetector::get_type_scheme(
+    ea_t func_ea) const {
     auto it = known_schemes_.find(func_ea);
     if (it != known_schemes_.end()) {
         return it->second;
@@ -465,15 +499,7 @@ std::optional<TypeScheme> PolymorphicFunctionDetector::get_type_scheme(ea_t func
 }
 
 void PolymorphicFunctionDetector::register_polymorphic(ea_t func_ea, TypeScheme scheme) {
-    known_polymorphic_.insert(func_ea);
     known_schemes_[func_ea] = std::move(scheme);
-}
-
-void PolymorphicFunctionDetector::register_known_functions() {
-    // Register common polymorphic functions like memcpy, memset, qsort, etc.
-    // These would be identified by name or import address
-    // For now, this is a placeholder - actual implementation would look up
-    // function names from the IDA database
 }
 
 // ============================================================================

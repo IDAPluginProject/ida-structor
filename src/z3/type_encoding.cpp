@@ -213,6 +213,28 @@ tinfo_t TypeEncoder::decode(
     tinfo_t type;
     uint32_t ptr_size = ctx_.pointer_size();
 
+    // A candidate's storage width is authoritative for materialization. Ctree
+    // evidence can carry a promoted expression type (for example int32 for a
+    // 16-bit load); emitting that wider tinfo would change offsets and ABI
+    // packing when persisted.
+    if (is_integer(category) && type_category_size(category, ptr_size) != size) {
+        const bool is_signed = is_signed_int(category);
+        switch (size) {
+            case 1: category = is_signed ? TypeCategory::Int8 : TypeCategory::UInt8; break;
+            case 2: category = is_signed ? TypeCategory::Int16 : TypeCategory::UInt16; break;
+            case 4: category = is_signed ? TypeCategory::Int32 : TypeCategory::UInt32; break;
+            case 8: category = is_signed ? TypeCategory::Int64 : TypeCategory::UInt64; break;
+            default: category = TypeCategory::RawBytes; break;
+        }
+    } else if (is_floating(category) && type_category_size(category, ptr_size) != size) {
+        if (size == 4) category = TypeCategory::Float32;
+        else if (size == 8) category = TypeCategory::Float64;
+        else category = TypeCategory::RawBytes;
+    } else if ((category == TypeCategory::Pointer || category == TypeCategory::FuncPtr) &&
+               size != ptr_size) {
+        category = TypeCategory::RawBytes;
+    }
+
     switch (category) {
         case TypeCategory::Int8:
             type.create_simple_type(BTF_INT8);
@@ -354,8 +376,6 @@ std::pair<::z3::expr, bool> TypeEncoder::compatible(
 
     // Integer types of the same size are compatible
     // (e.g., int32 and uint32 at same offset is acceptable)
-    auto& c = ctx_.ctx();
-
     ::z3::expr int8_compat =
         ((t1 == category_expr(TypeCategory::Int8)) && (t2 == category_expr(TypeCategory::UInt8))) ||
         ((t1 == category_expr(TypeCategory::UInt8)) && (t2 == category_expr(TypeCategory::Int8)));

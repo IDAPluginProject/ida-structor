@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
+import hashlib
 import json
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -15,13 +20,21 @@ from check_fixture_contracts import (  # noqa: E402
     normalize_result,
     render_pseudocode_snapshot,
     run_case,
+    load_contracts,
+    verify_case,
 )
 
 
 def function_case(
-    name: str, target: str, dump_functions: list[str], *, var_idx: int = 0
+    name: str,
+    target: str,
+    dump_functions: list[str],
+    *,
+    var_idx: int = 0,
+    config: dict | None = None,
+    expect: dict | None = None,
 ):
-    return {
+    case = {
         "name": name,
         "synth": {
             "kind": "function",
@@ -30,10 +43,21 @@ def function_case(
         },
         "dump_functions": dump_functions,
     }
+    if config:
+        case["config"] = config
+    if expect:
+        case["expect"] = expect
+    return case
 
 
-def global_case(name: str, target: str, dump_functions: list[str]):
-    return {
+def global_case(
+    name: str,
+    target: str,
+    dump_functions: list[str],
+    *,
+    expect: dict | None = None,
+):
+    case = {
         "name": name,
         "synth": {
             "kind": "global",
@@ -41,6 +65,9 @@ def global_case(name: str, target: str, dump_functions: list[str]):
         },
         "dump_functions": dump_functions,
     }
+    if expect:
+        case["expect"] = expect
+    return case
 
 
 CONTRACT_MANIFEST = [
@@ -49,7 +76,100 @@ CONTRACT_MANIFEST = [
         "cases": [
             function_case(
                 "process_simple", "process_simple", ["process_simple", "init_simple"]
-            )
+            ),
+            function_case(
+                "candidate_limit_failure",
+                "process_simple",
+                ["process_simple"],
+                config={"z3_max_candidates": 1},
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "z3_status": "resource_limit",
+                    "used_fallback": False,
+                    "resource_limit_kind": "candidates",
+                },
+            ),
+            function_case(
+                "field_limit_failure",
+                "process_simple",
+                ["process_simple"],
+                config={"z3_max_fields": 1},
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "z3_status": "resource_limit",
+                    "used_fallback": False,
+                    "resource_limit_kind": "fields",
+                },
+            ),
+            function_case(
+                "structure_span_limit_failure",
+                "process_simple",
+                ["process_simple"],
+                config={"z3_max_structure_size": 8},
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "z3_status": "resource_limit",
+                    "used_fallback": False,
+                    "resource_limit_kind": "structure_size",
+                },
+            ),
+            function_case(
+                "access_limit_failure",
+                "process_simple",
+                ["process_simple"],
+                config={"z3_max_accesses": 1},
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "z3_status": "resource_limit",
+                    "used_fallback": False,
+                    "resource_limit_kind": "accesses",
+                },
+            ),
+            function_case(
+                "constraint_pair_limit_failure",
+                "process_simple",
+                ["process_simple"],
+                config={"z3_max_constraint_pairs": 1},
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "z3_status": "resource_limit",
+                    "used_fallback": False,
+                    "resource_limit_kind": "constraint_pairs",
+                },
+            ),
+            function_case(
+                "maxsmt_memory_limit_failure",
+                "process_simple",
+                ["process_simple"],
+                config={
+                    "z3_enable_maxsmt": True,
+                    "z3_memory_limit_mb": 1,
+                },
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "z3_status": "resource_limit",
+                    "used_fallback": False,
+                    "resource_limit_kind": "solver_memory",
+                },
+            ),
+            function_case(
+                "confidence_threshold_preserves_direct_evidence",
+                "process_simple",
+                ["process_simple"],
+                config={"z3_min_confidence": 100},
+                expect={
+                    "success": True,
+                    "z3_status": "success",
+                    "used_fallback": False,
+                    "required_field_offsets": [0, 8, 16],
+                },
+            ),
         ],
     },
     {
@@ -136,6 +256,22 @@ CONTRACT_MANIFEST = [
         ],
     },
     {
+        "fixture": "test_packing_matrix",
+        "cases": [
+            function_case(
+                "read_pack2", "read_pack2", ["read_pack2", "seed_pack2"]
+            ),
+            function_case(
+                "read_pack4", "read_pack4", ["read_pack4", "seed_pack4"]
+            ),
+            function_case(
+                "read_default_chars",
+                "read_default_chars",
+                ["read_default_chars", "seed_default_chars"],
+            ),
+        ],
+    },
+    {
         "fixture": "test_packed_nested_array",
         "cases": [
             function_case("read_bundle", "read_bundle", ["read_bundle", "read_tail"])
@@ -177,8 +313,20 @@ CONTRACT_MANIFEST = [
         "fixture": "test_bounded_index",
         "cases": [
             function_case(
-                "read_indexed", "read_indexed", ["read_indexed", "read_marks"]
-            )
+                "read_indexed",
+                "read_indexed",
+                ["read_indexed", "read_inclusive", "read_marks"],
+            ),
+            function_case(
+                "read_inclusive",
+                "read_inclusive",
+                ["read_inclusive", "read_indexed", "read_marks"],
+            ),
+            function_case(
+                "read_reversed_bound",
+                "read_reversed_bound",
+                ["read_reversed_bound"],
+            ),
         ],
     },
     {
@@ -201,7 +349,36 @@ CONTRACT_MANIFEST = [
                     "inspect_bits",
                     "inspect_bytes",
                 ],
-            )
+            ),
+            function_case(
+                "union_alternative_limit_failure",
+                "inspect_header",
+                ["inspect_header", "inspect_float_view"],
+                config={"z3_max_union_alternatives": 1},
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "z3_status": "resource_limit",
+                    "used_fallback": False,
+                    "resource_limit_kind": "union_alternatives",
+                },
+            ),
+            function_case(
+                "array_candidate_cap_preserves_scalar_evidence",
+                "inspect_header",
+                ["inspect_header", "inspect_bytes"],
+                config={
+                    "z3_min_array_elements": 2,
+                    "z3_max_array_elements": 2,
+                },
+                expect={
+                    "success": True,
+                    "z3_status": "success",
+                    "used_fallback": False,
+                    "max_array_count": 2,
+                    "required_field_offsets": [16, 17, 18, 19],
+                },
+            ),
         ],
     },
     {
@@ -440,6 +617,28 @@ CONTRACT_MANIFEST = [
                 "g_scratch",
                 "g_scratch",
                 ["fill_scratch", "scramble_scratch", "checksum_scratch"],
+                expect={
+                    "success": False,
+                    "require_structure": False,
+                    "error_contains": "No global/static structure accesses found",
+                },
+            )
+        ],
+    },
+    {
+        "fixture": "test_global_union_overlay",
+        "cases": [
+            global_case(
+                "g_overlay_storage",
+                "g_overlay_storage",
+                [
+                    "initialize_global_overlay",
+                    "seed_global_overlay",
+                    "inspect_global_overlay",
+                    "consume_global_overlay_u32",
+                    "consume_global_overlay_float",
+                    "consume_global_overlay_edges",
+                ],
             )
         ],
     },
@@ -456,7 +655,7 @@ CONTRACT_MANIFEST = [
 ]
 
 
-def generate_contracts(
+def _generate_contracts_locked(
     repo_root: Path,
     plugin_path: Path,
     idump_path: str,
@@ -472,7 +671,7 @@ def generate_contracts(
         raise RuntimeError("no fixture entries selected for contract generation")
 
     build_fixtures(repo_root, *(entry["fixture"] for entry in manifest))
-    contracts_dir.mkdir(parents=True, exist_ok=True)
+    generated_contracts: dict[str, dict] = {}
 
     for entry in manifest:
         fixture_name = entry["fixture"]
@@ -487,28 +686,211 @@ def generate_contracts(
                 case,
                 debug_mode=False,
             )
+            normalized_result = normalize_result(raw_result)
+            pseudocode_snapshot = render_pseudocode_snapshot(
+                raw_output,
+                case.get("snapshot_functions")
+                or case.get("dump_functions")
+                or [],
+            )
+            validation_case = dict(case)
+            validation_expect = dict(case.get("expect", {}))
+            validation_expect.setdefault("success", True)
+            validation_expect.setdefault(
+                "require_structure", validation_expect["success"]
+            )
+            validation_case["expect"] = validation_expect
+            verify_case(
+                {"fixture": fixture_name},
+                validation_case,
+                raw_result,
+                raw_output,
+                normalized_result,
+                pseudocode_snapshot,
+                require_goldens=False,
+            )
             contract["cases"].append(
                 {
                     "name": case["name"],
                     "synth": case["synth"],
                     "dump_functions": case["dump_functions"],
-                    "golden_result": normalize_result(raw_result),
-                    "golden_pseudocode": render_pseudocode_snapshot(
-                        raw_output,
-                        case.get("snapshot_functions")
-                        or case.get("dump_functions")
-                        or [],
-                    ),
+                    **({"config": case["config"]} if case.get("config") else {}),
+                    **({"expect": case["expect"]} if case.get("expect") else {}),
+                    "golden_result": normalized_result,
+                    "golden_pseudocode": pseudocode_snapshot,
                 }
             )
             print(f"[RECORDED] {fixture_name}/{case['name']}")
 
-        output_path = contracts_dir / f"{fixture_name}.json"
-        output_path.write_text(
-            json.dumps(contract, indent=2, sort_keys=False) + "\n",
-            encoding="utf-8",
+        generated_contracts[fixture_name] = contract
+
+    # Do not mutate the blessed corpus until every requested live IDA run has
+    # completed and the complete staged corpus passes the authoritative loader.
+    contracts_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage_root = Path(
+        tempfile.mkdtemp(
+            prefix=f".{contracts_dir.name}.stage-",
+            dir=contracts_dir.parent,
         )
-        print(f"[WROTE] {output_path}")
+    )
+    staged_contracts_dir = stage_root / contracts_dir.name
+    backup_root: Path | None = None
+    moved_original = False
+    installed_stage = False
+    try:
+        if selected_fixtures and contracts_dir.exists():
+            shutil.copytree(contracts_dir, staged_contracts_dir)
+        else:
+            staged_contracts_dir.mkdir()
+
+        for fixture_name, contract in generated_contracts.items():
+            output_path = staged_contracts_dir / f"{fixture_name}.json"
+            output_path.write_text(
+                json.dumps(contract, indent=2, sort_keys=False) + "\n",
+                encoding="utf-8",
+            )
+
+        # Always validate the entire corpus. A selected regeneration therefore
+        # cannot bless files against a missing or stale peer contract.
+        load_contracts(staged_contracts_dir, [])
+
+        if contracts_dir.exists():
+            backup_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{contracts_dir.name}.backup-",
+                    dir=contracts_dir.parent,
+                )
+            )
+            os.replace(contracts_dir, backup_root / contracts_dir.name)
+            moved_original = True
+
+        try:
+            os.replace(staged_contracts_dir, contracts_dir)
+            installed_stage = True
+        except BaseException as install_error:
+            if moved_original and backup_root is not None:
+                try:
+                    os.replace(
+                        backup_root / contracts_dir.name, contracts_dir
+                    )
+                    moved_original = False
+                except BaseException as restore_error:
+                    raise RuntimeError(
+                        "contract corpus installation and restoration failed; "
+                        f"original corpus retained at "
+                        f"{backup_root / contracts_dir.name}"
+                    ) from restore_error
+            raise install_error
+
+        for fixture_name in generated_contracts:
+            print(f"[WROTE] {contracts_dir / f'{fixture_name}.json'}")
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        if backup_root is not None and (installed_stage or not moved_original):
+            shutil.rmtree(backup_root, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def contract_recorder_lock(contracts_dir: Path):
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError(
+            "contract generation requires POSIX advisory file locking"
+        ) from exc
+
+    lock_id = hashlib.sha256(str(contracts_dir).encode("utf-8")).hexdigest()[:16]
+    lock_path = Path(tempfile.gettempdir()) / f"structor-contracts-{lock_id}.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"another contract recorder holds {lock_path}"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def recover_interrupted_swap(contracts_dir: Path) -> None:
+    backup_roots = sorted(
+        path
+        for path in contracts_dir.parent.glob(
+            f".{contracts_dir.name}.backup-*"
+        )
+        if path.is_dir()
+    )
+    stage_roots = sorted(
+        path
+        for path in contracts_dir.parent.glob(f".{contracts_dir.name}.stage-*")
+        if path.is_dir()
+    )
+    if len(backup_roots) > 1:
+        raise RuntimeError(
+            "multiple interrupted corpus backups require inspection: "
+            + ", ".join(str(path) for path in backup_roots)
+        )
+    if backup_roots:
+        backup_root = backup_roots[0]
+        backup_corpus = backup_root / contracts_dir.name
+        if contracts_dir.exists():
+            raise RuntimeError(
+                "an interrupted corpus swap retained both destination and "
+                f"backup; no data was removed: {backup_corpus}"
+            )
+        if not backup_corpus.is_dir():
+            raise RuntimeError(
+                f"interrupted backup is missing its corpus: {backup_root}"
+            )
+        os.replace(backup_corpus, contracts_dir)
+        shutil.rmtree(backup_root)
+
+    if stage_roots:
+        if not contracts_dir.exists():
+            raise RuntimeError(
+                "staged corpus exists without a recoverable destination: "
+                + ", ".join(str(path) for path in stage_roots)
+            )
+        for stage_root in stage_roots:
+            shutil.rmtree(stage_root)
+
+
+def generate_contracts(
+    repo_root: Path,
+    plugin_path: Path,
+    idump_path: str,
+    contracts_dir: Path,
+    selected_fixtures: set[str],
+) -> None:
+    expected_contracts_dir = repo_root / "integration_tests" / "contracts"
+    if expected_contracts_dir.is_symlink() or (
+        contracts_dir != expected_contracts_dir.resolve()
+    ):
+        raise RuntimeError(
+            "--contracts-dir must resolve to the repository contract corpus: "
+            f"{expected_contracts_dir}"
+        )
+
+    known_fixtures = {entry["fixture"] for entry in CONTRACT_MANIFEST}
+    unknown_fixtures = selected_fixtures - known_fixtures
+    if unknown_fixtures:
+        raise RuntimeError(
+            "unknown fixture selection(s): "
+            + ", ".join(sorted(unknown_fixtures))
+        )
+
+    contracts_dir.parent.mkdir(parents=True, exist_ok=True)
+    with contract_recorder_lock(contracts_dir):
+        recover_interrupted_swap(contracts_dir)
+        _generate_contracts_locked(
+            repo_root,
+            plugin_path,
+            idump_path,
+            contracts_dir,
+            selected_fixtures,
+        )
 
 
 def main() -> int:

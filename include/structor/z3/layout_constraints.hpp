@@ -6,10 +6,13 @@
 #include "structor/z3/context.hpp"
 #include "structor/z3/type_encoding.hpp"
 #include "structor/z3/array_constraints.hpp"
+#include "structor/z3/union_constraints.hpp"
 #include "structor/z3/field_candidates.hpp"
 #include "structor/z3/constraint_tracker.hpp"
 #include "structor/z3/result.hpp"
 #include <optional>
+#include <chrono>
+#include <string>
 
 namespace structor::z3 {
 
@@ -47,7 +50,12 @@ struct LayoutConstraintConfig {
     // Union handling
     bool allow_unions = true;
     bool create_actual_unions = true;
-    int max_union_alternatives = 8;
+    uint32_t max_union_alternatives = 8;
+
+    bool detect_arrays = true;
+    uint32_t min_array_elements = 3;
+    bool detect_symbolic_arrays = true;
+    uint32_t max_array_stride = 4096;
 
     // Optimization weights (for Max-SMT)
     int weight_coverage = 100;           // Hard: every access must be covered
@@ -60,6 +68,14 @@ struct LayoutConstraintConfig {
 
     // Limits
     uint32_t max_struct_size = 0x10000;
+    uint32_t max_accesses = 10000;
+    uint32_t max_candidates = 1000;
+    uint32_t max_fields = 4096;
+    uint32_t max_array_elements = 1024;
+    uint64_t max_constraint_pairs = 500000; // Pair + union-cardinality relation budget
+    bool enable_maxsmt = true;
+    bool relax_on_unsat = true;
+    uint32_t max_relaxation_iterations = 5;
 
     // Post-processing
     bool fill_gaps_with_padding = true;  // Fill gaps between fields with padding
@@ -154,6 +170,9 @@ private:
     std::optional<uint32_t> inferred_packing_;
     qvector<UnionResolution> union_resolutions_;
     Z3Statistics statistics_;
+    std::optional<std::chrono::steady_clock::time_point> solve_deadline_;
+    bool solve_deadline_exhausted_ = false;
+    std::string last_unknown_reason_;
 
     /// Create Z3 variables for each candidate
     void create_field_variables();
@@ -171,6 +190,24 @@ private:
 
     /// Add optimization objectives
     void add_optimization_objectives();
+
+    /// Return validated packing-domain values bounded by the configured ABI
+    /// default, in deterministic descending order.
+    [[nodiscard]] qvector<uint32_t> normalized_packing_options() const;
+
+    /// Replace an arbitrary satisfying packing assignment with the largest
+    /// packing cap compatible with every selected field, then recheck the
+    /// pinned model against the active assumption set.
+    [[nodiscard]] std::optional<::z3::model> canonicalize_packing_model(
+        const ::z3::model& model,
+        const ::z3::expr_vector& active_assumptions);
+
+    [[nodiscard]] ::z3::check_result check_solver_with_deadline(
+        const ::z3::expr_vector& assumptions);
+    [[nodiscard]] ::z3::check_result check_optimizer_with_deadline(
+        ::z3::optimize& optimizer);
+    [[nodiscard]] Z3Result solve_weighted_maxsmt(
+        std::chrono::steady_clock::time_point start_time);
 
     /// Relaxation loop for UNSAT cases
     [[nodiscard]] Z3Result solve_with_relaxation();
