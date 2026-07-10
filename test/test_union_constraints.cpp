@@ -16,25 +16,29 @@
 namespace {
 
 using structor::z3::UnionConstraintVariables;
-using structor::z3::union_alternative_limit_constraints;
+using structor::z3::CanonicalUnionConstraintVariables;
+using structor::z3::canonical_union_alternative_limit_constraints;
+using structor::z3::canonical_union_group_domain_constraint;
 using structor::z3::union_group_capacity;
-using structor::z3::union_group_domain_constraint;
 using structor::z3::UnionAlternativeDescriptor;
 using structor::z3::checked_layout_relation_count;
 using structor::z3::largest_mandatory_union_cluster;
 
-std::vector<UnionConstraintVariables> make_variables(
+std::vector<CanonicalUnionConstraintVariables> make_variables(
     z3::context& ctx,
-    std::size_t count)
+    const std::vector<std::uint32_t>& canonical_groups)
 {
-    std::vector<UnionConstraintVariables> variables;
-    variables.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
+    std::vector<CanonicalUnionConstraintVariables> variables;
+    variables.reserve(canonical_groups.size());
+    for (std::size_t i = 0; i < canonical_groups.size(); ++i) {
         const std::string prefix = "u" + std::to_string(i) + "_";
         variables.push_back({
-            ctx.bool_const((prefix + "selected").c_str()),
-            ctx.bool_const((prefix + "member").c_str()),
-            ctx.int_const((prefix + "group").c_str()),
+            {
+                ctx.bool_const((prefix + "selected").c_str()),
+                ctx.bool_const((prefix + "member").c_str()),
+                ctx.int_const((prefix + "group").c_str()),
+            },
+            canonical_groups[i],
         });
     }
     return variables;
@@ -43,14 +47,15 @@ std::vector<UnionConstraintVariables> make_variables(
 void add_production_constraints(
     z3::solver& solver,
     z3::context& ctx,
-    const std::vector<UnionConstraintVariables>& variables,
+    const std::vector<CanonicalUnionConstraintVariables>& variables,
     std::uint32_t max_groups,
     std::uint32_t max_alternatives)
 {
     for (const auto& variable : variables) {
-        solver.add(union_group_domain_constraint(variable, max_groups));
+        solver.add(canonical_union_group_domain_constraint(
+            variable.variables, variable.canonical_group));
     }
-    for (const auto& constraint : union_alternative_limit_constraints(
+    for (const auto& constraint : canonical_union_alternative_limit_constraints(
              ctx, variables, max_groups, max_alternatives)) {
         solver.add(constraint);
     }
@@ -96,11 +101,15 @@ void test_relation_budget_counts_union_ast_and_checks_overflow() {
 void test_alternative_limit_is_per_group() {
     z3::context ctx;
     z3::solver solver(ctx);
-    auto variables = make_variables(ctx, 6);
-    add_production_constraints(solver, ctx, variables, 6, 2);
+    auto variables = make_variables(ctx, {0, 0, 1, 1, 2, 2});
+    add_production_constraints(solver, ctx, variables, 3, 2);
 
     for (std::size_t i = 0; i < variables.size(); ++i) {
-        constrain_member(solver, variables[i], true, static_cast<int>(i / 2));
+        constrain_member(
+            solver,
+            variables[i].variables,
+            true,
+            static_cast<int>(variables[i].canonical_group));
     }
     assert(solver.check() == z3::sat);
 }
@@ -108,11 +117,11 @@ void test_alternative_limit_is_per_group() {
 void test_third_selected_alternative_is_rejected() {
     z3::context ctx;
     z3::solver solver(ctx);
-    auto variables = make_variables(ctx, 3);
-    add_production_constraints(solver, ctx, variables, 3, 2);
+    auto variables = make_variables(ctx, {0, 0, 0});
+    add_production_constraints(solver, ctx, variables, 1, 2);
 
     for (const auto& variable : variables) {
-        constrain_member(solver, variable, true, 0);
+        constrain_member(solver, variable.variables, true, 0);
     }
     assert(solver.check() == z3::unsat);
 }
@@ -120,48 +129,61 @@ void test_third_selected_alternative_is_rejected() {
 void test_unselected_alternative_does_not_consume_limit() {
     z3::context ctx;
     z3::solver solver(ctx);
-    auto variables = make_variables(ctx, 3);
-    add_production_constraints(solver, ctx, variables, 3, 2);
+    auto variables = make_variables(ctx, {0, 0, 0});
+    add_production_constraints(solver, ctx, variables, 1, 2);
 
-    constrain_member(solver, variables[0], true, 0);
-    constrain_member(solver, variables[1], true, 0);
-    constrain_non_member(solver, variables[2], false);
+    constrain_member(solver, variables[0].variables, true, 0);
+    constrain_member(solver, variables[1].variables, true, 0);
+    constrain_non_member(solver, variables[2].variables, false);
     assert(solver.check() == z3::sat);
 }
 
 void test_unselected_candidate_cannot_carry_phantom_union_state() {
     z3::context ctx;
     z3::solver solver(ctx);
-    auto variables = make_variables(ctx, 1);
+    auto variables = make_variables(ctx, {0});
     add_production_constraints(solver, ctx, variables, 1, 1);
 
-    constrain_member(solver, variables[0], false, 0);
+    constrain_member(solver, variables[0].variables, false, 0);
     assert(solver.check() == z3::unsat);
 }
 
 void test_zero_alternatives_disables_selected_union_members() {
     z3::context ctx;
     z3::solver solver(ctx);
-    auto variables = make_variables(ctx, 1);
+    auto variables = make_variables(ctx, {0});
     add_production_constraints(solver, ctx, variables, 1, 0);
 
-    constrain_member(solver, variables[0], true, 0);
+    constrain_member(solver, variables[0].variables, true, 0);
     assert(solver.check() == z3::unsat);
 }
 
-void test_group_domain_is_independent_of_alternative_limit() {
+void test_group_domain_is_fixed_by_storage_origin() {
     z3::context ctx;
-    auto variables = make_variables(ctx, 1);
+    auto variables = make_variables(ctx, {5});
 
     z3::solver valid(ctx);
     add_production_constraints(valid, ctx, variables, 6, 2);
-    constrain_member(valid, variables[0], true, 5);
+    constrain_member(valid, variables[0].variables, true, 5);
     assert(valid.check() == z3::sat);
 
-    z3::solver out_of_range(ctx);
-    add_production_constraints(out_of_range, ctx, variables, 6, 2);
-    constrain_member(out_of_range, variables[0], true, 6);
-    assert(out_of_range.check() == z3::unsat);
+    z3::solver wrong_storage_origin(ctx);
+    add_production_constraints(wrong_storage_origin, ctx, variables, 6, 2);
+    constrain_member(wrong_storage_origin, variables[0].variables, true, 4);
+    assert(wrong_storage_origin.check() == z3::unsat);
+}
+
+void test_invalid_canonical_group_is_rejected() {
+    z3::context ctx;
+    auto variables = make_variables(ctx, {1});
+    bool rejected = false;
+    try {
+        (void)canonical_union_alternative_limit_constraints(
+            ctx, variables, 1, 1);
+    } catch (const std::out_of_range&) {
+        rejected = true;
+    }
+    assert(rejected);
 }
 
 void test_mandatory_cluster_count_is_exact_range_and_ignores_optional() {
@@ -185,7 +207,8 @@ int main() {
     test_unselected_alternative_does_not_consume_limit();
     test_unselected_candidate_cannot_carry_phantom_union_state();
     test_zero_alternatives_disables_selected_union_members();
-    test_group_domain_is_independent_of_alternative_limit();
+    test_group_domain_is_fixed_by_storage_origin();
+    test_invalid_canonical_group_is_rejected();
     test_mandatory_cluster_count_is_exact_range_and_ignores_optional();
     std::cout << "[PASS] production union constraint helper tests\n";
     return 0;

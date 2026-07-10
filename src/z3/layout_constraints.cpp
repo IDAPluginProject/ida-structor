@@ -531,8 +531,8 @@ void LayoutConstraintBuilder::create_field_variables() {
         (void)offset;
         group = next_union_group++;
     }
-    std::vector<std::vector<size_t>> candidates_by_union_group(
-        union_group_by_offset.size());
+    std::vector<CanonicalUnionConstraintVariables> canonical_union_variables;
+    canonical_union_variables.reserve(candidates_.size());
 
     z3_log("[Structor/Z3] Creating field variables for %zu candidates\n", candidates_.size());
 
@@ -578,8 +578,11 @@ void LayoutConstraintBuilder::create_field_variables() {
 
         const int deterministic_union_group =
             union_group_by_offset.at(cand.offset);
-        candidates_by_union_group[
-            static_cast<size_t>(deterministic_union_group)].push_back(i);
+        const UnionConstraintVariables union_variables{
+            fv.selected, fv.is_union_member, fv.union_group};
+        canonical_union_variables.push_back({
+            union_variables,
+            static_cast<std::uint32_t>(deterministic_union_group)});
 
         // Selected union alternatives at the same byte offset use one
         // canonical group id. Nonmembers carry the -1 sentinel. This domain
@@ -592,13 +595,12 @@ void LayoutConstraintBuilder::create_field_variables() {
                 static_cast<unsigned long long>(cand.offset));
             prov.is_soft = false;
             prov.kind = ConstraintProvenance::Kind::Other;
-            const ::z3::expr nonmember =
-                !fv.is_union_member && fv.union_group == -1;
-            const ::z3::expr member =
-                fv.selected && fv.is_union_member &&
-                fv.union_group == deterministic_union_group;
             constraint_tracker_.add_hard(
-                solver_, nonmember || member, prov);
+                solver_,
+                canonical_union_group_domain_constraint(
+                    union_variables,
+                    static_cast<std::uint32_t>(deterministic_union_group)),
+                prov);
         }
 
         if (!config_.allow_unions) {
@@ -641,17 +643,14 @@ void LayoutConstraintBuilder::create_field_variables() {
     }
 
     if (config_.allow_unions && !field_vars_.empty()) {
+        const auto cardinality_constraints =
+            canonical_union_alternative_limit_constraints(
+                ctx,
+                canonical_union_variables,
+                static_cast<std::uint32_t>(union_group_by_offset.size()),
+                config_.max_union_alternatives);
         for (size_t group = 0;
-             group < candidates_by_union_group.size(); ++group) {
-            ::z3::expr selected_members = ctx.int_val(0);
-            for (size_t candidate_index :
-                 candidates_by_union_group[group]) {
-                const auto& fv = field_vars_[candidate_index];
-                selected_members = selected_members + ::z3::ite(
-                    fv.selected && fv.is_union_member,
-                    ctx.int_val(1),
-                    ctx.int_val(0));
-            }
+             group < cardinality_constraints.size(); ++group) {
             ConstraintProvenance prov;
             prov.description.sprnt(
                 "Storage union group %zu has at most %u selected alternatives",
@@ -661,8 +660,7 @@ void LayoutConstraintBuilder::create_field_variables() {
             prov.kind = ConstraintProvenance::Kind::Other;
             constraint_tracker_.add_hard(
                 solver_,
-                selected_members <=
-                    ctx.int_val(config_.max_union_alternatives),
+                cardinality_constraints[group],
                 prov);
         }
     }

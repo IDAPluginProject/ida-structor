@@ -7,6 +7,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace structor::z3 {
@@ -16,6 +17,13 @@ struct UnionConstraintVariables {
     ::z3::expr selected;
     ::z3::expr is_union_member;
     ::z3::expr union_group;
+};
+
+/// One solver variable tuple paired with its deterministic storage-origin
+/// group. The group is derived from the candidate offset before solving.
+struct CanonicalUnionConstraintVariables {
+    UnionConstraintVariables variables;
+    std::uint32_t canonical_group = 0;
 };
 
 struct UnionAlternativeDescriptor {
@@ -138,59 +146,60 @@ checked_layout_relation_count(
     return *pairs + *union_relations;
 }
 
-/// Constrain the sentinel/group domain. Non-members use -1; selected members
-/// use a concrete group in [0, max_union_groups). Unselected candidates are
-/// canonicalized as non-members to eliminate irrelevant model symmetry.
-[[nodiscard]] inline ::z3::expr union_group_domain_constraint(
+/// Constrain the sentinel/group domain for one candidate. Non-members use -1;
+/// selected members use the group fixed by their storage origin. Unselected
+/// candidates are canonicalized as non-members, eliminating group-label and
+/// unselected-state symmetry.
+[[nodiscard]] inline ::z3::expr canonical_union_group_domain_constraint(
     const UnionConstraintVariables& variables,
-    std::uint32_t max_union_groups)
+    std::uint32_t canonical_group)
 {
     const ::z3::expr non_member_domain =
         !variables.is_union_member && variables.union_group == -1;
     const ::z3::expr member_domain =
         variables.selected && variables.is_union_member &&
-        variables.union_group >= 0 &&
-        variables.union_group < static_cast<int>(max_union_groups);
+        variables.union_group == static_cast<int>(canonical_group);
     return non_member_domain || member_domain;
 }
 
-/// Limit the number of selected members assigned to one concrete union group.
-/// Unselected candidates and non-members do not consume the alternatives cap.
+/// Build one hard cardinality constraint per canonical storage-origin group.
+/// Every candidate is visited only in its precomputed group; unselected
+/// candidates and non-members do not consume the alternatives cap.
 ///
-/// Complexity: O(C) time and O(C) Z3 AST nodes for C candidate variables.
-[[nodiscard]] inline ::z3::expr union_alternative_limit_constraint(
+/// Complexity: O(C+G) time, O(C+G) auxiliary space, and O(C+G) Z3 AST nodes
+/// for C candidate variables and G canonical groups.
+[[nodiscard]] inline std::vector<::z3::expr>
+canonical_union_alternative_limit_constraints(
     ::z3::context& ctx,
-    std::span<const UnionConstraintVariables> variables,
-    std::uint32_t union_group,
+    std::span<const CanonicalUnionConstraintVariables> variables,
+    std::uint32_t canonical_group_count,
     std::uint32_t max_union_alternatives)
 {
-    ::z3::expr selected_member_count = ctx.int_val(0);
-    for (const auto& variable : variables) {
-        const ::z3::expr in_group =
-            variable.selected && variable.is_union_member &&
-            variable.union_group == static_cast<int>(union_group);
-        selected_member_count = selected_member_count +
-            ::z3::ite(in_group, ctx.int_val(1), ctx.int_val(0));
+    std::vector<std::vector<std::size_t>> candidates_by_group(
+        canonical_group_count);
+    for (std::size_t i = 0; i < variables.size(); ++i) {
+        const std::uint32_t group = variables[i].canonical_group;
+        if (group >= canonical_group_count) {
+            throw std::out_of_range(
+                "canonical union group is outside the declared group count");
+        }
+        candidates_by_group[group].push_back(i);
     }
-    return selected_member_count <= ctx.int_val(max_union_alternatives);
-}
 
-/// Build one hard per-group cardinality constraint. Group capacity and member
-/// capacity are deliberately independent dimensions.
-///
-/// Complexity: O(G*C) time/AST nodes and O(G) returned expressions, where
-/// G=min(candidate_count,max_fields).
-[[nodiscard]] inline std::vector<::z3::expr> union_alternative_limit_constraints(
-    ::z3::context& ctx,
-    std::span<const UnionConstraintVariables> variables,
-    std::uint32_t max_union_groups,
-    std::uint32_t max_union_alternatives)
-{
     std::vector<::z3::expr> constraints;
-    constraints.reserve(max_union_groups);
-    for (std::uint32_t group = 0; group < max_union_groups; ++group) {
-        constraints.push_back(union_alternative_limit_constraint(
-            ctx, variables, group, max_union_alternatives));
+    constraints.reserve(canonical_group_count);
+    for (std::uint32_t group = 0; group < canonical_group_count; ++group) {
+        ::z3::expr selected_member_count = ctx.int_val(0);
+        for (const std::size_t candidate_index : candidates_by_group[group]) {
+            const auto& variable = variables[candidate_index].variables;
+            const ::z3::expr in_group =
+                variable.selected && variable.is_union_member &&
+                variable.union_group == static_cast<int>(group);
+            selected_member_count = selected_member_count +
+                ::z3::ite(in_group, ctx.int_val(1), ctx.int_val(0));
+        }
+        constraints.push_back(
+            selected_member_count <= ctx.int_val(max_union_alternatives));
     }
     return constraints;
 }
