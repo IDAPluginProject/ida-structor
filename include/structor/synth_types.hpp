@@ -25,7 +25,6 @@
 #include <unordered_set>
 #include <functional>
 #include <algorithm>
-#include <format>
 #include <span>
 #include <stdexcept>
 #include <limits>

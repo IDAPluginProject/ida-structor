@@ -66,13 +66,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Checkout pinned IDA SDK
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: ${{ env.IDA_SDK_REPO }}
           ref: ${{ matrix.ida_ref }}
@@ -110,10 +110,12 @@ jobs:
       - name: Set ccache environment (Unix)
         if: runner.os != 'Windows'
         run: |
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-          echo "CCACHE_BASEDIR=${{ github.workspace }}" >> $GITHUB_ENV
-          echo "CCACHE_COMPRESS=true" >> $GITHUB_ENV
-          echo "CCACHE_MAXSIZE=1G" >> $GITHUB_ENV
+          {
+            echo "CCACHE_DIR=$HOME/.ccache"
+            echo "CCACHE_BASEDIR=${{ github.workspace }}"
+            echo "CCACHE_COMPRESS=true"
+            echo "CCACHE_MAXSIZE=1G"
+          } >> "$GITHUB_ENV"
 
       - name: Configure CMake (macOS)
         if: runner.os == 'macOS'
@@ -160,7 +162,8 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd build
-          cmake --build . --config Release -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          cmake --build . --config Release \
+            --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
 
       - name: Show ccache stats (Unix)
         if: runner.os != 'Windows'
@@ -178,12 +181,17 @@ jobs:
       - name: Rebuild and stage hook-free production plugin (Unix)
         if: runner.os != 'Windows'
         run: |
-          rm -rf stage artifacts
-          cmake -S . -B build \
+          rm -rf build-production stage artifacts
+          cmake -S . -B build-production \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBUILD_TESTS=OFF \
-            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=OFF
-          cmake --build build --config Release --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-          cmake --install build --config Release --component Runtime \
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=OFF \
+            -DIDA_SDK_DIR="${{ github.workspace }}/ida-sdk/src"
+          cmake --build build-production --config Release \
+            --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          cmake --install build-production --config Release --component Runtime \
             --prefix "${{ github.workspace }}/stage"
 
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -260,12 +268,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Remove-Item -Recurse -Force stage, artifacts -ErrorAction SilentlyContinue
-          cmake -S . -B build `
+          Remove-Item -Recurse -Force build-production, stage, artifacts -ErrorAction SilentlyContinue
+          cmake -S . -B build-production -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_TESTS=OFF `
-            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=OFF
-          cmake --build build --config Release
-          cmake --install build --config Release --component Runtime `
+            -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=OFF `
+            "-DIDA_SDK_DIR=${{ github.workspace }}/ida-sdk/src"
+          cmake --build build-production --config Release
+          cmake --install build-production --config Release --component Runtime `
             --prefix "${{ github.workspace }}/stage"
 
           $plugin = "${{ github.workspace }}/stage/plugins/structor.dll"
@@ -317,13 +327,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Checkout pinned IDA SDK
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: ${{ env.IDA_SDK_REPO }}
           ref: 70e29758997745524e917e296fbbfeef5faf9c57
@@ -372,7 +382,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 

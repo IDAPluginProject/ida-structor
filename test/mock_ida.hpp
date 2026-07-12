@@ -4,6 +4,9 @@
 /// @brief Mock IDA SDK types and functions for unit testing
 
 #include <cstdint>
+#include <cstddef>
+#include <cstdarg>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <map>
@@ -30,6 +33,13 @@ using sval_t = std::int64_t;
 using uval_t = std::uint64_t;
 using flags64_t = std::uint64_t;
 using nodeidx_t = std::uint64_t;
+
+// The IDA SDK defines ssize_t on every supported host. MSVC does not provide
+// the POSIX spelling, so the standalone mock must supply the pointer-sized
+// signed type before production headers declare callbacks that use it.
+#ifdef _WIN32
+using ssize_t = std::ptrdiff_t;
+#endif
 
 constexpr ea_t BADADDR = static_cast<ea_t>(-1);
 constexpr tid_t BADNODE = static_cast<tid_t>(-1);
