@@ -16,6 +16,7 @@ public:
     AccessPatternVisitor(cfunc_t* cfunc, int target_var_idx);
 
     int idaapi visit_expr(cexpr_t* expr) override;
+    int idaapi leave_expr(cexpr_t* expr) override;
     int idaapi visit_insn(cinsn_t* insn) override;
 
     [[nodiscard]] const qvector<FieldAccess>& accesses() const noexcept {
@@ -57,7 +58,7 @@ private:
 
     void process_dereference(cexpr_t* expr, const cexpr_t* ptr_expr);
     void process_memptr_access(cexpr_t* expr);
-    void process_call_argument_uses(cexpr_t* call_expr);
+    void process_call_argument_use(const cexpr_t* call_expr, const cexpr_t* argument);
     void process_call_through_ptr(cexpr_t* call_expr);
     void process_array_access(cexpr_t* expr);
     void process_assignment(cexpr_t* expr);
@@ -68,6 +69,8 @@ private:
     [[nodiscard]] std::optional<IndexRange> bounded_index_range(
         const cexpr_t* access_expr, int var_idx) const;
     [[nodiscard]] bool loop_may_change_index(const cinsn_t* loop, int var_idx) const;
+    [[nodiscard]] bool call_sibling_may_change_index(
+        const cexpr_t* call, const citem_t* active_child, int var_idx) const;
     void invalidate_local_var_state(int var_idx, bool clear_pending_constants);
 
     void record_bitfield_access(const cexpr_t* expr, sval_t offset, uint32_t size,

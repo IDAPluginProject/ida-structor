@@ -2,6 +2,7 @@
 
 #include <z3++.h>
 #include "structor/z3/context.hpp"
+#include "structor/z3/calling_convention_model.hpp"
 #include "structor/z3/type_lattice.hpp"
 #include "structor/z3/instruction_semantics.hpp"
 #include "structor/z3/alias_analysis.hpp"
@@ -190,6 +191,9 @@ public:
     [[nodiscard]] const TypeInferenceStats& last_stats() const noexcept { return last_stats_; }
 
 private:
+#if defined(STRUCTOR_LIVE_TEST_HOOKS)
+    friend struct TypeInferenceSignatureTestAccess;
+#endif
     Z3Context& ctx_;
     TypeInferenceConfig config_;
     TypeInferenceStats last_stats_;
@@ -288,21 +292,15 @@ private:
 /// Calling convention detector
 class CallingConventionDetector {
 public:
-    enum class Convention {
-        Unknown,
-        CDecl,          // x86 cdecl
-        Stdcall,        // x86 stdcall
-        Fastcall,       // x86 fastcall
-        Thiscall,       // x86 thiscall (C++ methods)
-        SystemV_x64,    // System V AMD64 ABI (Linux/macOS)
-        Microsoft_x64,  // Microsoft x64
-        ARM_AAPCS,      // ARM AAPCS
-        ARM64_AAPCS64   // ARM64 AAPCS64
-    };
+    using Convention = CallingConvention;
     
     CallingConventionDetector(Z3Context& ctx);
     
-    /// Detect calling convention for a function
+    /// Select a represented convention from the recovered prototype or target
+    /// default. This does not prove that a function obeys the default: an
+    /// unrecognized per-function ABI override can be absent from IDA metadata.
+    /// Unknown/custom target variants remain Unknown; the host is irrelevant.
+    [[nodiscard]] CallingConventionDetection detect_with_evidence(cfunc_t* cfunc);
     [[nodiscard]] Convention detect(cfunc_t* cfunc);
     
     /// Get parameter types based on convention
@@ -317,15 +315,21 @@ public:
         cfunc_t* cfunc
     );
     
-    /// Get parameter register/stack mapping
+    /// Get fixed-prototype x64 scalar/pointer locations. Unsupported conventions,
+    /// types, variadic calls, or unspecified prototype mode return an empty
+    /// vector. Stack offsets are bytes from the callee-entry stack pointer.
+    /// FixedPrototype asserts the supplied convention and complete ABI argument
+    /// list, including hidden arguments. TargetDefault detection alone does not
+    /// discharge this precondition.
     struct ParamLocation {
-        bool is_register;
+        bool is_register = false;
         qstring reg_name;      // If is_register
-        sval_t stack_offset;   // If !is_register
+        sval_t stack_offset = 0;   // If !is_register
     };
     [[nodiscard]] std::vector<ParamLocation> get_param_locations(
         Convention conv,
-        const qvector<InferredType>& param_types
+        const qvector<InferredType>& param_types,
+        ParameterPassingMode mode = ParameterPassingMode::Unspecified
     );
 
 private:

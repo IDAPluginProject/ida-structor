@@ -75,6 +75,7 @@ def main() -> int:
         ],
         [sys.executable, "integration_tests/check_cpp_api_surface.py", *common],
         [sys.executable, "integration_tests/check_index_guard_regressions.py", *common],
+        [sys.executable, "integration_tests/check_assignment_order_regressions.py", *common],
         [sys.executable, "integration_tests/check_fixture_contracts.py", *common],
         [sys.executable, "integration_tests/check_determinism_regressions.py", *common],
         [sys.executable, "integration_tests/check_persistence_regressions.py", *common],
@@ -85,6 +86,7 @@ def main() -> int:
         [sys.executable, "integration_tests/check_type_matcher_regressions.py", *common],
         [sys.executable, "integration_tests/check_array_regressions.py", *common],
         [sys.executable, "integration_tests/check_type_application_regressions.py", *common],
+        [sys.executable, "integration_tests/check_signature_abi_regressions.py", *common],
         [sys.executable, "integration_tests/check_instruction_semantics_identity.py", *common],
     ]
 
@@ -92,6 +94,7 @@ def main() -> int:
         "external CMake consumer",
         "C++ API surface",
         "index guard regressions",
+        "assignment and call evaluation regressions",
         "exact fixture contracts",
         "fresh-database determinism regressions",
         "structure-persistence regressions",
@@ -102,6 +105,7 @@ def main() -> int:
         "existing-type matcher regressions",
         "typed-array solver regressions",
         "type-application identity regressions",
+        "signature mapping and target ABI regressions",
         "experimental instruction semantics identity",
     ]
 

@@ -344,7 +344,7 @@ std::optional<std::uint32_t> regular_offset_stride(const qvector<sval_t>& offset
 // ============================================================================
 
 AccessPatternVisitor::AccessPatternVisitor(cfunc_t* cfunc, int target_var_idx)
-    : ctree_visitor_t(CV_PARENTS)
+    : ctree_visitor_t(CV_PARENTS | CV_POST)
     , cfunc_(cfunc)
     , target_var_idx_(target_var_idx)
     , has_unstructured_control_flow_(cfunc && cfunc->body.contains_insn(cit_goto)) {}
@@ -380,6 +380,15 @@ int AccessPatternVisitor::visit_insn(cinsn_t* insn) {
 
 int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
     if (!expr) return 0;
+
+    // An argument is observed when its expression is entered. Observing every
+    // argument at the call node would use stale aliases from before earlier
+    // argument expressions, and applying call effects here would precede all
+    // argument loads.
+    const cexpr_t* parent = parent_expr();
+    if (parent && parent->op == cot_call && parent->x != expr) {
+        process_call_argument_use(parent, expr);
+    }
 
     switch (expr->op) {
         case cot_ptr:
@@ -417,7 +426,8 @@ int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
         case cot_asgudiv:
         case cot_asgsmod:
         case cot_asgumod:
-            process_assignment(expr);
+            // Commit the destination only after the RHS has been observed.
+            // In particular, q = *q must read through q's incoming alias.
             break;
 
         case cot_band: {
@@ -502,15 +512,31 @@ int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
         case cot_ref:
             if (expr->x && expr->x->op == cot_var) {
                 escaped_local_vars_.insert(expr->x->v.idx);
-                invalidate_local_var_state(expr->x->v.idx, true);
+                // Taking a direct argument's address does not change its
+                // value. Defer only casts of &local passed directly to a call;
+                // an address stored/used inside a larger expression may expose
+                // the local to an intervening write before that call executes.
+                const citem_t* child = expr;
+                bool direct_call_argument = false;
+                for (std::size_t i = parents.size(); i > 0; --i) {
+                    const citem_t* item = parents[i - 1];
+                    if (!item || !item->is_expr()) break;
+                    const auto* ancestor = static_cast<const cexpr_t*>(item);
+                    if (ancestor->op == cot_cast && ancestor->x == child) {
+                        child = ancestor;
+                        continue;
+                    }
+                    direct_call_argument = ancestor->op == cot_call && ancestor->x != child;
+                    break;
+                }
+                if (!direct_call_argument) {
+                    invalidate_local_var_state(expr->x->v.idx, true);
+                }
             }
             break;
 
         case cot_call:
-            for (int var_idx : escaped_local_vars_) {
-                invalidate_local_var_state(var_idx, true);
-            }
-            process_call_argument_uses(expr);
+            // Check the callee value before the call can change escaped locals.
             // Check for indirect calls through our variable
             process_call_through_ptr(expr);
             break;
@@ -519,6 +545,18 @@ int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
             break;
     }
 
+    return 0;
+}
+
+int AccessPatternVisitor::leave_expr(cexpr_t* expr) {
+    if (!expr) return 0;
+    if (is_assignment_op(expr->op)) {
+        process_assignment(expr);
+    } else if (expr->op == cot_call) {
+        for (int var_idx : escaped_local_vars_) {
+            invalidate_local_var_state(var_idx, true);
+        }
+    }
     return 0;
 }
 
@@ -968,6 +1006,54 @@ bool AccessPatternVisitor::loop_may_change_index(const cinsn_t* loop, int var_id
         (it->second.has_call && escaped_local_vars_.contains(var_idx));
 }
 
+bool AccessPatternVisitor::call_sibling_may_change_index(
+        const cexpr_t* call, const citem_t* active_child, int var_idx) const {
+    if (!call || call->op != cot_call) return false;
+    struct EffectVisitor final : ctree_visitor_t {
+        int index_var;
+        bool writes_index = false;
+        bool references_index = false;
+        bool has_call = false;
+        bool has_indirect_write = false;
+        explicit EffectVisitor(int var) : ctree_visitor_t(CV_FAST), index_var(var) {}
+        int idaapi visit_expr(cexpr_t* expr) override {
+            if (expr->op == cot_call) has_call = true;
+            if (expr->op == cot_ref && expr->x && expr->x->op == cot_var &&
+                expr->x->v.idx == index_var) references_index = true;
+            const bool writes = is_assignment_op(expr->op) ||
+                expr->op == cot_preinc || expr->op == cot_predec ||
+                expr->op == cot_postinc || expr->op == cot_postdec;
+            if (writes && expr->x) {
+                if (expr->x->op == cot_var) {
+                    writes_index |= expr->x->v.idx == index_var;
+                } else {
+                    has_indirect_write = true;
+                }
+            }
+            return 0;
+        }
+    } visitor(var_idx);
+    const auto gather_effects = [&](const cexpr_t* operand) {
+        if (operand && operand != active_child) {
+            visitor.apply_to(const_cast<cexpr_t*>(operand), nullptr);
+        }
+    };
+    // ctree child order is not an argument-evaluation-order guarantee. A
+    // sibling's write or nested call can invalidate the index before this
+    // argument is evaluated; the outer call's own effects occur afterward.
+    // Combine sibling effects: one argument can expose the index's address
+    // and a different argument can call or write through that address.
+    gather_effects(call->x);
+    if (call->a) {
+        for (const auto& arg : *call->a) {
+            gather_effects(&arg);
+        }
+    }
+    return visitor.writes_index ||
+        ((visitor.has_call || visitor.has_indirect_write) &&
+         (visitor.references_index || escaped_local_vars_.contains(var_idx)));
+}
+
 std::optional<AccessPatternVisitor::IndexRange> AccessPatternVisitor::bounded_index_range(
         const cexpr_t* access_expr, int var_idx) const {
     // Lexical ancestry alone cannot prove dominance when a goto may enter a
@@ -988,6 +1074,10 @@ std::optional<AccessPatternVisitor::IndexRange> AccessPatternVisitor::bounded_in
         if (!parent) continue;
         if (parent->is_expr()) {
             const auto* expression = static_cast<const cexpr_t*>(parent);
+            if (expression->op == cot_call &&
+                call_sibling_may_change_index(expression, child, var_idx)) {
+                return std::nullopt;
+            }
             if (expression->op == cot_land && child == expression->y) {
                 constrain(expression->x, true);
             } else if (expression->op == cot_lor && child == expression->y) {
@@ -1362,65 +1452,64 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
     accesses_.push_back(std::move(access));
 }
 
-void AccessPatternVisitor::process_call_argument_uses(cexpr_t* call_expr) {
-    if (!call_expr || call_expr->op != cot_call || !call_expr->a) {
+void AccessPatternVisitor::process_call_argument_use(
+        const cexpr_t* call_expr, const cexpr_t* argument) {
+    if (!call_expr || call_expr->op != cot_call || !argument) {
         return;
     }
 
-    for (const auto& arg : *call_expr->a) {
-        const cexpr_t* arg_expr = &arg;
-        while (arg_expr && arg_expr->op == cot_cast) {
-            arg_expr = arg_expr->x;
-        }
-        if (!arg_expr) {
-            continue;
-        }
+    const cexpr_t* arg_expr = argument;
+    while (arg_expr && arg_expr->op == cot_cast) {
+        arg_expr = arg_expr->x;
+    }
+    if (!arg_expr) {
+        return;
+    }
 
-        if (arg_expr->type.is_array() || arg_expr->type.is_struct() || is_aggregate_member_container(arg_expr)) {
-            continue;
+    if (arg_expr->type.is_array() || arg_expr->type.is_struct() || is_aggregate_member_container(arg_expr)) {
+        return;
+    }
+
+    FieldAccess access;
+    bool resolved = false;
+
+    sval_t offset = 0;
+    uint32_t size = 0;
+    std::optional<std::uint8_t> base_indirection;
+    if (extract_access(arg_expr, offset, size, &base_indirection)) {
+        access.insn_ea = call_expr->ea;
+        access.source_func_ea = cfunc_->entry_ea;
+        access.offset = offset;
+        access.size = size;
+        access.access_type = determine_access_type(arg_expr);
+        access.semantic_type = infer_semantic_from_usage(arg_expr, call_expr);
+        access.context_expr = utils::expr_to_string(arg_expr, cfunc_);
+        access.inferred_type = arg_expr->type;
+        if (base_indirection.has_value()) {
+            access.base_indirection = base_indirection;
         }
-
-        FieldAccess access;
-        bool resolved = false;
-
-        sval_t offset = 0;
-        uint32_t size = 0;
-        std::optional<std::uint8_t> base_indirection;
-        if (extract_access(arg_expr, offset, size, &base_indirection)) {
+        resolved = true;
+    } else if (arg_expr->op == cot_var) {
+        auto it = local_aliases_.find(arg_expr->v.idx);
+        if (it != local_aliases_.end() &&
+            !address_aliases_.contains(arg_expr->v.idx)) {
+            access = it->second;
             access.insn_ea = call_expr->ea;
             access.source_func_ea = cfunc_->entry_ea;
-            access.offset = offset;
-            access.size = size;
-            access.access_type = determine_access_type(arg_expr);
-            access.semantic_type = infer_semantic_from_usage(arg_expr, call_expr);
             access.context_expr = utils::expr_to_string(arg_expr, cfunc_);
-            access.inferred_type = arg_expr->type;
-            if (base_indirection.has_value()) {
-                access.base_indirection = base_indirection;
-            }
             resolved = true;
-        } else if (arg_expr->op == cot_var) {
-            auto it = local_aliases_.find(arg_expr->v.idx);
-            if (it != local_aliases_.end() &&
-                !address_aliases_.contains(arg_expr->v.idx)) {
-                access = it->second;
-                access.insn_ea = call_expr->ea;
-                access.source_func_ea = cfunc_->entry_ea;
-                access.context_expr = utils::expr_to_string(arg_expr, cfunc_);
-                resolved = true;
-            }
         }
-
-        if (!resolved) {
-            continue;
-        }
-
-        access.is_call_argument = true;
-        if (access.access_type == AccessType::Unknown) {
-            access.access_type = AccessType::Read;
-        }
-        accesses_.push_back(std::move(access));
     }
+
+    if (!resolved) {
+        return;
+    }
+
+    access.is_call_argument = true;
+    if (access.access_type == AccessType::Unknown) {
+        access.access_type = AccessType::Read;
+    }
+    accesses_.push_back(std::move(access));
 }
 
 void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {

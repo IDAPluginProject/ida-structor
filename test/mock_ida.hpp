@@ -615,6 +615,7 @@ public:
     virtual ~ctree_visitor_t() = default;
 
     virtual int idaapi visit_expr(cexpr_t* e) { return 0; }
+    virtual int idaapi leave_expr(cexpr_t* e) { return 0; }
     virtual int idaapi visit_insn(cinsn_t* i) { return 0; }
 
     int apply_to(citem_t* item, void*) {

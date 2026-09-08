@@ -12,15 +12,17 @@ or completion of this project-wide objective.
 | Preserve every observed byte range when generating array candidates | Production `ArrayConstraintBuilder` tests; sparse and overlapping fixture contracts | Eighteen detector cases and seven live layout/diagnostic cases pass |
 | Preserve selected array element types when extracting nested subobjects | Residual-fragment helper tests and exact recursive-constructor contracts | Nine helper cases and both live constructor contracts pass; known residual types survive byte-array fallback |
 | Use index bounds only where the comparison holds for the same variable value | Fresh-IDB collector tests for branches, short-circuit expressions, mutation, loops, and casts | All 35 combined-plugin cases pass; original collector fails six selected differential cases |
+| Observe assignment and call operands before their effects; reject bounds invalidated by sibling effects | Eleven native ctree and five constructed SDK ctree cases, plus the unchanged guard suite | All 16 sequencing cases and 35 guard cases pass; matched baseline fails 11 sequencing cases |
 | Distinguish the type of a pointer base from the type of its loaded field | Production access inference helper tests and real `TypeFixer::analyze_variable` calls | Twenty-two focused helper cases and 13 live type-fixer cases pass |
 | Preserve full function/variable identity in inference caches | Production composite-key and semantics tests, forced collisions, distinct high addresses/SSA versions, and live ctree extraction | Caller cache and experimental variable identities verified; live extraction emits 19 constraints from 16 expressions |
 | Preserve complete type values in lattice caches | Real function/structure hash collisions, mutable child aliases, and returned-result mutation | Directed production lattice tests pass; cache entries own detached snapshots |
 | Merge existing types without losing evidence, observed storage, padding, or protected names | Production matcher unit tests and anonymous IDA type checks | Standalone tests and 11 real-IDA checks pass |
 | Return solver diagnostics that remain valid after the synthesis context is destroyed | Production solver/optimizer UNSAT tests and public API return/destruction checks | Standalone lifetime checks and public API UNSAT/relaxation checks pass |
 | Reject inference results belonging to another function before applying types | Real local/prototype snapshots, foreign/unknown/high-address rejection, and positive application controls | All nine live checks pass within the active IDB |
+| Map signature arguments to actual locals and distinguish target ABI defaults from recovered function evidence | Fifteen portable tests, five live argument-map cases, and six target-family cases | All pass; two foreign-ABI fixtures explicitly falsify the assumption that every function follows its target default |
 | Preserve pointer forwarding as address evidence rather than inventing a field load | Alias-only call/comparison negatives and loaded-field positive controls | Live controls pass; original-collector isolation confirms removal of a fictitious linked-list pointer observation |
-| Maintain public API, deterministic layouts, transactional persistence, global recovery, vtables, and type fixing | Full licensed integrity suite and external CMake consumer | Commit `496e507` passes all 13 licensed integrity suites (317.7 s); the identity tranche additionally passes targeted live extraction, public API, and external consumer checks |
-| Maintain reproducible, usable builds and diagnostics | CMake build, CTest, compile-gated hook checks, explicit `idump` runtime diagnostics | 180 standalone CTest entries pass after identity integration; the release build excludes all eight hook markers and its installed copy passes codesign verification |
+| Maintain public API, deterministic layouts, transactional persistence, global recovery, vtables, and type fixing | Full licensed integrity suite and external CMake consumer | All 16 combined integrity suites pass (352.2 s), including the external consumer; no contract expectations changed for sequencing/ABI integration |
+| Maintain reproducible, usable builds and diagnostics | CMake build, CTest, compile-gated hook checks, explicit `idump` runtime diagnostics | 195 standalone CTest entries pass; the release build excludes all 11 hook markers and its installed copy passes codesign verification |
 | Extend adaptive and interprocedural inference beyond existing supported paths | Production implementation, adversarial fixtures, convergence/resource tests | Incomplete; see remaining work |
 
 ## Assumption register
@@ -39,6 +41,8 @@ Dependent findings reference these identifiers.
 | A8 | Exported diagnostics contain metadata and do not own Z3 expressions tied to an expired context. | Produce real solver and optimizer UNSAT cores, destroy the context, then copy/move/read/destroy the returned diagnostics. Repeat through the public synthesis API. | Diagnostic lifetime |
 | A9 | Experimental variable identities are session-local; the ctree stays stable during each extraction pass. Hashes and diagnostic labels are not identities. | Force collisions, vary high address bits/SSA/width/function scope, reuse diagnostic IDs, and recycle node storage between passes. | Experimental extraction and solver variables |
 | A10 | Abstract types are finite acyclic trees. Cached keys/results must not retain caller-mutable child aliases; Z3 expressions and external encoders borrow their context. | Mutate the ninth function parameter without changing its hash, mutate a returned cached result, and instantiate multiple encoders in one context. | Lattice cache snapshots and shared sort declarations |
+| A11 | Assignment state changes follow operand observations; call-body effects follow argument observations. Ctree sibling order does not prove argument evaluation order. | Actual `q = *q`, indexed assignments, pre/post increments, loads around escaped-index calls, and constructed sibling reference/write combinations. | Expression sequencing |
+| A12 | Signature parameters follow the recovered `argidx`; target defaults do not prove a particular function's ABI. Location models require a complete lowered fixed prototype. | Nonidentity/invalid maps, six cross-target binaries, foreign ABI overrides, hidden return pointers, mixed register banks, and stack exhaustion. | Signature/ABI facts; details in [SIGNATURE_ABI_INFERENCE.md](SIGNATURE_ABI_INFERENCE.md) |
 
 ## Changes and reproducibility
 
@@ -78,6 +82,22 @@ testing exposed two SDK boundary assumptions: the parent list includes a null
 root sentinel, and the default visitor enumerates branch/loop bodies before
 their conditions. The verified collector handles both, including lowered
 sign-bit guards and index postincrements. [A1, A3]
+
+Assignments now commit alias/value state after operand observations. The actual
+linked-list `q = *q` load survives this order, as do indexed assignment and
+increment controls. Call-body effects follow argument traversal, while sibling
+expressions that can modify an index prevent expansion under an obsolete guard.
+Eleven native and five constructed SDK ctree cases pass; the latter verify
+restoration of the original function body. [A1, A11]
+
+Signature constraints validate `argidx` and map each recovered parameter to its
+actual local. The detector selects supported target families without host-OS
+macros and reports the evidence source. Two stripped foreign-ABI examples show
+that recovered argument locations can agree with the wrong target default;
+this limitation remains explicit. Modeled x64 stack locations start at callee
+entry: System V uses `SP + 8 bytes`, Microsoft uses `SP + 40 bytes`. Full
+contracts, primary references, and falsification records are described in
+[SIGNATURE_ABI_INFERENCE.md](SIGNATURE_ABI_INFERENCE.md). [A12]
 
 An overlapping-array test exposed a returned diagnostic retaining a Z3 tracking
 expression after its context had been destroyed. The public synthesis boundary
@@ -183,6 +203,9 @@ platforms.
   for persistent keys, current-pass expression nodes, and name bytes. [A9]
 - Type-cache snapshots: O(T) time and space for T logical tree nodes. Complete
   equality resolves collisions; caches do not use hashes as type values. [A10]
+- Sibling-effect scans: O(V²) worst-case time across a pathological call tree
+  containing V expression nodes; each scan uses O(H) stack for tree height H.
+  Indexed expansion remains capped at 32 candidate values. [A11]
 
 ## Bounded scope expansion and remaining work
 
@@ -191,18 +214,18 @@ platforms.
   directed algebra checks. Memory-result indexing is separate from the repaired
   variable interner. Moving a context with its cached TypeEncoder also needs a
   wrapper-reference repair. The experimental pipeline remains disabled by default.
-- **High impact — experimental signature/application mapping:** inspect prototype
-  argument mapping through `cfunc_t::argidx`, target ABI selection independent of
-  build-host OS, and stale inference across IDB/function revisions. Foreign
-  function-address rejection is implemented and live-tested.
+- **High impact — function ABI and revision identity:** prototype mapping and
+  target-default selection are repaired. Per-function ABI overrides absent from
+  recovered metadata still require machine-code evidence; stale inference across
+  IDB/function revisions requires explicit revision tracking. Foreign function
+  address rejection is implemented and live-tested.
 - **High impact — provenance:** preserve load versus address-flow evidence and
   independent observation sites across deduplication. Access count alone is not
   a confidence calibration. Local alias maps also need branch-sensitive
   reaching-definition checks; lexical visitation of a sibling branch does not
   establish which pointer value reaches a load.
-  A real linked-list witness also shows assignment preorder suppressing the
-  right-hand load in `q = *q`; this occurs in both the original and revised
-  collector and requires a separate expression-sequencing repair.
+  The linked-list assignment-order defect is repaired, but branch-state joins
+  and loop-carried aliases still require distinct reaching-definition evidence.
 - **High impact — interprocedural inference:** the experimental fixed-point API
   remains explicitly unimplemented. Completing it requires convergence,
   recursion/SCC, widening, and resource-bound contracts; a successful local

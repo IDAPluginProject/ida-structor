@@ -377,6 +377,8 @@ set(STRUCTOR_CORE_HEADERS
     include/structor/z3/type_variable_identity.hpp
     include/structor/z3/alias_analysis.hpp
     include/structor/z3/type_inference_engine.hpp
+    include/structor/z3/signature_argument_map.hpp
+    include/structor/z3/calling_convention_model.hpp
     include/structor/z3/type_applicator.hpp
 )
 

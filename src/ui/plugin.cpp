@@ -10,6 +10,8 @@
 #if defined(STRUCTOR_LIVE_TEST_HOOKS)
 #include "type_matcher_live_checks.hpp"
 #include "type_application_live_checks.hpp"
+#include "signature_abi_live_checks.hpp"
+#include "../../integration_tests/assignment_order_ctree_probe.hpp"
 #endif
 #include <expr.hpp>
 #include <auto.hpp>
@@ -1516,6 +1518,187 @@ static bool run_pending_api_command_impl(const qstring& command_text) {
 #endif
 
 #if defined(STRUCTOR_LIVE_TEST_HOOKS)
+    if (command == "check_assignment_order_ctree") {
+        if (parts.size() != 2) {
+            export_api_error(command.c_str(), "Expected carrier function");
+            return false;
+        }
+        ea_t func_ea = BADADDR;
+        if (!resolve_function_spec(qstring(parts[1].c_str()), func_ea)) {
+            export_api_error(command.c_str(), "Carrier function not found");
+            return false;
+        }
+        cfuncptr_t cfunc = utils::get_cfunc(func_ea);
+        const auto observations = testing::probe_assignment_order_ctree(cfunc);
+        bool success = true;
+        std::string payload = "\"evidence\":\"constructed SDK ctree\",\"cases\":[";
+        for (size_t i = 0; i < observations.size(); ++i) {
+            const auto& observation = observations[i];
+            const bool passed = observation.matches_expected &&
+                observation.original_body_restored && observation.error.empty();
+            success &= passed;
+            if (i != 0) payload += ',';
+            payload += "{\"name\":";
+            append_json_string(payload, observation.name.c_str());
+            payload += ",\"passed\":";
+            append_json_bool(payload, passed);
+            payload += ",\"original_body_restored\":";
+            append_json_bool(payload, observation.original_body_restored);
+            payload += ",\"error\":";
+            append_json_string(payload, observation.error.c_str());
+            payload += ",\"pattern\":";
+            append_access_pattern_json(payload, observation.pattern);
+            payload += '}';
+        }
+        payload += "],\"success\":";
+        append_json_bool(payload, success);
+        export_api_json(command.c_str(), payload);
+        return success;
+    }
+
+    if (command == "inspect_signature_mapping") {
+        if (parts.size() != 3) {
+            export_api_error(command.c_str(), "Expected function and mapping scenario");
+            return false;
+        }
+        ea_t func_ea = BADADDR;
+        if (!resolve_function_spec(qstring(parts[1].c_str()), func_ea)) {
+            export_api_error(command.c_str(), "Function not found");
+            return false;
+        }
+        cfuncptr_t cfunc = utils::get_cfunc(func_ea);
+        const auto evidence = detail::run_live_signature_mapping_check(cfunc, parts[2]);
+        const bool success = evidence.error.empty() && !evidence.checks.empty() &&
+            std::all_of(evidence.checks.begin(), evidence.checks.end(),
+                [](const auto& check) { return check.second; });
+        std::string payload = "\"success\":";
+        append_json_bool(payload, success);
+        payload += ",\"error\":";
+        append_json_string(payload, evidence.error);
+        payload += ",\"checks\":{";
+        bool first = true;
+        for (const auto& [name, passed] : evidence.checks) {
+            if (!first) payload += ',';
+            first = false;
+            append_json_string(payload, name);
+            payload += ':';
+            append_json_bool(payload, passed);
+        }
+        payload += "},\"argument_indexes\":[";
+        first = true;
+        for (const auto index : evidence.argument_indexes) {
+            if (!first) payload += ',';
+            first = false;
+            payload += std::to_string(index);
+        }
+        payload += "],\"parameter_types\":[";
+        first = true;
+        for (const auto& type : evidence.parameter_types) {
+            if (!first) payload += ',';
+            first = false;
+            append_json_string(payload, type);
+        }
+        payload += "],\"constraints\":[";
+        first = true;
+        for (const auto& fact : evidence.constraints) {
+            if (!first) payload += ',';
+            first = false;
+            payload += "{\"local_index\":" + std::to_string(fact.local_index);
+            payload += ",\"type\":";
+            append_json_string(payload, fact.type);
+            payload += ",\"is_soft\":";
+            append_json_bool(payload, fact.is_soft);
+            payload += ",\"weight\":" + std::to_string(fact.weight) + '}';
+        }
+        payload += ']';
+        export_api_json(command.c_str(), payload);
+        return success;
+    }
+
+    if (command == "inspect_target_calling_convention") {
+        if (parts.size() != 2) {
+            export_api_error(command.c_str(), "Expected function");
+            return false;
+        }
+        ea_t func_ea = BADADDR;
+        if (!resolve_function_spec(qstring(parts[1].c_str()), func_ea)) {
+            export_api_error(command.c_str(), "Function not found");
+            return false;
+        }
+        cfuncptr_t cfunc = utils::get_cfunc(func_ea);
+        if (!cfunc) {
+            export_api_error(command.c_str(), "Failed to decompile function");
+            return false;
+        }
+        z3::Z3Context context;
+        z3::CallingConventionDetector detector(context);
+        const auto convention = detector.detect(cfunc);
+        const auto detection = detector.detect_with_evidence(cfunc);
+        qstring database_abi;
+        const auto abi_length = get_abi_name(&database_abi);
+        tinfo_t prototype;
+        const bool has_prototype = cfunc->get_func_type(&prototype);
+        const auto* processor = get_ph();
+        std::string payload = "\"success\":true,\"convention\":";
+        append_json_string(payload, detail::calling_convention_name(convention));
+        payload += ",\"convention_evidence\":";
+        append_json_string(payload,
+            detection.evidence == z3::CallingConventionEvidence::TargetDefault ? "target_default" :
+            (detection.evidence == z3::CallingConventionEvidence::RecoveredPrototype
+                ? "recovered_prototype" : "unavailable"));
+        payload += ",\"location_assumption\":\"standard_fixed_prototype_complete_abi_arguments\"";
+        payload += ",\"processor_id\":" + std::to_string(processor ? processor->id : -1);
+        payload += ",\"bitness\":" + std::to_string(inf_is_64bit() ? 64 :
+            (inf_is_32bit_exactly() ? 32 : 16));
+        payload += ",\"filetype\":" + std::to_string(inf_get_filetype());
+        payload += ",\"database_abi\":";
+        append_json_string(payload, database_abi);
+        payload += ",\"abi_name_available\":";
+        append_json_bool(payload, abi_length >= 0);
+        payload += ",\"signature_cc\":" + std::to_string(
+            has_prototype ? static_cast<unsigned>(prototype.get_cc()) : 0);
+        payload += ",\"prototype_arguments\":[";
+        func_type_data_t prototype_details;
+        if (has_prototype && prototype.get_func_details(&prototype_details)) {
+            for (std::size_t index = 0; index < prototype_details.size(); ++index) {
+                if (index != 0) payload += ',';
+                const auto& argument = prototype_details[index];
+                payload += "{\"type\":";
+                append_json_string(payload, argument.type.dstr());
+                char location[256] = {};
+                print_argloc(location, sizeof(location), argument.argloc,
+                    static_cast<int>(argument.type.get_size()), PRALOC_STKOFF);
+                payload += ",\"location\":";
+                append_json_string(payload, location);
+                payload += '}';
+            }
+        }
+        payload += ']';
+        qvector<z3::InferredType> scalar_model;
+        scalar_model.push_back(z3::InferredType::make_base(z3::BaseType::Int32));
+        scalar_model.push_back(z3::InferredType::make_base(z3::BaseType::Float64));
+        scalar_model.push_back(z3::InferredType::make_ptr(z3::InferredType::make_base(z3::BaseType::Int8)));
+        scalar_model.push_back(z3::InferredType::make_base(z3::BaseType::Float32));
+        scalar_model.push_back(z3::InferredType::make_base(z3::BaseType::Int32));
+        scalar_model.push_back(z3::InferredType::make_base(z3::BaseType::Float64));
+        const auto locations = detector.get_param_locations(convention, scalar_model,
+            z3::ParameterPassingMode::FixedPrototype);
+        payload += ",\"scalar_model_locations\":[";
+        bool first = true;
+        for (const auto& location : locations) {
+            if (!first) payload += ',';
+            first = false;
+            payload += "{\"register\":";
+            if (location.is_register) append_json_string(payload, location.reg_name);
+            else payload += "null";
+            payload += ",\"stack_offset\":" + std::to_string(location.stack_offset) + '}';
+        }
+        payload += "],\"unspecified_location_count\":" + std::to_string(
+            detector.get_param_locations(convention, scalar_model).size());
+        export_api_json(command.c_str(), payload);
+        return true;
+    }
+
     if (command == "inspect_base_inference") {
         if (parts.size() < 3 || parts.size() > 4 ||
             (parts.size() == 4 && parts[3] != "ctree")) {

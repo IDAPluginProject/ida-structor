@@ -447,6 +447,10 @@ Experimental type variables use exact session identities, including full
 function addresses and requested SSA versions. Diagnostic IDs and labels do
 not establish variable equality. Rebuild C++ consumers after updating the
 plugin: factory signatures are preserved, but public object layouts changed.
+Calling-convention detection reports whether it used recovered prototype
+evidence or a target default. See [signature and ABI inference](docs/SIGNATURE_ABI_INFERENCE.md)
+for supported targets, the explicit fixed-prototype location model, and tested
+limits involving hidden parameters and per-function ABI overrides.
 
 ## Testing
 

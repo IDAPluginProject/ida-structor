@@ -1,4 +1,5 @@
 #include "structor/z3/type_inference_engine.hpp"
+#include "structor/z3/signature_argument_map.hpp"
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
@@ -8,6 +9,7 @@
 #include <kernwin.hpp>
 #include <name.hpp>
 #include <funcs.hpp>
+#include <idp.hpp>
 #endif
 
 namespace structor::z3 {
@@ -324,23 +326,28 @@ void TypeInferenceEngine::add_type_preferences() {
 
 void TypeInferenceEngine::add_calling_convention_constraints(cfunc_t* cfunc) {
     if (!cfunc) return;
+
+    lvars_t* lvars = cfunc->get_lvars();
+    if (!lvars) return;
+    // Validate indexes before asking the SDK to derive a function type; that
+    // operation may itself consult the argument-to-local mapping.
+    const auto bindings = detail::map_signature_arguments(
+        std::span<const int>(cfunc->argidx.begin(), cfunc->argidx.size()),
+        cfunc->argidx.size(), lvars->size());
+    if (!bindings.has_value()) return;
     
     // Get function type from IDA
     tinfo_t func_type;
     if (!cfunc->get_func_type(&func_type)) return;
     
     func_type_data_t ftd;
-    if (!func_type.get_func_details(&ftd)) return;
-    
-    // Add parameter type constraints
-    lvars_t* lvars = cfunc->get_lvars();
-    if (!lvars) return;
-    
-    for (size_t i = 0; i < ftd.size() && i < lvars->size(); ++i) {
-        auto it = var_to_type_var_.find(static_cast<int>(i));
+    if (!func_type.get_func_details(&ftd) || ftd.size() != bindings->size()) return;
+
+    for (const auto& binding : *bindings) {
+        auto it = var_to_type_var_.find(binding.local_index);
         if (it == var_to_type_var_.end()) continue;
         
-        auto inferred = InferredType::from_tinfo(ftd[i].type);
+        auto inferred = InferredType::from_tinfo(ftd[binding.parameter_index].type);
         if (inferred.is_unknown()) continue;
         
         current_constraints_.add(
@@ -506,35 +513,72 @@ void PolymorphicFunctionDetector::register_polymorphic(ea_t func_ea, TypeScheme 
 CallingConventionDetector::CallingConventionDetector(Z3Context& ctx) : ctx_(ctx) {}
 
 CallingConventionDetector::Convention CallingConventionDetector::detect(cfunc_t* cfunc) {
-    if (!cfunc) return Convention::Unknown;
-    
-    // Try to detect from function type
+    return detect_with_evidence(cfunc).convention;
+}
+
+CallingConventionDetection CallingConventionDetector::detect_with_evidence(cfunc_t* cfunc) {
+    if (!cfunc) return {};
+
+    detail::SignatureConvention signature = detail::SignatureConvention::Default;
     tinfo_t func_type;
     if (cfunc->get_func_type(&func_type)) {
-        cm_t cc = func_type.get_cc();
+        // callcnv_t preserves extended/custom convention codes; cm_t truncates
+        // them and can turn a language-specific ABI into a platform default.
+        const callcnv_t cc = func_type.get_cc();
         switch (cc) {
-            case CM_CC_CDECL:    return Convention::CDecl;
-            case CM_CC_STDCALL:  return Convention::Stdcall;
-            case CM_CC_FASTCALL: return Convention::Fastcall;
-            case CM_CC_THISCALL: return Convention::Thiscall;
-            default: break;
+            case CM_CC_UNKNOWN:
+            case CM_CC_VOIDARG:
+                break;
+            case CM_CC_CDECL:
+            case CM_CC_ELLIPSIS:
+                signature = detail::SignatureConvention::CDecl;
+                break;
+            case CM_CC_STDCALL:
+                signature = detail::SignatureConvention::Stdcall;
+                break;
+            case CM_CC_FASTCALL:
+                signature = detail::SignatureConvention::Fastcall;
+                break;
+            case CM_CC_THISCALL:
+                signature = detail::SignatureConvention::Thiscall;
+                break;
+            default:
+                signature = detail::SignatureConvention::Unsupported;
+                break;
         }
     }
-    
-    // Platform-based detection
+
+    detail::CallingConventionTarget target;
 #ifndef STRUCTOR_TESTING
-    if (inf_is_64bit()) {
-#ifdef __APPLE__
-        return Convention::SystemV_x64;
-#elif defined(_WIN32)
-        return Convention::Microsoft_x64;
-#else
-        return Convention::SystemV_x64;
-#endif
+    const auto* processor = get_ph();
+    if (processor != nullptr) {
+        if (processor->id == PLFM_386) target.machine = detail::TargetMachine::X86;
+        if (processor->id == PLFM_ARM) target.machine = detail::TargetMachine::Arm;
     }
+    target.bitness = inf_is_64bit() ? 64 : (inf_is_32bit_exactly() ? 32 : 16);
+    tinfo_t void_type;
+    void_type.create_simple_type(BTF_VOID);
+    tinfo_t pointer_type;
+    pointer_type.create_ptr(void_type);
+    const auto pointer_size = pointer_type.get_size();
+    if (pointer_size == 4 || pointer_size == 8) {
+        target.pointer_size = static_cast<unsigned>(pointer_size);
+    }
+    switch (inf_get_filetype()) {
+        case f_PE: target.format = detail::TargetObjectFormat::PE; break;
+        case f_ELF: target.format = detail::TargetObjectFormat::ELF; break;
+        case f_MACHO: target.format = detail::TargetObjectFormat::MachO; break;
+        default: break;
+    }
+    qstring database_abi;
+    if (get_abi_name(&database_abi) < 0) return {};
+    target.database_abi = database_abi.c_str();
 #endif
-    
-    return Convention::Unknown;
+    const auto convention = detail::select_calling_convention(target, signature);
+    if (convention == Convention::Unknown) return {};
+    const auto evidence = target.machine == detail::TargetMachine::X86 && target.bitness == 32
+        ? CallingConventionEvidence::RecoveredPrototype : CallingConventionEvidence::TargetDefault;
+    return {convention, evidence};
 }
 
 qvector<InferredType> CallingConventionDetector::get_param_constraints(
@@ -570,83 +614,41 @@ std::optional<InferredType> CallingConventionDetector::get_return_constraint(
     return InferredType::from_tinfo(ftd.rettype);
 }
 
-std::vector<CallingConventionDetector::ParamLocation> 
+std::vector<CallingConventionDetector::ParamLocation>
 CallingConventionDetector::get_param_locations(
     Convention conv,
-    const qvector<InferredType>& param_types)
+    const qvector<InferredType>& param_types,
+    ParameterPassingMode mode)
 {
-    std::vector<ParamLocation> result;
-    
-    // Convention-specific parameter passing rules
-    switch (conv) {
-        case Convention::SystemV_x64: {
-            // RDI, RSI, RDX, RCX, R8, R9, then stack
-            const char* int_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
-            const char* float_regs[] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
-            
-            int int_idx = 0;
-            int float_idx = 0;
-            sval_t stack_off = 0;
-            
-            for (const auto& pt : param_types) {
-                ParamLocation loc;
-                if (pt.is_base() && is_floating(pt.base_type())) {
-                    if (float_idx < 8) {
-                        loc.is_register = true;
-                        loc.reg_name = float_regs[float_idx++];
-                    } else {
-                        loc.is_register = false;
-                        loc.stack_offset = stack_off;
-                        stack_off += 8;
-                    }
-                } else {
-                    if (int_idx < 6) {
-                        loc.is_register = true;
-                        loc.reg_name = int_regs[int_idx++];
-                    } else {
-                        loc.is_register = false;
-                        loc.stack_offset = stack_off;
-                        stack_off += 8;
-                    }
-                }
-                result.push_back(loc);
+    std::vector<detail::ABIArgument> arguments;
+    arguments.reserve(param_types.size());
+    for (const auto& type : param_types) {
+        detail::ABIArgument argument;
+        if (type.is_pointer()) {
+            argument.kind = detail::ABIArgumentClass::IntegerOrPointer;
+            argument.size = 8;
+        } else if (type.is_base()) {
+            const auto base = type.base_type();
+            if (is_integer(base) || base == BaseType::Bool) {
+                argument.kind = detail::ABIArgumentClass::IntegerOrPointer;
+            } else if (is_floating(base)) {
+                argument.kind = detail::ABIArgumentClass::Floating;
             }
-            break;
+            argument.size = base_type_size(base, 8);
         }
-        
-        case Convention::Microsoft_x64: {
-            // RCX, RDX, R8, R9, then stack
-            const char* regs[] = {"rcx", "rdx", "r8", "r9"};
-            sval_t stack_off = 32;  // Shadow space
-            
-            for (size_t i = 0; i < param_types.size(); ++i) {
-                ParamLocation loc;
-                if (i < 4) {
-                    loc.is_register = true;
-                    loc.reg_name = regs[i];
-                } else {
-                    loc.is_register = false;
-                    loc.stack_offset = stack_off;
-                    stack_off += 8;
-                }
-                result.push_back(loc);
-            }
-            break;
-        }
-        
-        default:
-            // Default: all on stack
-            sval_t off = 0;
-            for (size_t i = 0; i < param_types.size(); ++i) {
-                ParamLocation loc;
-                loc.is_register = false;
-                loc.stack_offset = off;
-                off += param_types[i].size(8);
-                result.push_back(loc);
-            }
-            break;
+        arguments.push_back(argument);
     }
-    
+
+    const auto modeled = detail::fixed_x64_parameter_locations(conv, arguments, mode);
+    std::vector<ParamLocation> result;
+    result.reserve(modeled.size());
+    for (const auto& location : modeled) {
+        ParamLocation converted;
+        converted.is_register = location.is_register;
+        if (location.is_register) converted.reg_name = location.register_name.data();
+        converted.stack_offset = location.stack_offset;
+        result.push_back(std::move(converted));
+    }
     return result;
 }
 

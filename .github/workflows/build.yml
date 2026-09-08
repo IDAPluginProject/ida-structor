@@ -211,11 +211,14 @@ jobs:
           for marker in \
             STRUCTOR_INTEGRATION_TESTING \
             STRUCTOR_TEST_PERSISTENCE_FAULT \
+            check_assignment_order_ctree \
             inspect_instruction_semantics_identity \
             fault_global_tinfo_rollback \
             inspect_base_inference \
             inspect_existing_type_matcher \
             inspect_array_layout \
+            inspect_signature_mapping \
+            inspect_target_calling_convention \
             inspect_type_application_identity; do
             if strings "$PLUGIN_FILE" | grep -F -- "$marker"; then
               echo "ERROR: production plugin contains live-test marker: $marker"
@@ -295,11 +298,14 @@ jobs:
           foreach ($marker in @(
               "STRUCTOR_INTEGRATION_TESTING",
               "STRUCTOR_TEST_PERSISTENCE_FAULT",
+              "check_assignment_order_ctree",
               "inspect_instruction_semantics_identity",
               "fault_global_tinfo_rollback",
               "inspect_base_inference",
               "inspect_existing_type_matcher",
               "inspect_array_layout",
+              "inspect_signature_mapping",
+              "inspect_target_calling_convention",
               "inspect_type_application_identity")) {
             if ($ascii.Contains($marker)) {
               Write-Error "Production plugin contains live-test marker: $marker"
