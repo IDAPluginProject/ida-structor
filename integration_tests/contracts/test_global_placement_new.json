@@ -19,6 +19,8 @@
         "vtable_slots": 0,
         "propagated_to": [
           "__Z10use_gadgetv",
+          "__ZL16construct_gadgetPvj",
+          "__ZL23construct_gadget_stage2Pv",
           "__ZN6Gadget4bumpEj",
           "__ZN6GadgetC1EjPv",
           "__ZN6GadgetC2EjPv",
@@ -144,7 +146,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> __Z23construct_gadget_stage1v\nvoid *__fastcall construct_gadget_stage1() {\n    Gadget::Gadget(this: (Gadget *)&g_gadget_storage, a2: 9u, a3: &g_gadget_storage);\n    g_gadget = (__int64)&g_gadget_storage;\n    return &g_gadget_storage;\n}\n<<<\n\n>>> __Z10use_gadgetv\nauto_g_gadget_storage *__fastcall use_gadget() {\n    auto_g_gadget_storage *result; // x0\n    auto_g_gadget_storage *v1; // [xsp+8h] [xbp-8h]\n\n    v1 = g_gadget;\n    sink ^= g_gadget->u32_0;\n    sink ^= g_gadget->u32_4;\n    sink ^= g_gadget->u64_8;\n    sink ^= g_gadget->u64_10;\n    sink ^= g_gadget->u16_18;\n    sink ^= g_gadget->u16_1A;\n    result = (auto_g_gadget_storage *)Gadget::bump(this: g_gadget, a2: 4u);\n    sink ^= v1->u32_4;\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> __Z23construct_gadget_stage1v\n__int64 __fastcall construct_gadget_stage1() {\n    return construct_gadget_stage2(a1: &g_gadget_storage);\n}\n<<<\n\n>>> __Z10use_gadgetv\nauto_g_gadget_storage *__fastcall use_gadget() {\n    auto_g_gadget_storage *result; // x0\n    auto_g_gadget_storage *v1; // [xsp+8h] [xbp-8h]\n\n    v1 = g_gadget;\n    sink ^= g_gadget->u32_0;\n    sink ^= g_gadget->u32_4;\n    sink ^= g_gadget->u64_8;\n    sink ^= g_gadget->u64_10;\n    sink ^= g_gadget->u16_18;\n    sink ^= g_gadget->u16_1A;\n    result = (auto_g_gadget_storage *)Gadget::bump(this: g_gadget, a2: 4u);\n    sink ^= v1->u32_4;\n    return result;\n}\n<<<\n"
     }
   ]
 }

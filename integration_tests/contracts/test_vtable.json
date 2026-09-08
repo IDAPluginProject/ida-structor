@@ -19,8 +19,10 @@
         "fields_created": 2,
         "vtable_slots": 2,
         "propagated_to": [
+          "__Z12access_valuePv",
           "__Z19call_through_vtablePv",
-          "__ZN4BaseC2Ev",
+          "__ZN7DerivedC1Ev",
+          "__ZN7DerivedC2Ev",
           "_main"
         ],
         "failed_sites": [],
@@ -96,7 +98,7 @@
           }
         }
       },
-      "golden_pseudocode": ">>> __Z19call_through_vtablePv\n__int64 __fastcall call_through_vtable(auto_z19call_through_vtablepv *a1) {\n    int v2; // [xsp+Ch] [xbp-24h]\n    auto_z19call_through_vtablepv_vtbl *vtable; // [xsp+20h] [xbp-10h]\n\n    vtable = a1->vtable;\n    ((void (__fastcall *)(auto_z19call_through_vtablepv *))a1->vtable->slot_1)(a1);\n    v2 = ((__int64 (__fastcall *)(auto_z19call_through_vtablepv *, __int64))vtable[1].slot_0)(a1, a2: 10);\n    return printf(a1: \"method2 result: %d\\n\", v2);\n}\n<<<\n\n>>> __Z12access_valuePv\n__int64 __fastcall access_value(_DWORD *a1) {\n    return printf(a1: \"value: %d\\n\", a1[2]);\n}\n<<<\n"
+      "golden_pseudocode": ">>> __Z19call_through_vtablePv\n__int64 __fastcall call_through_vtable(auto_z19call_through_vtablepv *a1) {\n    int v2; // [xsp+Ch] [xbp-24h]\n    auto_z19call_through_vtablepv_vtbl *vtable; // [xsp+20h] [xbp-10h]\n\n    vtable = a1->vtable;\n    ((void (__fastcall *)(auto_z19call_through_vtablepv *))a1->vtable->slot_1)(a1);\n    v2 = ((__int64 (__fastcall *)(auto_z19call_through_vtablepv *, __int64))vtable[1].slot_0)(a1, a2: 10);\n    return printf(a1: \"method2 result: %d\\n\", v2);\n}\n<<<\n\n>>> __Z12access_valuePv\n__int64 __fastcall access_value(auto_z19call_through_vtablepv *a1) {\n    return printf(a1: \"value: %d\\n\", LODWORD(a1->u64_8));\n}\n<<<\n"
     },
     {
       "name": "main_dispatch_object",
@@ -117,8 +119,11 @@
         "fields_created": 2,
         "vtable_slots": 2,
         "propagated_to": [
+          "__Z12access_valuePv",
           "__Z19call_through_vtablePv",
           "__ZN4BaseC2Ev",
+          "__ZN7DerivedC1Ev",
+          "__ZN7DerivedC2Ev",
           "_main"
         ],
         "failed_sites": [],
@@ -194,7 +199,7 @@
           }
         }
       },
-      "golden_pseudocode": ">>> main\nint __fastcall main(int argc, const char **argv, const char **envp) {\n    auto_main *v4; // [xsp+0h] [xbp-20h]\n\n    v4 = (auto_main *)operator new(__sz: 0x10u);\n    v4->vtable = nullptr;\n    v4->u64_8 = 0;\n    Base::Base(this: v4);\n    v4->vtable = (auto_main_vtbl *)off_100004010;\n    v4->u64_8 = 0xC800000064LL;\n    call_through_vtable(a1: v4);\n    printf(a1: \"value: %d\\n\", LODWORD(v4->u64_8));\n    if ( v4 != nullptr )\n        ((void (__fastcall *)(auto_main *))v4->vtable->slot_1)(a1: v4);\n    return 0;\n}\n<<<\n\n>>> __Z19call_through_vtablePv\n__int64 __fastcall call_through_vtable(auto_main *a1) {\n    int v2; // [xsp+Ch] [xbp-24h]\n    auto_main_vtbl *vtable; // [xsp+20h] [xbp-10h]\n\n    vtable = a1->vtable;\n    ((void (__fastcall *)(auto_main *))a1->vtable->slot_1)(a1);\n    v2 = ((__int64 (__fastcall *)(auto_main *, __int64))vtable[1].slot_0)(a1, a2: 10);\n    return printf(a1: \"method2 result: %d\\n\", v2);\n}\n<<<\n\n>>> __Z12access_valuePv\n__int64 __fastcall access_value(_DWORD *a1) {\n    return printf(a1: \"value: %d\\n\", a1[2]);\n}\n<<<\n"
+      "golden_pseudocode": ">>> main\nint __fastcall main(int argc, const char **argv, const char **envp) {\n    auto_main *v4; // [xsp+0h] [xbp-20h]\n\n    v4 = (auto_main *)operator new(__sz: 0x10u);\n    v4->vtable = nullptr;\n    v4->u64_8 = 0;\n    Derived::Derived(this: v4);\n    v4->u64_8 = 0xC800000064LL;\n    call_through_vtable(a1: v4);\n    access_value(a1: v4);\n    if ( v4 != nullptr )\n        ((void (__fastcall *)(auto_main *))v4->vtable->slot_1)(a1: v4);\n    return 0;\n}\n<<<\n\n>>> __Z19call_through_vtablePv\n__int64 __fastcall call_through_vtable(auto_main *a1) {\n    int v2; // [xsp+Ch] [xbp-24h]\n    auto_main_vtbl *vtable; // [xsp+20h] [xbp-10h]\n\n    vtable = a1->vtable;\n    ((void (__fastcall *)(auto_main *))a1->vtable->slot_1)(a1);\n    v2 = ((__int64 (__fastcall *)(auto_main *, __int64))vtable[1].slot_0)(a1, a2: 10);\n    return printf(a1: \"method2 result: %d\\n\", v2);\n}\n<<<\n\n>>> __Z12access_valuePv\n__int64 __fastcall access_value(auto_main *a1) {\n    return printf(a1: \"value: %d\\n\", LODWORD(a1->u64_8));\n}\n<<<\n"
     }
   ]
 }

@@ -20,6 +20,7 @@
         "vtable_slots": 0,
         "propagated_to": [
           "_widget_ctor",
+          "_widget_ctor_stage2",
           "_widget_ctor_stage3",
           "_widget_use_leaf"
         ],
