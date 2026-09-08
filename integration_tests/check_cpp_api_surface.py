@@ -51,7 +51,7 @@ def require_success(proc: subprocess.CompletedProcess[str], description: str) ->
     if proc.returncode == 0:
         return
     output = (proc.stdout or "") + (proc.stderr or "")
-    raise RuntimeError(f"{description} failed\n{output}")
+    raise RuntimeError(f"{description} failed (exit={proc.returncode})\n{output}")
 
 
 def build_required_fixtures(repo_root: Path) -> None:

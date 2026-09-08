@@ -75,7 +75,7 @@ def require_success(proc, description: str) -> None:
         return
 
     output = (proc.stdout or "") + (proc.stderr or "")
-    raise RuntimeError(f"{description} failed\n{output}")
+    raise RuntimeError(f"{description} failed (exit={proc.returncode})\n{output}")
 
 
 def require_decompiler_output(output: str, idump_path: str) -> None:
