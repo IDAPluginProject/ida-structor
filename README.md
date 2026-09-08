@@ -443,6 +443,10 @@ Disabled or unsupported adjunct operations return explicit status/error data.
 The current adjunct infers per-function local-variable types only; it does not
 produce memory-location types, function signatures, interprocedural fixed
 points, allocation provenance, or polymorphic type-scheme substitutions.
+Experimental type variables use exact session identities, including full
+function addresses and requested SSA versions. Diagnostic IDs and labels do
+not establish variable equality. Rebuild C++ consumers after updating the
+plugin: factory signatures are preserved, but public object layouts changed.
 
 ## Testing
 

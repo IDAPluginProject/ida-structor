@@ -3,6 +3,7 @@
 #include <z3++.h>
 #include "structor/z3/type_lattice.hpp"
 #include "structor/z3/context.hpp"
+#include "structor/z3/type_variable_identity.hpp"
 #include "structor/synth_types.hpp"
 
 #ifndef STRUCTOR_TESTING
@@ -21,20 +22,23 @@ class TypeConstraintSet;
 
 /// A type variable representing an unknown type to be inferred
 struct TypeVariable {
-    int id;                      // Unique identifier
+    int id;                      // Diagnostic index; never a semantic identity
     ea_t func_ea;                // Function containing this variable
     int var_idx;                 // Local variable index (-1 if not a local var)
     int ssa_version;             // SSA version for flow-sensitivity
     qstring name;                // Human-readable name
+    TypeVariableIdentity identity; // Session identity, preserved when copied
     
     // Location info for memory variables
     std::optional<ea_t> mem_base;
     std::optional<sval_t> mem_offset;
     std::optional<uint32_t> mem_size;
     
-    TypeVariable() : id(-1), func_ea(BADADDR), var_idx(-1), ssa_version(0) {}
+    TypeVariable() : id(-1), func_ea(BADADDR), var_idx(-1), ssa_version(0),
+                     identity(fresh_type_variable_identity()) {}
     
-    /// Create a type variable for a local variable
+    /// Create an independent local variable. Copy it to share identity, or use
+    /// InstructionSemanticsExtractor::get_var_type for exact key interning.
     static TypeVariable for_local(int id, ea_t func_ea, int var_idx, int version = 0);
     
     /// Create a type variable for a memory location
@@ -48,14 +52,14 @@ struct TypeVariable {
     [[nodiscard]] bool is_temp() const noexcept { return !is_local() && !is_memory(); }
     
     bool operator==(const TypeVariable& other) const noexcept {
-        return id == other.id;
+        return identity == other.identity;
     }
 };
 
 /// Hash for TypeVariable
 struct TypeVariableHash {
     std::size_t operator()(const TypeVariable& tv) const noexcept {
-        return std::hash<int>{}(tv.id);
+        return TypeVariableIdentityHash{}(tv.identity);
     }
 };
 
@@ -155,10 +159,12 @@ public:
         const InstructionSemanticsConfig& config = {}
     );
     
-    /// Extract all type constraints from a function's ctree
+    /// Extract all type constraints in one expression-identity pass. The ctree
+    /// must remain stable until this call returns; no node keys survive it.
     [[nodiscard]] TypeConstraintSet extract(cfunc_t* cfunc);
     
-    /// Extract constraints for a specific expression
+    /// Extract constraints for one expression in a fresh identity pass. Local,
+    /// memory and named-variable identities persist for this extractor's life.
     [[nodiscard]] qvector<TypeConstraint> extract_expr(cexpr_t* expr, cfunc_t* cfunc);
     
     /// Get or create type variable for a local variable
@@ -191,13 +197,20 @@ private:
     
     // Type variable management
     int next_var_id_ = 0;
-    std::unordered_map<int, std::unordered_map<int, TypeVariable>> local_vars_;  // func -> var_idx -> TypeVar
-    std::unordered_map<std::size_t, TypeVariable> mem_vars_;                     // hash -> TypeVar
-    std::unordered_map<std::size_t, TypeVariable> temp_vars_;                    // hash -> TypeVar
+    TypeVariableInterner identities_;
+    using VariableCache = std::unordered_map<TypeVariableIdentity, TypeVariable,
+                                             TypeVariableIdentityHash>;
+    VariableCache persistent_vars_;
+    VariableCache expression_vars_;
     
     // Current function being analyzed
     cfunc_t* current_cfunc_ = nullptr;
     ea_t current_func_ea_ = BADADDR;
+
+    friend class ConstraintExtractionVisitor;
+    [[nodiscard]] int allocate_diagnostic_id();
+    void begin_expression_pass(cfunc_t* cfunc);
+    void end_expression_pass();
     
     /// Analyze a specific ctree node
     void analyze_node(cexpr_t* expr, qvector<TypeConstraint>& constraints);
@@ -224,11 +237,6 @@ private:
     /// Check if comparison uses unsigned semantics
     [[nodiscard]] bool is_unsigned_comparison(ctype_t cmp_op) const noexcept;
     
-    /// Generate hash for memory location
-    [[nodiscard]] std::size_t hash_mem_location(ea_t base, sval_t offset, uint32_t size) const;
-    
-    /// Generate hash for temp variable
-    [[nodiscard]] std::size_t hash_temp(ea_t func_ea, const char* name) const;
 };
 
 /// Collection of type constraints for solving
@@ -274,7 +282,8 @@ private:
     qvector<TypeConstraint> constraints_;
     std::unordered_set<TypeVariable, TypeVariableHash> variables_;
     
-    mutable std::unordered_map<int, ::z3::expr> var_cache_;  // tv.id -> z3_expr
+    mutable std::unordered_map<TypeVariableIdentity, ::z3::expr,
+                               TypeVariableIdentityHash> var_cache_;
     
     /// Convert a single constraint to Z3
     [[nodiscard]] ::z3::expr constraint_to_z3(

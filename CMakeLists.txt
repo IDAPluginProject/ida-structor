@@ -374,6 +374,7 @@ set(STRUCTOR_CORE_HEADERS
     include/structor/z3/test_ir.hpp
     include/structor/z3/type_lattice.hpp
     include/structor/z3/instruction_semantics.hpp
+    include/structor/z3/type_variable_identity.hpp
     include/structor/z3/alias_analysis.hpp
     include/structor/z3/type_inference_engine.hpp
     include/structor/z3/type_applicator.hpp

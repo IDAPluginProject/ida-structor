@@ -1,6 +1,8 @@
 #include "structor/z3/instruction_semantics.hpp"
 #include <algorithm>
 #include <functional>
+#include <limits>
+#include <stdexcept>
 
 #ifndef STRUCTOR_TESTING
 #include <pro.h>
@@ -10,6 +12,19 @@
 #endif
 
 namespace structor::z3 {
+
+namespace {
+
+std::optional<uint32_t> storage_width(const tinfo_t& type) {
+    const auto size = type.get_size();
+    if (size == BADSIZE || size == 0 ||
+        size > std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(size);
+}
+
+} // namespace
 
 // ============================================================================
 // TypeVariable implementation
@@ -47,7 +62,7 @@ TypeVariable TypeVariable::for_temp(int id, ea_t func_ea, const char* name) {
     tv.id = id;
     tv.func_ea = func_ea;
     tv.var_idx = -1;
-    tv.name = name;
+    tv.name = name ? name : "";
     return tv;
 }
 
@@ -161,103 +176,121 @@ InstructionSemanticsExtractor::InstructionSemanticsExtractor(
     , config_(config)
 {}
 
+int InstructionSemanticsExtractor::allocate_diagnostic_id() {
+    if (next_var_id_ == std::numeric_limits<int>::max()) {
+        throw std::overflow_error("type variable diagnostic indices exhausted");
+    }
+    ++stats_.type_variables;
+    return next_var_id_++;
+}
+
+void InstructionSemanticsExtractor::begin_expression_pass(cfunc_t* cfunc) {
+    identities_.begin_expression_pass();
+    expression_vars_.clear();
+    current_cfunc_ = cfunc;
+    current_func_ea_ = cfunc->entry_ea;
+    stats_.expressions_analyzed = 0;
+    stats_.constraints_extracted = 0;
+    stats_.hard_constraints = 0;
+    stats_.soft_constraints = 0;
+}
+
+void InstructionSemanticsExtractor::end_expression_pass() {
+    expression_vars_.clear();
+    identities_.end_expression_pass();
+    current_cfunc_ = nullptr;
+    current_func_ea_ = BADADDR;
+}
+
 TypeConstraintSet InstructionSemanticsExtractor::extract(cfunc_t* cfunc) {
     TypeConstraintSet result(ctx_);
-    
     if (!cfunc || !cfunc->body.cblock) {
         return result;
     }
-    
-    current_cfunc_ = cfunc;
-    current_func_ea_ = cfunc->entry_ea;
-    
-    qvector<TypeConstraint> constraints;
-    
-    // Visit all expressions in the ctree
-    ConstraintExtractionVisitor visitor(*this, constraints);
-    visitor.apply_to(&cfunc->body, nullptr);
-    
-    // Add all extracted constraints
-    result.add_all(constraints);
-    
-    stats_.constraints_extracted = static_cast<int>(constraints.size());
-    
+
+    begin_expression_pass(cfunc);
+    try {
+        qvector<TypeConstraint> constraints;
+        ConstraintExtractionVisitor visitor(*this, constraints);
+        visitor.apply_to(&cfunc->body, nullptr);
+        result.add_all(constraints);
+        stats_.constraints_extracted = static_cast<int>(result.total_count());
+        stats_.hard_constraints = static_cast<int>(result.hard_count());
+        stats_.soft_constraints = static_cast<int>(result.soft_count());
+    } catch (...) {
+        end_expression_pass();
+        throw;
+    }
+    end_expression_pass();
     return result;
 }
 
 qvector<TypeConstraint> InstructionSemanticsExtractor::extract_expr(
-    cexpr_t* expr, 
+    cexpr_t* expr,
     cfunc_t* cfunc)
 {
     qvector<TypeConstraint> constraints;
-    
     if (!expr || !cfunc) {
         return constraints;
     }
-    
-    current_cfunc_ = cfunc;
-    current_func_ea_ = cfunc->entry_ea;
-    
-    analyze_node(expr, constraints);
-    
+
+    begin_expression_pass(cfunc);
+    try {
+        analyze_node(expr, constraints);
+        stats_.constraints_extracted = static_cast<int>(constraints.size());
+        stats_.soft_constraints = static_cast<int>(std::count_if(
+            constraints.begin(), constraints.end(),
+            [](const TypeConstraint& constraint) { return constraint.is_soft; }));
+        stats_.hard_constraints = stats_.constraints_extracted - stats_.soft_constraints;
+    } catch (...) {
+        end_expression_pass();
+        throw;
+    }
+    end_expression_pass();
     return constraints;
 }
 
 TypeVariable InstructionSemanticsExtractor::get_var_type(
-    cfunc_t* cfunc, 
-    int var_idx, 
+    cfunc_t* cfunc,
+    int var_idx,
     int version)
 {
-    ea_t func_ea = cfunc ? cfunc->entry_ea : BADADDR;
-    
-    // Check cache
-    auto func_it = local_vars_.find(static_cast<int>(func_ea));
-    if (func_it != local_vars_.end()) {
-        auto var_it = func_it->second.find(var_idx);
-        if (var_it != func_it->second.end()) {
-            return var_it->second;
-        }
+    const ea_t func_ea = cfunc ? cfunc->entry_ea : BADADDR;
+    const auto identity = identities_.local(func_ea, var_idx, version);
+    if (const auto found = persistent_vars_.find(identity); found != persistent_vars_.end()) {
+        return found->second;
     }
-    
-    // Create new type variable
-    TypeVariable tv = TypeVariable::for_local(next_var_id_++, func_ea, var_idx, version);
-    local_vars_[static_cast<int>(func_ea)][var_idx] = tv;
-    stats_.type_variables++;
-    
+    TypeVariable tv = TypeVariable::for_local(
+        allocate_diagnostic_id(), func_ea, var_idx, version);
+    tv.identity = identity;
+    persistent_vars_.emplace(identity, tv);
     return tv;
 }
 
 TypeVariable InstructionSemanticsExtractor::get_mem_type(
-    ea_t base, 
-    sval_t offset, 
+    ea_t base,
+    sval_t offset,
     uint32_t size)
 {
-    std::size_t hash = hash_mem_location(base, offset, size);
-    
-    auto it = mem_vars_.find(hash);
-    if (it != mem_vars_.end()) {
-        return it->second;
+    const auto identity = identities_.memory(base, offset, size);
+    if (const auto found = persistent_vars_.find(identity); found != persistent_vars_.end()) {
+        return found->second;
     }
-    
-    TypeVariable tv = TypeVariable::for_memory(next_var_id_++, base, offset, size);
-    mem_vars_[hash] = tv;
-    stats_.type_variables++;
-    
+    TypeVariable tv = TypeVariable::for_memory(
+        allocate_diagnostic_id(), base, offset, size);
+    tv.identity = identity;
+    persistent_vars_.emplace(identity, tv);
     return tv;
 }
 
 TypeVariable InstructionSemanticsExtractor::get_temp_type(ea_t func_ea, const char* name) {
-    std::size_t hash = hash_temp(func_ea, name);
-    
-    auto it = temp_vars_.find(hash);
-    if (it != temp_vars_.end()) {
-        return it->second;
+    const auto identity = identities_.named(func_ea, name ? name : "");
+    if (const auto found = persistent_vars_.find(identity); found != persistent_vars_.end()) {
+        return found->second;
     }
-    
-    TypeVariable tv = TypeVariable::for_temp(next_var_id_++, func_ea, name);
-    temp_vars_[hash] = tv;
-    stats_.type_variables++;
-    
+    TypeVariable tv = TypeVariable::for_temp(allocate_diagnostic_id(), func_ea, name);
+    tv.identity = identity;
+    persistent_vars_.emplace(identity, tv);
     return tv;
 }
 
@@ -422,10 +455,9 @@ void InstructionSemanticsExtractor::extract_from_ptr_deref(
     );
     
     // Size constraint from access
-    uint32_t access_size = static_cast<uint32_t>(expr->type.get_size());
-    if (access_size > 0) {
+    if (const auto access_size = storage_width(expr->type)) {
         constraints.push_back(
-            TypeConstraint::make_has_size(deref_type, access_size, expr->ea)
+            TypeConstraint::make_has_size(deref_type, *access_size, expr->ea)
                 .describe("dereference size")
         );
     }
@@ -605,10 +637,9 @@ void InstructionSemanticsExtractor::extract_from_cast(
     
     // Source type has size from original
     if (!expr->x->type.empty()) {
-        uint32_t src_size = static_cast<uint32_t>(expr->x->type.get_size());
-        if (src_size > 0 && src_size != BADSIZE) {
+        if (const auto src_size = storage_width(expr->x->type)) {
             constraints.push_back(
-                TypeConstraint::make_has_size(src_type, src_size, expr->ea)
+                TypeConstraint::make_has_size(src_type, *src_size, expr->ea)
                     .describe("cast source size")
             );
         }
@@ -696,10 +727,9 @@ void InstructionSemanticsExtractor::extract_from_array_access(
     
     // Element type from expression type
     if (!expr->type.empty()) {
-        uint32_t elem_size = static_cast<uint32_t>(expr->type.get_size());
-        if (elem_size > 0 && elem_size != BADSIZE) {
+        if (const auto elem_size = storage_width(expr->type)) {
             constraints.push_back(
-                TypeConstraint::make_has_size(elem_type, elem_size, expr->ea)
+                TypeConstraint::make_has_size(elem_type, *elem_size, expr->ea)
                     .describe("array element size")
             );
         }
@@ -743,18 +773,25 @@ std::optional<InferredType> InstructionSemanticsExtractor::infer_from_tinfo(cons
 
 TypeVariable InstructionSemanticsExtractor::get_expr_type(cexpr_t* expr) {
     if (!expr) {
-        return get_temp_type(current_func_ea_, "null_expr");
+        // Missing operands are not a shared program variable.
+        return TypeVariable::for_temp(
+            allocate_diagnostic_id(), current_func_ea_, "null_expr");
     }
-    
-    // Check if this is a local variable reference
     if (expr->op == cot_var && current_cfunc_) {
         return get_var_type(current_cfunc_, expr->v.idx);
     }
-    
-    // Create temp type variable for expression
+
+    const auto identity = identities_.expression(expr);
+    if (const auto found = expression_vars_.find(identity); found != expression_vars_.end()) {
+        return found->second;
+    }
     qstring name;
     name.sprnt("expr_%llX_%d", static_cast<unsigned long long>(expr->ea), expr->op);
-    return get_temp_type(current_func_ea_, name.c_str());
+    TypeVariable tv = TypeVariable::for_temp(
+        allocate_diagnostic_id(), current_func_ea_, name.c_str());
+    tv.identity = identity;
+    expression_vars_.emplace(identity, tv);
+    return tv;
 }
 
 bool InstructionSemanticsExtractor::is_signed_comparison(ctype_t cmp_op) const noexcept {
@@ -767,25 +804,6 @@ bool InstructionSemanticsExtractor::is_unsigned_comparison(ctype_t cmp_op) const
     // Unsigned comparisons: ult, ule, ugt, uge
     return cmp_op == cot_ult || cmp_op == cot_ule || 
            cmp_op == cot_ugt || cmp_op == cot_uge;
-}
-
-std::size_t InstructionSemanticsExtractor::hash_mem_location(
-    ea_t base, 
-    sval_t offset, 
-    uint32_t size) const
-{
-    std::size_t h = std::hash<ea_t>{}(base);
-    h ^= std::hash<sval_t>{}(offset) << 1;
-    h ^= std::hash<uint32_t>{}(size) << 2;
-    return h;
-}
-
-std::size_t InstructionSemanticsExtractor::hash_temp(ea_t func_ea, const char* name) const {
-    std::size_t h = std::hash<ea_t>{}(func_ea);
-    if (name) {
-        h ^= std::hash<std::string_view>{}(name) << 1;
-    }
-    return h;
 }
 
 // ============================================================================
@@ -818,13 +836,14 @@ void TypeConstraintSet::add_all(const qvector<TypeConstraint>& constraints) {
     const TypeVariable& tv, 
     TypeLatticeEncoder& encoder) const
 {
-    auto it = var_cache_.find(tv.id);
+    auto it = var_cache_.find(tv.identity);
     if (it != var_cache_.end()) {
         return it->second;
     }
     
-    ::z3::expr var = encoder.make_type_var(tv.name.c_str());
-    var_cache_.emplace(tv.id, var);
+    const auto symbol = type_variable_solver_symbol(tv.identity);
+    ::z3::expr var = encoder.make_type_var(symbol.c_str());
+    var_cache_.emplace(tv.identity, var);
     return var;
 }
 
@@ -947,10 +966,9 @@ ConstraintExtractionVisitor::ConstraintExtractionVisitor(
 {}
 
 int ConstraintExtractionVisitor::visit_expr(cexpr_t* e) {
-    auto extracted = extractor_.extract_expr(e, nullptr);  // cfunc set in extractor
-    for (auto& c : extracted) {
-        constraints_.push_back(std::move(c));
-    }
+    // The owning extract() call already established one function/pass. A
+    // public extract_expr() call would start a separate pass for every node.
+    extractor_.analyze_node(e, constraints_);
     return 0;  // Continue visiting
 }
 

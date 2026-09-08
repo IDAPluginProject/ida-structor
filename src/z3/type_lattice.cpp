@@ -512,6 +512,19 @@ std::size_t InferredType::hash() const noexcept {
     return h;
 }
 
+InferredType InferredType::snapshot() const {
+    InferredType result = *this;
+    const auto copy_child = [](const std::shared_ptr<InferredType>& child) {
+        return child ? std::make_shared<InferredType>(child->snapshot()) : nullptr;
+    };
+    result.pointee_ = copy_child(pointee_);
+    result.return_type_ = copy_child(return_type_);
+    result.element_type_ = copy_child(element_type_);
+    for (auto& parameter : result.param_types_) parameter = copy_child(parameter);
+    for (auto& alternative : result.sum_alternatives_) alternative = copy_child(alternative);
+    return result;
+}
+
 // ============================================================================
 // TypeLattice implementation
 // ============================================================================
@@ -612,16 +625,16 @@ InferredType TypeLattice::lub(const InferredType& a, const InferredType& b) cons
     if (b.is_bottom()) return a;
     
     // Check cache
-    TypePairKey key{a.hash(), b.hash()};
+    TypePairKey key{a, b};
     auto it = lub_cache_.find(key);
     if (it != lub_cache_.end()) {
         ++stats_.lub_hits;
-        return it->second;
+        return it->second.snapshot();
     }
     
     ++stats_.lub_misses;
     InferredType result = lub_impl(a, b);
-    lub_cache_.emplace(key, result);
+    lub_cache_.emplace(TypePairKey{a.snapshot(), b.snapshot()}, result.snapshot());
     return result;
 }
 
@@ -691,16 +704,16 @@ InferredType TypeLattice::glb(const InferredType& a, const InferredType& b) cons
     if (b.is_unknown()) return a;
     
     // Check cache
-    TypePairKey key{a.hash(), b.hash()};
+    TypePairKey key{a, b};
     auto it = glb_cache_.find(key);
     if (it != glb_cache_.end()) {
         ++stats_.glb_hits;
-        return it->second;
+        return it->second.snapshot();
     }
     
     ++stats_.glb_misses;
     InferredType result = glb_impl(a, b);
-    glb_cache_.emplace(key, result);
+    glb_cache_.emplace(TypePairKey{a.snapshot(), b.snapshot()}, result.snapshot());
     return result;
 }
 
@@ -795,6 +808,11 @@ void TypeLatticeEncoder::initialize_sorts() {
 }
 
 void TypeLatticeEncoder::initialize_base_sort() {
+    if (ctx_.type_lattice_sorts_) {
+        base_type_sort_ = ctx_.type_lattice_sorts_->base_sort;
+        base_type_consts_ = ctx_.type_lattice_sorts_->base_constants;
+        return;
+    }
     auto& c = ctx_.ctx();
     
     // Create enumeration sort for base types
@@ -826,6 +844,8 @@ void TypeLatticeEncoder::initialize_base_sort() {
     for (unsigned i = 0; i < num_base_types; ++i) {
         base_type_consts_.push_back(consts[i]());
     }
+    ctx_.type_lattice_sorts_ = std::make_unique<Z3Context::TypeLatticeSortCache>(
+        *base_type_sort_, base_type_consts_);
 }
 
 void TypeLatticeEncoder::initialize_type_datatype() {
@@ -879,8 +899,7 @@ void TypeLatticeEncoder::initialize_type_datatype() {
 
 ::z3::expr TypeLatticeEncoder::encode(const InferredType& type) {
     // Check cache
-    auto hash = type.hash();
-    auto it = encode_cache_.find(hash);
+    auto it = encode_cache_.find(type);
     if (it != encode_cache_.end()) {
         return it->second;
     }
@@ -933,7 +952,7 @@ void TypeLatticeEncoder::initialize_type_datatype() {
     }
     
     result = ctx_.int_val(encoded);
-    encode_cache_.emplace(hash, result);
+    encode_cache_.emplace(type.snapshot(), result);
     return result;
 }
 

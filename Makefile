@@ -80,7 +80,8 @@ install:
 	@for marker in STRUCTOR_INTEGRATION_TESTING \
 		STRUCTOR_TEST_PERSISTENCE_FAULT fault_global_tinfo_rollback \
 		inspect_base_inference inspect_existing_type_matcher \
-		inspect_array_layout inspect_type_application_identity; do \
+		inspect_array_layout inspect_type_application_identity \
+		inspect_instruction_semantics_identity; do \
 		if strings "$(INSTALL_STAGE_DIR)/plugins/structor$(PLUGIN_EXT)" | \
 			grep -F -- "$$marker" >/dev/null; then \
 			echo "Production plugin contains live-test marker: $$marker"; \

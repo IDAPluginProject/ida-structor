@@ -37,7 +37,18 @@ Z3Context::Z3Context(const Z3Config& config)
 Z3Context::~Z3Context() = default;
 
 Z3Context::Z3Context(Z3Context&&) noexcept = default;
-Z3Context& Z3Context::operator=(Z3Context&&) noexcept = default;
+Z3Context& Z3Context::operator=(Z3Context&& other) noexcept {
+    if (this != &other) {
+        // Release context-owned AST caches before replacing their context.
+        type_encoder_.reset();
+        type_lattice_sorts_.reset();
+        ctx_ = std::move(other.ctx_);
+        config_ = other.config_;
+        type_encoder_ = std::move(other.type_encoder_);
+        type_lattice_sorts_ = std::move(other.type_lattice_sorts_);
+    }
+    return *this;
+}
 
 ::z3::solver Z3Context::make_solver() {
     ::z3::solver s(*ctx_);

@@ -400,6 +400,8 @@ inline bool tinfo_t::get_array_details(array_type_data_t* atd) const {
     return true;
 }
 
+inline bool get_tinfo(tinfo_t*, ea_t) { return false; }
+
 // ============================================================================
 // Hex-Rays Mock Types
 // ============================================================================
@@ -475,6 +477,9 @@ enum ctype_t {
     cot_sizeof,
     cot_helper,
     cot_type,
+    cit_empty = 1000,
+    cit_block,
+    cit_expr,
 };
 
 struct citem_t;
@@ -494,13 +499,11 @@ struct citem_t {
     ea_t ea = BADADDR;
 
     bool is_citem() const { return true; }
-    bool is_expr() const { return true; }
+    bool is_expr() const { return op < cit_empty; }
 
     cexpr_t* cexpr();
     const cexpr_t* cexpr() const;
 };
-
-struct carglist_t : public qvector<cexpr_t*> {};
 
 struct cexpr_t : public citem_t {
     tinfo_t type;
@@ -510,6 +513,7 @@ struct cexpr_t : public citem_t {
     sval_t m = 0;  // member offset for memptr
     ea_t obj_ea = BADADDR;  // for cot_obj
     carglist_t* a = nullptr;  // for cot_call
+    int ptrsize = 0;
 
     sval_t numval() const { return num_value_; }
     void set_numval(sval_t val) { num_value_ = val; }
@@ -523,11 +527,19 @@ private:
     sval_t num_value_ = 0;
 };
 
+struct carglist_t : public qvector<cexpr_t> {};
+
 // Define the cexpr() methods after cexpr_t is complete
 inline cexpr_t* citem_t::cexpr() { return static_cast<cexpr_t*>(this); }
 inline const cexpr_t* citem_t::cexpr() const { return static_cast<const cexpr_t*>(this); }
 
-struct cinsn_t : public citem_t {};
+struct cblock_t;
+struct cinsn_t : public citem_t {
+    cinsn_t() { op = cit_empty; }
+    cblock_t* cblock = nullptr;
+    cexpr_t cexpr;
+};
+struct cblock_t : public qvector<cinsn_t> {};
 
 struct lvar_locator_t {
     int mock_id = -1;
@@ -608,7 +620,25 @@ public:
     int apply_to(citem_t* item, void*) {
         if (!item) return 0;
         if (item->is_expr()) {
-            return visit_expr(static_cast<cexpr_t*>(item));
+            auto* expression = static_cast<cexpr_t*>(item);
+            if (const int result = visit_expr(expression)) return result;
+            if (const int result = apply_to(expression->x, nullptr)) return result;
+            if (const int result = apply_to(expression->y, nullptr)) return result;
+            if (expression->op == cot_call && expression->a) {
+                for (auto& argument : *expression->a) {
+                    if (const int result = apply_to(&argument, nullptr)) return result;
+                }
+            }
+        } else {
+            auto* instruction = static_cast<cinsn_t*>(item);
+            if (const int result = visit_insn(instruction)) return result;
+            if (instruction->op == cit_block && instruction->cblock) {
+                for (auto& child : *instruction->cblock) {
+                    if (const int result = apply_to(&child, nullptr)) return result;
+                }
+            } else if (instruction->op == cit_expr) {
+                return apply_to(&instruction->cexpr, nullptr);
+            }
         }
         return 0;
     }

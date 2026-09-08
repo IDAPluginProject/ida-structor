@@ -437,12 +437,9 @@ TypeVariable TypeInferenceEngine::get_type_var(int var_idx) {
         return it->second;
     }
     
-    // Create new type variable
-    TypeVariable tv = TypeVariable::for_local(
-        static_cast<int>(var_to_type_var_.size()),
-        current_cfunc_ ? current_cfunc_->entry_ea : BADADDR,
-        var_idx
-    );
+    // Use the extractor's exact registry so later constraints refer to the
+    // same local, independently of diagnostic index allocation order.
+    TypeVariable tv = semantics_extractor_->get_var_type(current_cfunc_, var_idx);
     var_to_type_var_[var_idx] = tv;
     return tv;
 }

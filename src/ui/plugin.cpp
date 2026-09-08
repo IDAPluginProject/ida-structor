@@ -1644,6 +1644,68 @@ static bool run_pending_api_command_impl(const qstring& command_text) {
         export_api_json(command.c_str(), payload);
         return !comparison.inferred_type.empty();
     }
+    if (command == "inspect_instruction_semantics_identity") {
+        ea_t function_ea = BADADDR;
+        if (parts.size() != 2 ||
+            !resolve_function_spec(qstring(parts[1].c_str()), function_ea)) {
+            export_api_error(command.c_str(), "Expected a function");
+            return false;
+        }
+        cfuncptr_t cfunc = utils::get_cfunc(function_ea);
+        if (!cfunc) {
+            export_api_error(command.c_str(), "Failed to decompile identity fixture");
+            return false;
+        }
+        z3::Z3Context context;
+        z3::InstructionSemanticsExtractor extractor(context);
+        const auto extracted = extractor.extract(cfunc);
+        const bool full_extraction = extracted.hard_count() > 0 &&
+            extracted.total_count() > 0 && extractor.stats().expressions_analyzed > 0;
+        z3::TypeLatticeEncoder second_encoder(context);
+        const bool shared_sorts =
+            ::z3::eq(extractor.type_encoder().base_type_sort(), second_encoder.base_type_sort()) &&
+            ::z3::eq(extractor.type_encoder().type_sort(), second_encoder.type_sort());
+
+        const auto integer = z3::TypeVariable::for_temp(7, function_ea, "same label");
+        const auto floating = z3::TypeVariable::for_temp(7, function_ea, "same label");
+        z3::TypeConstraintSet independent(context);
+        independent.add(z3::TypeConstraint::make_is_base(integer, z3::BaseType::Int32));
+        independent.add(z3::TypeConstraint::make_is_base(floating, z3::BaseType::Float32));
+        auto solver = context.make_solver();
+        solver.add(independent.to_z3_hard(second_encoder));
+        const bool independent_variables = independent.variables().size() == 2 &&
+            solver.check() == ::z3::sat;
+
+        z3::TypeInferenceConfig inference_config;
+        inference_config.enable_experimental_pipeline = true;
+        inference_config.phase_alias_analysis = false;
+        inference_config.phase_soft_constraints = false;
+        z3::TypeInferenceEngine engine(context, inference_config);
+        const auto inference = engine.infer_function(cfunc);
+        const bool engine_extraction =
+            inference.status != z3::TypeInferenceStatus::InternalError &&
+            inference.stats.type_constraints_hard > 0 &&
+            inference.stats.variables_typed > 0;
+        const bool success = full_extraction && shared_sorts &&
+            independent_variables && engine_extraction;
+        std::string payload = "\"success\":";
+        append_json_bool(payload, success);
+        payload += ",\"full_extraction\":";
+        append_json_bool(payload, full_extraction);
+        payload += ",\"shared_sorts\":";
+        append_json_bool(payload, shared_sorts);
+        payload += ",\"independent_variables\":";
+        append_json_bool(payload, independent_variables);
+        payload += ",\"engine_extraction\":";
+        append_json_bool(payload, engine_extraction);
+        payload += ",\"constraints\":" + std::to_string(extracted.total_count());
+        payload += ",\"expressions\":" + std::to_string(extractor.stats().expressions_analyzed);
+        payload += ",\"engine_status\":" + std::to_string(static_cast<int>(inference.status));
+        payload += ",\"engine_error\":";
+        append_json_string(payload, inference.error_message.c_str());
+        export_api_json(command.c_str(), payload);
+        return success;
+    }
 
     if (command == "fault_global_tinfo_rollback") {
         qstring global_name;

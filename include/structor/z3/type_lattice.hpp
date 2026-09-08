@@ -170,6 +170,10 @@ public:
     /// Hash support
     [[nodiscard]] std::size_t hash() const noexcept;
 
+    /// Copy a finite, acyclic type tree without retaining mutable child aliases.
+    /// Cache keys and cached results use snapshots to preserve value identity.
+    [[nodiscard]] InferredType snapshot() const;
+
 private:
     Kind kind_ = Kind::Base;
     BaseType base_type_ = BaseType::Unknown;
@@ -245,13 +249,13 @@ private:
     /// Internal GLB implementation without caching
     [[nodiscard]] InferredType glb_impl(const InferredType& a, const InferredType& b) const;
     
-    /// Cache key for type pairs - optimized for minimal collisions
+    /// Cache keys own complete types; hashes only select lookup buckets.
     struct TypePairKey {
-        std::size_t hash_a;
-        std::size_t hash_b;
-        
-        bool operator==(const TypePairKey& other) const noexcept {
-            return hash_a == other.hash_a && hash_b == other.hash_b;
+        InferredType type_a;
+        InferredType type_b;
+
+        bool operator==(const TypePairKey& other) const {
+            return type_a == other.type_a && type_b == other.type_b;
         }
     };
     
@@ -259,8 +263,8 @@ private:
         std::size_t operator()(const TypePairKey& k) const noexcept {
             // FNV-1a style mixing with golden ratio - better avalanche than XOR
             constexpr std::size_t kGoldenRatio = 0x9e3779b97f4a7c15ULL;
-            std::size_t h = k.hash_a;
-            h ^= k.hash_b + kGoldenRatio + (h << 6) + (h >> 2);
+            std::size_t h = k.type_a.hash();
+            h ^= k.type_b.hash() + kGoldenRatio + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -346,7 +350,7 @@ private:
     std::vector<::z3::expr> base_type_consts_;
     
     // Cache for encoded types
-    std::unordered_map<std::size_t, ::z3::expr> encode_cache_;
+    std::unordered_map<InferredType, ::z3::expr, InferredTypeHash> encode_cache_;
     
     void initialize_sorts();
     void initialize_base_sort();

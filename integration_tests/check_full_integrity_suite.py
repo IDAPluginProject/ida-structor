@@ -85,6 +85,7 @@ def main() -> int:
         [sys.executable, "integration_tests/check_type_matcher_regressions.py", *common],
         [sys.executable, "integration_tests/check_array_regressions.py", *common],
         [sys.executable, "integration_tests/check_type_application_regressions.py", *common],
+        [sys.executable, "integration_tests/check_instruction_semantics_identity.py", *common],
     ]
 
     labels = [
@@ -101,6 +102,7 @@ def main() -> int:
         "existing-type matcher regressions",
         "typed-array solver regressions",
         "type-application identity regressions",
+        "experimental instruction semantics identity",
     ]
 
     for cmd, label in zip(suites, labels, strict=True):

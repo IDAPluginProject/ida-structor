@@ -211,6 +211,7 @@ jobs:
           for marker in \
             STRUCTOR_INTEGRATION_TESTING \
             STRUCTOR_TEST_PERSISTENCE_FAULT \
+            inspect_instruction_semantics_identity \
             fault_global_tinfo_rollback \
             inspect_base_inference \
             inspect_existing_type_matcher \
@@ -294,6 +295,7 @@ jobs:
           foreach ($marker in @(
               "STRUCTOR_INTEGRATION_TESTING",
               "STRUCTOR_TEST_PERSISTENCE_FAULT",
+              "inspect_instruction_semantics_identity",
               "fault_global_tinfo_rollback",
               "inspect_base_inference",
               "inspect_existing_type_matcher",

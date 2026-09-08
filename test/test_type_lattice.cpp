@@ -383,9 +383,100 @@ TEST(type_lattice_canonical) {
     ASSERT_EQ(canonical8_32.base_type(), BaseType::UInt64);
 }
 
+// Equal hashes must never substitute a different type at a lattice boundary.
+TEST(type_lattice_function_hash_collision) {
+    const auto scalar = InferredType::make_base(BaseType::Int32);
+    std::vector<InferredType> args(9, scalar);
+    const auto first = InferredType::make_func(scalar, args);
+    args[8] = InferredType::make_base(BaseType::Float64);
+    const auto second = InferredType::make_func(scalar, args);
+    ASSERT_NE(first, second);
+    // The current bounded hash deliberately samples only the first eight args.
+    ASSERT_EQ(first.hash(), second.hash());
+    TypeLattice lattice;
+    ASSERT_EQ(lattice.lub(first, first), first);
+    ASSERT_EQ(lattice.lub(second, second), second);
+    ASSERT_EQ(lattice.glb(first, first), first);
+    ASSERT_EQ(lattice.glb(second, second), second);
+    ASSERT_EQ(lattice.lub(first, first), first);
+    ASSERT_EQ(lattice.glb(second, second), second);
+}
+
+TEST(type_lattice_cache_mutable_arguments) {
+    const auto scalar = InferredType::make_base(BaseType::Int32);
+    std::vector<InferredType> args(9, scalar);
+    auto first = InferredType::make_func(scalar, args);
+    args[8] = InferredType::make_base(BaseType::Int8);
+    const auto second = InferredType::make_func(scalar, args);
+    TypeLattice cached, uncached;
+    ASSERT_EQ(cached.lub(first, second), second);
+    ASSERT_EQ(cached.glb(first, second), first);
+    const auto original_hash = first.hash();
+    *first.param_types()[8] = InferredType::make_base(BaseType::Float64);
+    ASSERT_EQ(first.hash(), original_hash);
+    // Shared children are mutable through the public API. Neither the cache
+    // identity nor its result may silently change with an old caller object.
+    ASSERT_EQ(cached.lub(first, second), uncached.lub(first, second));
+    ASSERT_EQ(cached.glb(first, second), uncached.glb(first, second));
+}
+
+TEST(type_lattice_cache_result_isolation) {
+    const auto scalar = InferredType::make_base(BaseType::Int32);
+    const auto original = InferredType::make_func(scalar, {scalar});
+    TypeLattice lattice;
+    (void)lattice.lub(original, original);
+    (void)lattice.glb(original, original);
+    auto joined = lattice.lub(original, original);
+    auto met = lattice.glb(original, original);
+    *joined.param_types()[0] = InferredType::make_base(BaseType::Float32);
+    *met.param_types()[0] = InferredType::make_base(BaseType::UInt64);
+    const auto expected = InferredType::make_func(scalar, {scalar});
+    ASSERT_EQ(original, expected);
+    ASSERT_EQ(lattice.lub(expected, expected), expected);
+    ASSERT_EQ(lattice.glb(expected, expected), expected);
+}
+
+TEST(inferred_type_snapshot) {
+    auto pointee = std::make_shared<InferredType>(InferredType::make_base(BaseType::Int32));
+    const auto pointer = InferredType::make_ptr(pointee);
+    const auto compound = InferredType::make_sum({
+        InferredType::make_array(pointer, 3),
+        InferredType::make_func(pointer, {pointer})});
+    const auto snapshot = compound.snapshot();
+    ASSERT_EQ(compound, snapshot);
+    *pointee = InferredType::make_base(BaseType::Float64);
+    ASSERT_NE(compound, snapshot);
+    ASSERT_EQ(snapshot.sum_alternatives()[0]->element_type()->pointee()->base_type(),
+              BaseType::Int32);
+    ASSERT_EQ(snapshot.sum_alternatives()[1]->return_type()->pointee()->base_type(),
+              BaseType::Int32);
+    ASSERT_EQ(snapshot.sum_alternatives()[1]->param_types()[0]->pointee()->base_type(),
+              BaseType::Int32);
+}
+
 // ============================================================================
 // TypeLatticeEncoder tests
 // ============================================================================
+
+TEST(type_encoder_cross_kind_hash_collision) {
+    // Full-width structure identities can collide with scalar cache hashes.
+    // This value is the inverse of the structure hash's pre-avalanche mix
+    // for BaseType::Int32; equality still has to compare the complete type.
+    const auto scalar = InferredType::make_base(BaseType::Int32);
+    const auto structure = InferredType::make_struct(0xFD000001BA03ULL);
+    ASSERT_NE(scalar, structure);
+    ASSERT_EQ(scalar.hash(), structure.hash());
+    Z3Context ctx;
+    TypeLatticeEncoder encoder(ctx);
+    const auto encoded_scalar = encoder.encode(scalar);
+    const auto encoded_structure = encoder.encode(structure);
+    ::z3::solver solver(ctx.ctx());
+    solver.add(encoded_scalar == encoded_structure);
+    ASSERT_TRUE(solver.check() == ::z3::unsat);
+    solver.reset();
+    solver.add(encoder.is_integer_type(encoded_structure));
+    ASSERT_TRUE(solver.check() == ::z3::unsat);
+}
 
 TEST(type_encoder_basic) {
     Z3Context ctx;
@@ -513,8 +604,13 @@ int main() {
     RUN_TEST(type_lattice_compatible);
     RUN_TEST(type_lattice_widen);
     RUN_TEST(type_lattice_canonical);
+    RUN_TEST(type_lattice_function_hash_collision);
+    RUN_TEST(type_lattice_cache_mutable_arguments);
+    RUN_TEST(type_lattice_cache_result_isolation);
+    RUN_TEST(inferred_type_snapshot);
     
     // TypeLatticeEncoder tests
+    RUN_TEST(type_encoder_cross_kind_hash_collision);
     RUN_TEST(type_encoder_basic);
     RUN_TEST(type_encoder_constraints);
     

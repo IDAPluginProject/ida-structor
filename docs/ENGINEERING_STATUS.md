@@ -13,13 +13,14 @@ or completion of this project-wide objective.
 | Preserve selected array element types when extracting nested subobjects | Residual-fragment helper tests and exact recursive-constructor contracts | Nine helper cases and both live constructor contracts pass; known residual types survive byte-array fallback |
 | Use index bounds only where the comparison holds for the same variable value | Fresh-IDB collector tests for branches, short-circuit expressions, mutation, loops, and casts | All 35 combined-plugin cases pass; original collector fails six selected differential cases |
 | Distinguish the type of a pointer base from the type of its loaded field | Production access inference helper tests and real `TypeFixer::analyze_variable` calls | Twenty-two focused helper cases and 13 live type-fixer cases pass |
-| Preserve full function/variable identity in inference caches | Production composite-key tests, including forced hash collisions | Verified for the production caller-inference cache; experimental caches still require work |
+| Preserve full function/variable identity in inference caches | Production composite-key and semantics tests, forced collisions, distinct high addresses/SSA versions, and live ctree extraction | Caller cache and experimental variable identities verified; live extraction emits 19 constraints from 16 expressions |
+| Preserve complete type values in lattice caches | Real function/structure hash collisions, mutable child aliases, and returned-result mutation | Directed production lattice tests pass; cache entries own detached snapshots |
 | Merge existing types without losing evidence, observed storage, padding, or protected names | Production matcher unit tests and anonymous IDA type checks | Standalone tests and 11 real-IDA checks pass |
 | Return solver diagnostics that remain valid after the synthesis context is destroyed | Production solver/optimizer UNSAT tests and public API return/destruction checks | Standalone lifetime checks and public API UNSAT/relaxation checks pass |
 | Reject inference results belonging to another function before applying types | Real local/prototype snapshots, foreign/unknown/high-address rejection, and positive application controls | All nine live checks pass within the active IDB |
 | Preserve pointer forwarding as address evidence rather than inventing a field load | Alias-only call/comparison negatives and loaded-field positive controls | Live controls pass; original-collector isolation confirms removal of a fictitious linked-list pointer observation |
-| Maintain public API, deterministic layouts, transactional persistence, global recovery, vtables, and type fixing | Full licensed integrity suite and external CMake consumer | All 13 licensed integrity suites pass (317.7 s), including the external CMake consumer |
-| Maintain reproducible, usable builds and diagnostics | CMake build, CTest, compile-gated hook checks, explicit `idump` runtime diagnostics | 178 standalone CTest entries pass; release build excludes all seven hook markers and its installed copy passes codesign verification |
+| Maintain public API, deterministic layouts, transactional persistence, global recovery, vtables, and type fixing | Full licensed integrity suite and external CMake consumer | Commit `496e507` passes all 13 licensed integrity suites (317.7 s); the identity tranche additionally passes targeted live extraction, public API, and external consumer checks |
+| Maintain reproducible, usable builds and diagnostics | CMake build, CTest, compile-gated hook checks, explicit `idump` runtime diagnostics | 180 standalone CTest entries pass after identity integration; the release build excludes all eight hook markers and its installed copy passes codesign verification |
 | Extend adaptive and interprocedural inference beyond existing supported paths | Production implementation, adversarial fixtures, convergence/resource tests | Incomplete; see remaining work |
 
 ## Assumption register
@@ -36,6 +37,8 @@ Dependent findings reference these identifiers.
 | A6 | Hashes choose cache buckets; equality uses the complete semantic identity. | Use function addresses separated by 2^32 bytes, distinct variable indices, and a deliberately constant hash. | Caller-inference cache |
 | A7 | An externally supplied inference result belongs to the current IDB and the same function revision; its full function address must match the application target. | Reject another function, `BADADDR`, and addresses differing above bit 31; verify unchanged local/prototype types and positive same-function writes. IDB identity and stale same-function indices require separate revision tracking. | Type application |
 | A8 | Exported diagnostics contain metadata and do not own Z3 expressions tied to an expired context. | Produce real solver and optimizer UNSAT cores, destroy the context, then copy/move/read/destroy the returned diagnostics. Repeat through the public synthesis API. | Diagnostic lifetime |
+| A9 | Experimental variable identities are session-local; the ctree stays stable during each extraction pass. Hashes and diagnostic labels are not identities. | Force collisions, vary high address bits/SSA/width/function scope, reuse diagnostic IDs, and recycle node storage between passes. | Experimental extraction and solver variables |
+| A10 | Abstract types are finite acyclic trees. Cached keys/results must not retain caller-mutable child aliases; Z3 expressions and external encoders borrow their context. | Mutate the ninth function parameter without changing its hash, mutate a returned cached result, and instantiate multiple encoders in one context. | Lattice cache snapshots and shared sort declarations |
 
 ## Changes and reproducibility
 
@@ -104,6 +107,24 @@ controls verify actual same-function writes. [A7]
 All seven rejection cases mutate locals or saved signatures with the original
 applicator; the two same-function positive controls pass with both versions.
 
+Experimental extraction now analyzes each ctree node inside one function/pass.
+Previously its full-function visitor called the single-expression API with a
+null function, which returned no constraints. Exact interning includes full
+function addresses, SSA versions, memory widths, and expression-node identity;
+independent public factory calls remain distinct even when their diagnostic IDs
+and labels match. Copies retain identity. Rebuild embedding C++ consumers because
+the public object layouts changed, although factory signatures are unchanged.
+The integrated live check observes 19 constraints from 16 expressions, and an
+external CMake consumer builds successfully. [A1, A9]
+
+Lattice join/meet and encoding caches compare complete types. Directed tests
+use two nine-parameter functions with the same bounded hash and a scalar/struct
+hash collision. Snapshot tests also mutate shared parameter children after a
+cache insertion and mutate cache-hit results; keys and cached values now remain
+unchanged. Multiple encoders in one context share its BaseType declaration.
+These repairs do not establish lossless compound encoding or complete lattice
+algebra; those remain separate work. [A6, A10]
+
 The installed `idump` on the development machine could load the plugin but could
 not initialize its own decompiler API. It returned success with assembly-only
 output. The fixture harness now reports that condition explicitly. A locally
@@ -157,13 +178,19 @@ platforms.
   pipeline retains its own per-variable traversal and propagation costs. [A7]
 - Diagnostic export: O(D + L) time and space for D records containing L bytes
   of description text; no solver handles cross the boundary. [A8]
+- Exact variable interning: expected O(1) per key, plus O(L) for L name bytes;
+  adversarial collisions require O(V) equality checks. Storage is O(V + E + S)
+  for persistent keys, current-pass expression nodes, and name bytes. [A9]
+- Type-cache snapshots: O(T) time and space for T logical tree nodes. Complete
+  equality resolves collisions; caches do not use hashes as type values. [A10]
 
 ## Bounded scope expansion and remaining work
 
-- **High impact — experimental inference identity:** local keys narrow function
-  addresses and omit SSA versions; other paths use hashes as identities or
-  `(address, opcode)` for distinct expressions. These require exact keys and
-  production tests before wider enablement.
+- **High impact — experimental type representation:** compound Z3 encoding still
+  loses structure IDs and compound details; sum subtyping and join/meet laws need
+  directed algebra checks. Memory-result indexing is separate from the repaired
+  variable interner. Moving a context with its cached TypeEncoder also needs a
+  wrapper-reference repair. The experimental pipeline remains disabled by default.
 - **High impact — experimental signature/application mapping:** inspect prototype
   argument mapping through `cfunc_t::argidx`, target ABI selection independent of
   build-host OS, and stale inference across IDB/function revisions. Foreign

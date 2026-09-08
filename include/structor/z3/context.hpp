@@ -4,11 +4,13 @@
 #include <memory>
 #include <chrono>
 #include <cstdint>
+#include <vector>
 
 namespace structor::z3 {
 
 // Forward declaration
 class TypeEncoder;
+class TypeLatticeEncoder;
 
 /// Configuration for Z3 solver behavior
 struct Z3Config {
@@ -108,6 +110,19 @@ private:
 
     /// Shared TypeEncoder - lazily initialized to avoid circular dependency
     std::unique_ptr<TypeEncoder> type_encoder_;
+
+    // All lattice encoders in one context share the same enum declaration.
+    // Keep its owning ASTs after ctx_ so they are destroyed before the context.
+    struct TypeLatticeSortCache {
+        ::z3::sort base_sort;
+        std::vector<::z3::expr> base_constants;
+
+        TypeLatticeSortCache(const ::z3::sort& sort,
+                             const std::vector<::z3::expr>& constants)
+            : base_sort(sort), base_constants(constants) {}
+    };
+    std::unique_ptr<TypeLatticeSortCache> type_lattice_sorts_;
+    friend class TypeLatticeEncoder;
 
 };
 
