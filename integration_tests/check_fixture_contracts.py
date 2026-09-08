@@ -78,6 +78,16 @@ def require_success(proc, description: str) -> None:
     raise RuntimeError(f"{description} failed\n{output}")
 
 
+def require_decompiler_output(output: str, idump_path: str) -> None:
+    """idump can exit successfully after falling back to assembly-only output."""
+    if "Pseudocode and microcode output disabled" in output:
+        raise RuntimeError(
+            f"{idump_path}: Hex-Rays initialization failed; idump fell back to "
+            "assembly-only output. Select an idump build compatible with the "
+            "active IDA/Hex-Rays runtime using --idump (or TEST_IDUMP for make test)."
+        )
+
+
 def build_fixtures(repo_root: Path, *names: str) -> None:
     log(hr("="))
     log("Building fixture binaries")
@@ -652,6 +662,7 @@ def run_case(
 
         result = json.loads(result_path.read_text(encoding="utf-8"))
         output = strip_ansi((proc.stdout or "") + (proc.stderr or ""))
+        require_decompiler_output(output, idump_path)
         return result, output
     finally:
         shutil.rmtree(sandbox_home, ignore_errors=True)

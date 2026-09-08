@@ -10,11 +10,24 @@ sys.path.insert(0, str(REPO_ROOT / "integration_tests"))
 
 from check_fixture_contracts import (  # noqa: E402
     extract_pseudocode_blocks,
+    require_decompiler_output,
     verify_case,
 )
 
 
 class FixtureContractParserTest(unittest.TestCase):
+    def test_assembly_fallback_reports_runtime_incompatibility(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "compatible with the active IDA"):
+            require_decompiler_output(
+                "[WARNING] Hex-Rays decompiler not available. "
+                "Pseudocode and microcode output disabled.\n"
+                "[INFO] Falling back to assembly-only output.",
+                "/example/idump",
+            )
+
+    def test_decompiler_output_is_accepted(self) -> None:
+        require_decompiler_output("-- Pseudocode --\nint f(void) { return 1; }", "idump")
+
     def test_guessed_type_diagnostic_terminates_pseudocode_block(self) -> None:
         output = """\
 Function: update_tag (0x100001000)
