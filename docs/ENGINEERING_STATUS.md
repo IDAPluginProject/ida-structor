@@ -1,0 +1,213 @@
+# Engineering status
+
+This work pursues accuracy, flexibility, adaptability, and evidence-based
+inference across Structor. A passing local regression suite is evidence for the
+covered behavior; it does not establish complete recovery of source-level types
+or completion of this project-wide objective.
+
+## Requirements and evidence
+
+| Requirement | Verification source | Status |
+| --- | --- | --- |
+| Preserve every observed byte range when generating array candidates | Production `ArrayConstraintBuilder` tests; sparse and overlapping fixture contracts | Eighteen detector cases and seven live layout/diagnostic cases pass |
+| Preserve selected array element types when extracting nested subobjects | Residual-fragment helper tests and exact recursive-constructor contracts | Nine helper cases and both live constructor contracts pass; known residual types survive byte-array fallback |
+| Use index bounds only where the comparison holds for the same variable value | Fresh-IDB collector tests for branches, short-circuit expressions, mutation, loops, and casts | All 35 combined-plugin cases pass; original collector fails six selected differential cases |
+| Distinguish the type of a pointer base from the type of its loaded field | Production access inference helper tests and real `TypeFixer::analyze_variable` calls | Twenty-two focused helper cases and 13 live type-fixer cases pass |
+| Preserve full function/variable identity in inference caches | Production composite-key tests, including forced hash collisions | Verified for the production caller-inference cache; experimental caches still require work |
+| Merge existing types without losing evidence, observed storage, padding, or protected names | Production matcher unit tests and anonymous IDA type checks | Standalone tests and 11 real-IDA checks pass |
+| Return solver diagnostics that remain valid after the synthesis context is destroyed | Production solver/optimizer UNSAT tests and public API return/destruction checks | Standalone lifetime checks and public API UNSAT/relaxation checks pass |
+| Reject inference results belonging to another function before applying types | Real local/prototype snapshots, foreign/unknown/high-address rejection, and positive application controls | All nine live checks pass within the active IDB |
+| Preserve pointer forwarding as address evidence rather than inventing a field load | Alias-only call/comparison negatives and loaded-field positive controls | Live controls pass; original-collector isolation confirms removal of a fictitious linked-list pointer observation |
+| Maintain public API, deterministic layouts, transactional persistence, global recovery, vtables, and type fixing | Full licensed integrity suite and external CMake consumer | All 13 licensed integrity suites pass (317.7 s), including the external CMake consumer |
+| Maintain reproducible, usable builds and diagnostics | CMake build, CTest, compile-gated hook checks, explicit `idump` runtime diagnostics | 178 standalone CTest entries pass; release build excludes all seven hook markers and its installed copy passes codesign verification |
+| Extend adaptive and interprocedural inference beyond existing supported paths | Production implementation, adversarial fixtures, convergence/resource tests | Incomplete; see remaining work |
+
+## Assumption register
+
+Dependent findings reference these identifiers.
+
+| ID | Assumption | Stress test / falsification probe | Dependent results |
+| --- | --- | --- | --- |
+| A1 | The local integration target is macOS arm64 with IDA/Hex-Rays 9.4 and an ABI-compatible `idump`. | Load the plugin in a fresh IDB, require actual pseudocode, and compare exact contracts. Repeat on each supported OS, ISA, and SDK before extending the platform claim. | Local runtime and build results only |
+| A2 | A reconstructed type describes observed storage; unobserved source declarations are unknown. A regular sparse sequence is a candidate array, not proof of an original array declaration. | Supply incompatible element types, overlapping access widths, missing positions, and explicit element caps. Require the candidate to contain every observed byte and retain competing interpretations. | Array inference |
+| A3 | A finite symbolic range requires a condition that dominates the access and still describes the accessed variable value; integer expressions retain their declared width. | Test the opposite branch, a later/prior comparison, disjunction, narrowing, mutation, calls, loop backedges, unstructured entry, high/negative bounds, and wraparound. | Bounded-index expansion |
+| A4 | A direct, consistently typed load at offset zero supports one extra pointer level; partial or conflicting views do not identify a unique pointee. | Test scalar loads, pointer loads, callbacks, displaced/nested accesses, narrow reads from larger pointees, and aliases used without loads. | Base-type inference |
+| A5 | Existing-type reuse may add information but cannot silently remove observed storage or analyst-protected names. | Reject shrinking/conflicting overlays; verify untouched field types/evidence, padding fragments, array metadata, union/bitfield preservation, and name collisions. | Existing-type merges |
+| A6 | Hashes choose cache buckets; equality uses the complete semantic identity. | Use function addresses separated by 2^32 bytes, distinct variable indices, and a deliberately constant hash. | Caller-inference cache |
+| A7 | An externally supplied inference result belongs to the current IDB and the same function revision; its full function address must match the application target. | Reject another function, `BADADDR`, and addresses differing above bit 31; verify unchanged local/prototype types and positive same-function writes. IDB identity and stale same-function indices require separate revision tracking. | Type application |
+| A8 | Exported diagnostics contain metadata and do not own Z3 expressions tied to an expired context. | Produce real solver and optimizer UNSAT cores, destroy the context, then copy/move/read/destroy the returned diagnostics. Repeat through the public synthesis API. | Diagnostic lifetime |
+
+## Changes and reproducibility
+
+Array extents now include missing positions. For example, observed 4-byte loads
+at offsets 0, 4, and 12 with stride 4 require
+`((12 - 0) / 4) + 1 = 4` elements and `4 * 4 = 16` bytes. The former three-element
+candidate covered only `[0, 12)` and excluded the load at offset 12. Checked
+integer arithmetic rejects unrepresentable extents; configured caps count
+unobserved positions as well as observed elements. [A2]
+
+Conflicting element types retain separate array interpretations. Homogeneous
+runs are partitioned by normalized storage type, and unknown observations do
+not bridge incompatible runs. Each candidate owns the observation identities
+supporting that view; candidate generation and layout coverage use those
+identities rather than only offset and width. Reversed observation order is
+checked against the same materialized union layout. [A2]
+
+The corrected sparse extent also exposed a subobject-splitting downgrade:
+removing the child interval rebuilt a complete residual element from `_QWORD`
+storage and discarded the selected unsigned element type. Residuals now retain
+that type when their offset and size align with complete source elements and
+their previous type is empty or partial. Independently known equal types remain
+unchanged. Known pointers,
+callbacks, aggregates, scalar interpretations, and array dimensions are not
+overwritten by a more generic array. Both recursive-constructor contracts keep
+their original unsigned tail-field requirement. [A2]
+
+Type merges stage each accepted overlay before replacing the input. They check
+storage conflicts before changing names or moving fields, split intersected
+padding, synchronize array metadata, and reserve protected names during
+deduplication. Rejected overlays do not reorder or rename the input. Ten initial
+regressions failed against the original production implementation; additional
+review added protected-name and exact-no-op cases. [A5]
+
+The index collector now controls branch/loop traversal order explicitly. Live
+testing exposed two SDK boundary assumptions: the parent list includes a null
+root sentinel, and the default visitor enumerates branch/loop bodies before
+their conditions. The verified collector handles both, including lowered
+sign-bit guards and index postincrements. [A1, A3]
+
+An overlapping-array test exposed a returned diagnostic retaining a Z3 tracking
+expression after its context had been destroyed. The public synthesis boundary
+now copies metadata only. Weighted Max-SMT also tracks hard assumptions so an
+UNSAT result can identify the observations responsible. [A8]
+
+An integer run with a floating-point view of its final element retains both
+typed views. When the scalar/union layout wins, `success_relaxed` reports the
+unmet aggregate preferences. A live 12-byte example verifies all three
+4-byte positions, the two offset-8 views, and all four dropped preference
+descriptions; the candidate is not removed merely to make the status read
+`success`. [A2, A8]
+
+A full unchanged-HEAD build distinguishes inherited snapshot drift from code
+regressions. Six cases produce identical results and pseudocode in that build
+and the changed plugin; their runtime baseline is documented in
+[`integration_tests/contracts/README.md`](../integration_tests/contracts/README.md).
+Collector-only isolation separately proves that a linked-list pointer union
+came from comparing an address alias with zero, not from a pointer-typed load.
+Both versions preserve the machine-code loop limit omitted by the old snapshot.
+The revised collector removes the fictitious field interpretation. [A1, A4]
+
+Type application checks the full function address before capturing or changing
+locals, and direct signature application also requires successful inference.
+The rejection checks snapshot real local and saved prototype types; positive
+controls verify actual same-function writes. [A7]
+All seven rejection cases mutate locals or saved signatures with the original
+applicator; the two same-function positive controls pass with both versions.
+
+The installed `idump` on the development machine could load the plugin but could
+not initialize its own decompiler API. It returned success with assembly-only
+output. The fixture harness now reports that condition explicitly. A locally
+built IDA 9.4 `idump` produced the exact expected alias-lifetime result and
+pseudocode. This is a tool/runtime compatibility observation, not evidence of a
+Structor synthesis failure. [A1]
+
+Use an `idump` built for the selected IDA runtime:
+
+```sh
+cmake -S . -B build -G Ninja \
+  -DIDA_SDK_DIR=/path/to/idasdk \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure --no-tests=error -E '_live$'
+python3 integration_tests/check_full_integrity_suite.py \
+  --repo-root . --plugin build/structor.dylib --idump /path/to/compatible/idump
+```
+
+The integration runners install and codesign temporary plugin copies. Production
+builds must exclude live-test hooks. The Linux and Windows plugin suffixes are
+`.so` and `.dll`, respectively; local runtime evidence here does not verify those
+platforms.
+
+## Algorithm bounds
+
+- Array candidate validation: O(n log n) time and O(n) auxiliary storage for
+  n observations, including deterministic ordering of owned evidence. Typed-run
+  partitioning takes O(nT + n log n) time for T distinct normalized storage
+  types, excluding SDK type-comparison internals. Z3 solve time is bounded by
+  its configured timeout, not a polynomial-time guarantee. [A2]
+- Direct base-type inference: O(n + d) type operations for n observations and
+  d compared pointer levels, with O(1) auxiliary type handles, excluding IDA
+  type-object internals. [A4]
+- Residual array-type retention: O(1) interval arithmetic and type operations,
+  excluding SDK equality and type-construction internals. The source type's
+  exact byte extent must match the selected field. [A2]
+- Bounded integer evaluation: O(BE) time for E expression nodes and B candidate
+  index values, with B limited to 32; O(E) evaluation stack. Guard ancestry and
+  cached loop-effect analysis add their own traversal costs. Finite intervals
+  enclose possible values; disjoint predicates can leave unreachable values
+  inside the interval. This is not a complete path-reachability solver. [A3]
+- Existing-type overlay: O(mS + f log f) expected time and O(S) auxiliary storage,
+  where m is the number of incoming fields, f is the resulting field count, and
+  S includes the copied field/evidence payload. Hash operations assume ordinary
+  dispersion. The merge is bounded by `MAX_FIELDS` and `MAX_STRUCT_SIZE`. [A5]
+- Caller inference cache: expected O(1) lookup and O(k) entries for k distinct
+  function/variable pairs, with full-key comparison on collision. [A6]
+- Function identity preflight: O(1) time and space. The existing application
+  pipeline retains its own per-variable traversal and propagation costs. [A7]
+- Diagnostic export: O(D + L) time and space for D records containing L bytes
+  of description text; no solver handles cross the boundary. [A8]
+
+## Bounded scope expansion and remaining work
+
+- **High impact — experimental inference identity:** local keys narrow function
+  addresses and omit SSA versions; other paths use hashes as identities or
+  `(address, opcode)` for distinct expressions. These require exact keys and
+  production tests before wider enablement.
+- **High impact — experimental signature/application mapping:** inspect prototype
+  argument mapping through `cfunc_t::argidx`, target ABI selection independent of
+  build-host OS, and stale inference across IDB/function revisions. Foreign
+  function-address rejection is implemented and live-tested.
+- **High impact — provenance:** preserve load versus address-flow evidence and
+  independent observation sites across deduplication. Access count alone is not
+  a confidence calibration. Local alias maps also need branch-sensitive
+  reaching-definition checks; lexical visitation of a sibling branch does not
+  establish which pointer value reaches a load.
+  A real linked-list witness also shows assignment preorder suppressing the
+  right-hand load in `q = *q`; this occurs in both the original and revised
+  collector and requires a separate expression-sequencing repair.
+- **High impact — interprocedural inference:** the experimental fixed-point API
+  remains explicitly unimplemented. Completing it requires convergence,
+  recursion/SCC, widening, and resource-bound contracts; a successful local
+  layout test cannot verify this requirement.
+- **Medium impact — control flow:** lexical guard proofs do not cover general
+  dominance, arbitrary goto entry, loop induction, or exact disjoint index sets.
+  Finite intervals may overapproximate reachable values; supporting exact path
+  predicates requires retaining them through collection and synthesis.
+- **Medium impact — validation breadth:** extend live coverage across compiler
+  optimization levels, calling conventions, target bitness, and platforms. The
+  current local fixture matrix alone cannot establish that breadth.
+- **Medium impact — matching completeness:** sparse byte-field matching does not
+  yet establish semantic equivalence of whole aggregates or import arbitrary
+  bitfield layouts. Preserve those observations until a representable merge is
+  established.
+- **Medium impact — callee evidence availability:** a local call whose callee has
+  not been decompiled may have only scalar placeholder argument types. Pointer
+  depth cannot be inferred from source declarations absent from the analyzed
+  ctree. Pair unknown-prototype preservation controls with known-prototype
+  positives; bounded callee-body inference remains a separate capability.
+- **Low impact — artifact hygiene:** fixture compilation rewrites tracked binary
+  artifacts. Generated local changes should not obscure source review; migrate
+  runners to isolated fixture outputs in subsequent build-system work.
+
+## Quality gates
+
+QG1: no normative or ethical judgment is required. QG2: assumptions and
+falsification probes are recorded above. QG3: the requirement table preserves
+the full objective and explicitly marks incomplete coverage. QG4: byte offsets,
+integer extents, overflow checks, and algorithm bounds are specified. QG5:
+adversarial unit and live regressions are required before claiming each repair
+verified. QG6: provenance is the production source, original-code regression
+runs, and actual build/runtime output; no external claims are inferred from
+mock-only tests. QG7: bounded adjacent risks and opportunities are listed above.
+Project-wide completion remains unproven.

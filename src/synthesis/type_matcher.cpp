@@ -1,6 +1,9 @@
 /// @file type_matcher.cpp
 /// @brief Sparse matching of synthesized structures against existing IDA types
 
+#ifdef STRUCTOR_TESTING
+#include "mock_ida.hpp"
+#endif
 #include <structor/type_matcher.hpp>
 
 #include <algorithm>
@@ -22,15 +25,16 @@ qstring render_type_decl(const tinfo_t& type) {
 
 std::uint32_t member_size_bytes(const udm_t& member) {
     if (member.size != 0) {
-        return static_cast<std::uint32_t>((member.size + 7) / 8);
+        const auto bytes = member.size / 8 + (member.size % 8 != 0);
+        return bytes <= MAX_STRUCT_SIZE ? static_cast<std::uint32_t>(bytes) : 0;
     }
 
     const size_t type_size = member.type.get_size();
-    if (type_size != BADSIZE && type_size > 0) {
+    if (type_size != BADSIZE && type_size > 0 && type_size <= MAX_STRUCT_SIZE) {
         return static_cast<std::uint32_t>(type_size);
     }
 
-    return 1;
+    return 0;
 }
 
 bool extract_existing_fields(const tinfo_t& type, qvector<ExistingTypeField>& out) {
@@ -46,7 +50,13 @@ bool extract_existing_fields(const tinfo_t& type, qvector<ExistingTypeField>& ou
         field.size = member_size_bytes(member);
         field.type = member.type;
         field.type_decl = render_type_decl(member.type);
-        field.is_padding = ExistingTypeMatcher::is_padding_name(field.name);
+        field.is_bitfield = member.is_bitfield() || (member.offset % 8) != 0;
+        // A human field called alignment or gap_count is still data. Only
+        // conventionally named byte arrays are candidates for padding reuse.
+        array_type_data_t array;
+        field.is_padding = !field.is_bitfield &&
+            ExistingTypeMatcher::is_padding_name(field.name) &&
+            field.type.get_array_details(&array) && array.elem_type.get_size() == 1;
         out.push_back(std::move(field));
     }
 
@@ -85,16 +95,27 @@ bool existing_field_less(const ExistingTypeField& a, const ExistingTypeField& b)
 
 void uniquify_field_names(qvector<SynthField>& fields) {
     std::unordered_set<std::string> seen;
+    std::unordered_map<std::string, unsigned> next_suffix;
+    for (const auto& field : fields) {
+        if (!field.name.empty() &&
+            (field.naming.locked || field.naming.origin == NameOrigin::UserProvided)) {
+            seen.insert(field.name.c_str());
+        }
+    }
     for (auto& field : fields) {
+        if (!field.name.empty() &&
+            (field.naming.locked || field.naming.origin == NameOrigin::UserProvided)) {
+            continue;
+        }
         if (field.name.empty()) {
             field.name.sprnt("field_%X", static_cast<unsigned>(field.offset));
         }
 
         std::string base(field.name.c_str());
         std::string candidate = base;
-        unsigned suffix = 1;
+        const auto cursor = next_suffix.try_emplace(base, 1).first;
         while (seen.find(candidate) != seen.end()) {
-            candidate = base + "_" + std::to_string(suffix++);
+            candidate = base + "_" + std::to_string(cursor->second++);
         }
 
         if (candidate != base) {
@@ -132,16 +153,25 @@ bool ExistingTypeMatcher::is_padding_name(const qstring& name) {
         return static_cast<char>(std::tolower(ch));
     });
 
-    return lower.rfind("__pad", 0) == 0 ||
-           lower.rfind("_pad", 0) == 0 ||
-           lower.rfind("pad_", 0) == 0 ||
-           lower.rfind("padding", 0) == 0 ||
-           lower.rfind("gap", 0) == 0 ||
-           lower.rfind("align", 0) == 0;
+    for (const char* prefix : {"__pad_", "_pad_", "pad_", "padding_", "gap_", "align_"}) {
+        const std::string start(prefix);
+        if (lower.rfind(start, 0) != 0) {
+            continue;
+        }
+        std::string suffix = lower.substr(start.size());
+        if (suffix.rfind("0x", 0) == 0) {
+            suffix.erase(0, 2);
+        }
+        return !suffix.empty() &&
+            std::all_of(suffix.begin(), suffix.end(), [](unsigned char ch) {
+                return std::isxdigit(ch) != 0;
+            });
+    }
+    return false;
 }
 
 bool ExistingTypeMatcher::is_effective_padding(const SynthField& field) {
-    return field.is_padding || field.semantic == SemanticType::Padding || is_padding_name(field.name);
+    return field.is_padding || field.semantic == SemanticType::Padding;
 }
 
 SemanticType ExistingTypeMatcher::semantic_from_type(const tinfo_t& type) {
@@ -183,6 +213,14 @@ bool ExistingTypeMatcher::types_compatible(const tinfo_t& a, const tinfo_t& b) {
             return true;
         }
     } catch (...) {
+    }
+
+    // Equal pointer widths, aggregate sizes, or array extents do not imply
+    // equivalent pointees, members, element types, or function signatures.
+    if (a.is_ptr() || b.is_ptr() || a.is_func() || b.is_func() ||
+        a.is_array() || b.is_array() || a.is_struct() || b.is_struct() ||
+        a.is_union() || b.is_union()) {
+        return false;
     }
 
     const size_t a_size = a.get_size();
@@ -263,6 +301,8 @@ qvector<TypeOverlapCandidate> ExistingTypeMatcher::find_matches(
             }
 
             bool existing_matched = false;
+            bool exact_matched = false;
+            bool type_matched = false;
             for (std::size_t i = 0; i < synth_struct.fields.size(); ++i) {
                 const SynthField& synth = synth_struct.fields[i];
                 if (is_effective_padding(synth) || synth.size == 0) {
@@ -277,16 +317,19 @@ qvector<TypeOverlapCandidate> ExistingTypeMatcher::find_matches(
                 matched_synth_indexes.insert(i);
 
                 if (synth.offset == existing.offset) {
-                    ++candidate.exact_offset_matches;
-                }
-                if (types_compatible(synth.type, existing.type)) {
-                    ++candidate.type_matches;
+                    exact_matched = true;
+                    if (synth.size == existing.size &&
+                        types_compatible(synth.type, existing.type)) {
+                        type_matched = true;
+                    }
                 }
             }
 
             if (existing_matched) {
                 ++candidate.matched_existing_fields;
             }
+            candidate.exact_offset_matches += exact_matched;
+            candidate.type_matches += type_matched;
         }
 
         candidate.matched_synth_fields = static_cast<std::uint32_t>(matched_synth_indexes.size());
@@ -354,77 +397,63 @@ TypeMergeResult ExistingTypeMatcher::merge_existing_type(
         return result;
     }
 
+    // Stage the complete overlay so failed allocations and rejected fields
+    // never leave the caller with partially moved names, types, or evidence.
+    SynthStruct merged_structure = synth_struct;
     for (const auto& existing : candidate.fields) {
         if (existing.is_padding || existing.size == 0) {
             continue;
         }
         const auto existing_end =
             checked_interval_end(existing.offset, existing.size);
-        if (existing.offset < 0 || !existing_end.has_value() ||
+        if (existing.is_bitfield || existing.offset < 0 || !existing_end.has_value() ||
             *existing_end <= 0 ||
             static_cast<std::uint64_t>(*existing_end) > MAX_STRUCT_SIZE) {
             ++result.fields_skipped;
             continue;
         }
 
-        SynthField* exact = nullptr;
-        for (auto& synth : synth_struct.fields) {
+        const SynthField* exact = nullptr;
+        bool ambiguous_exact = false;
+        for (const auto& synth : merged_structure.fields) {
             if (synth.offset == existing.offset && !is_effective_padding(synth)) {
+                if (exact != nullptr) {
+                    ambiguous_exact = true;
+                    break;
+                }
                 exact = &synth;
-                break;
             }
         }
 
-        if (exact) {
-            if (!existing.name.empty() && field_name_can_be_reused(*exact) && exact->name != existing.name) {
-                exact->name = existing.name;
-                exact->naming.kind = GeneratedNameKind::Field;
-                exact->naming.origin = NameOrigin::ReusedType;
-                exact->naming.confidence = NameConfidence::High;
-                ++result.fields_renamed;
-            }
+        // Existing types may supply names and fill holes, but cannot erase
+        // observed storage or collapse union/bitfield evidence to one scalar.
+        if (ambiguous_exact || (exact &&
+            (existing.size < exact->size || exact->is_bitfield ||
+             exact->is_union_candidate || !exact->union_members.empty()))) {
+            ++result.fields_skipped;
+            continue;
+        }
 
-            if (!existing.type.empty()) {
-                bool type_range_conflicts = false;
-                for (const auto& other : synth_struct.fields) {
-                    if (&other == exact || is_effective_padding(other)) {
-                        continue;
-                    }
-                    if (ranges_overlap(other.offset, other.size, existing.offset, existing.size)) {
-                        type_range_conflicts = true;
-                        break;
-                    }
-                }
-
-                if (type_range_conflicts) {
-                    ++result.fields_skipped;
-                    continue;
-                }
-
-                exact->type = existing.type;
-                exact->semantic = semantic_from_type(existing.type);
-                exact->confidence = TypeConfidence::High;
-                exact->size = existing.size;
-                ++result.fields_retyped;
-            }
+        array_type_data_t array;
+        if ((!existing.type.empty() &&
+             existing.type.get_size() != existing.size) ||
+            (existing.type.empty() && (!exact || existing.size != exact->size)) ||
+            (existing.type.is_array() &&
+             (!existing.type.get_array_details(&array) || array.nelems == 0 ||
+              array.nelems > std::numeric_limits<std::uint32_t>::max()))) {
+            ++result.fields_skipped;
             continue;
         }
 
         bool conflicts_with_real_field = false;
-        qvector<SynthField> kept;
-        kept.reserve(synth_struct.fields.size());
-        for (auto& synth : synth_struct.fields) {
-            if (!ranges_overlap(synth.offset, synth.size, existing.offset, existing.size)) {
-                kept.push_back(std::move(synth));
+        for (const auto& synth : merged_structure.fields) {
+            if (&synth == exact || is_effective_padding(synth)) {
                 continue;
             }
-
-            if (is_effective_padding(synth)) {
-                continue;
+            if (ranges_overlap(synth.offset, synth.size, existing.offset, existing.size)) {
+                conflicts_with_real_field = true;
+                break;
             }
-
-            conflicts_with_real_field = true;
-            kept.push_back(std::move(synth));
         }
 
         if (conflicts_with_real_field) {
@@ -432,38 +461,72 @@ TypeMergeResult ExistingTypeMatcher::merge_existing_type(
             continue;
         }
 
-        SynthField merged;
-        merged.name = existing.name.empty() ? qstring() : existing.name;
+        SynthField merged = exact ? *exact : SynthField{};
+        const bool renamed = exact && !existing.name.empty() &&
+            field_name_can_be_reused(*exact) && exact->name != existing.name;
+        if (!exact || renamed) {
+            merged.name = existing.name;
+            merged.naming.kind = GeneratedNameKind::Field;
+            merged.naming.origin = NameOrigin::ReusedType;
+            merged.naming.confidence = NameConfidence::High;
+        }
         if (merged.name.empty()) {
             merged.name.sprnt("field_%X", static_cast<unsigned>(existing.offset));
         }
-        merged.naming.kind = GeneratedNameKind::Field;
-        merged.naming.origin = NameOrigin::ReusedType;
-        merged.naming.confidence = NameConfidence::High;
         merged.offset = existing.offset;
         merged.size = existing.size;
-        merged.type = existing.type;
-        merged.semantic = semantic_from_type(existing.type);
-        merged.confidence = TypeConfidence::High;
-        merged.comment.sprnt("Merged from existing type %s", candidate.name.c_str());
-        kept.push_back(std::move(merged));
-        synth_struct.fields = std::move(kept);
-        ++result.fields_added;
-    }
+        if (!existing.type.empty()) {
+            merged.type = existing.type;
+            merged.semantic = semantic_from_type(existing.type);
+            merged.confidence = TypeConfidence::High;
+            merged.is_array = existing.type.is_array();
+            merged.array_count = merged.is_array
+                ? static_cast<std::uint32_t>(array.nelems) : 1;
+        }
+        if (!exact) {
+            merged.comment.sprnt("Merged from existing type %s", candidate.name.c_str());
+        }
 
-    for (const auto& existing : candidate.fields) {
-        if (existing.is_padding || existing.size == 0 || existing.offset < 0) {
+        qvector<SynthField> kept;
+        kept.reserve(merged_structure.fields.size() + 2);
+        for (const auto& synth : merged_structure.fields) {
+            if (&synth == exact) {
+                continue;
+            }
+            if (!ranges_overlap(synth.offset, synth.size, existing.offset, existing.size)) {
+                kept.push_back(synth);
+                continue;
+            }
+
+            // Only padding can overlap here. Retain both uncovered fragments;
+            // dropping the entire original gap destroys its declared extent.
+            const auto padding_end = checked_interval_end(synth.offset, synth.size);
+            if (synth.offset < existing.offset) {
+                kept.push_back(SynthField::create_padding(
+                    synth.offset, static_cast<std::uint32_t>(existing.offset - synth.offset)));
+            }
+            if (padding_end && *padding_end > *existing_end) {
+                kept.push_back(SynthField::create_padding(
+                    *existing_end, static_cast<std::uint32_t>(*padding_end - *existing_end)));
+            }
+        }
+        kept.push_back(std::move(merged));
+        if (kept.size() > MAX_FIELDS) {
+            ++result.fields_skipped;
             continue;
         }
-        const auto end = checked_interval_end(existing.offset, existing.size);
-        if (end.has_value() && *end > 0 &&
-            static_cast<std::uint64_t>(*end) <= MAX_STRUCT_SIZE) {
-            synth_struct.size = std::max(
-                synth_struct.size, static_cast<std::uint32_t>(*end));
-        }
+        const bool retyped = exact && !existing.type.empty();
+        const bool added = exact == nullptr;
+        merged_structure.fields = std::move(kept);
+        merged_structure.size = std::max(
+            merged_structure.size, static_cast<std::uint32_t>(*existing_end));
+        result.fields_added += added;
+        result.fields_renamed += renamed;
+        result.fields_retyped += retyped;
     }
 
-    std::sort(synth_struct.fields.begin(), synth_struct.fields.end(), [](const SynthField& a,
+    if (result.fields_added || result.fields_renamed || result.fields_retyped) {
+        std::sort(merged_structure.fields.begin(), merged_structure.fields.end(), [](const SynthField& a,
                                                                          const SynthField& b) {
         if (a.offset != b.offset) {
             return a.offset < b.offset;
@@ -473,7 +536,9 @@ TypeMergeResult ExistingTypeMatcher::merge_existing_type(
         }
         return a.bit_offset < b.bit_offset;
     });
-    uniquify_field_names(synth_struct.fields);
+        uniquify_field_names(merged_structure.fields);
+        synth_struct = std::move(merged_structure);
+    }
 
     result.success = true;
     result.message.sprnt("Merged %s: +%u fields, renamed %u, retyped %u, skipped %u conflicts",

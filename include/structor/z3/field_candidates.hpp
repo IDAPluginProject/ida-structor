@@ -5,6 +5,7 @@
 #include "structor/cross_function_analyzer.hpp"
 #include "structor/z3/context.hpp"
 #include "structor/z3/type_encoding.hpp"
+#include <algorithm>
 #include <optional>
 #include <unordered_set>
 
@@ -62,6 +63,35 @@ struct FieldCandidate {
     /// Check if this is an array candidate
     [[nodiscard]] bool is_array() const noexcept {
         return kind == Kind::ArrayElement || kind == Kind::ArrayField;
+    }
+
+    [[nodiscard]] bool covers_source_evidence(const FieldCandidate& scalar) const {
+        if (scalar.source_access_indices.empty() || !contains(scalar)) {
+            return false;
+        }
+        return std::all_of(scalar.source_access_indices.begin(),
+                           scalar.source_access_indices.end(), [&](int source) {
+            return source >= 0 &&
+                std::find(source_access_indices.begin(), source_access_indices.end(),
+                          source) != source_access_indices.end();
+        });
+    }
+
+    /// A scalar array may stand in for an observed scalar view only when it
+    /// contains the complete original evidence for that view. Equal offsets,
+    /// widths, or array counts alone do not identify an element's type.
+    [[nodiscard]] bool replaces_scalar_evidence(const FieldCandidate& scalar) const {
+        if (kind != Kind::ArrayField ||
+            type_category == TypeCategory::Struct ||
+            type_category == TypeCategory::Union ||
+            type_category == TypeCategory::Array ||
+            type_category == TypeCategory::RawBytes ||
+            (scalar.kind != Kind::DirectAccess &&
+             scalar.kind != Kind::ArrayElement &&
+             scalar.kind != Kind::UnionAlternative)) {
+            return false;
+        }
+        return covers_source_evidence(scalar);
     }
 
     /// The array-element cap applies only to optional aggregate candidates;

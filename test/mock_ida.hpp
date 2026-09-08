@@ -137,48 +137,83 @@ enum type_flags : std::uint32_t {
     BTF_DOUBLE  = 0x400,
     BTF_BOOL    = 0x800,
     BT_INT8     = BTF_INT8,
+    BT_INT16    = BTF_INT16,
+    BT_INT32    = BTF_INT32,
+    BT_INT64    = BTF_INT64,
     BTMT_CHAR   = 0x1000,
     BTMT_USIGNED = 0x2000,
+    BTMT_UNSIGNED = BTMT_USIGNED,
+    BTF_STRUCT  = 0x4000,
+    BTF_UNION   = 0x8000,
+    BT_UNK_QWORD = 0x10000,
 };
+
+constexpr int TCMP_IGNMODS = 1;
+constexpr int TCMP_DECL = 0x20;
 
 // Forward declarations
 struct func_type_data_t;
 struct array_type_data_t;
+struct udt_type_data_t;
 
 class tinfo_t {
 public:
     tinfo_t() = default;
 
-    bool empty() const { return type_flags_ == 0 && !is_ptr_ && !is_array_; }
-    void clear() { type_flags_ = 0; is_ptr_ = false; is_array_ = false; pointed_size_ = 0; }
+    bool empty() const {
+        return type_flags_ == 0 && !is_ptr_ && !is_array_ &&
+               !is_struct_ && !is_union_ && !is_func_;
+    }
+    void clear() { *this = tinfo_t(); }
 
-    void create_simple_type(std::uint32_t bt) { type_flags_ = bt; is_ptr_ = false; }
+    void create_simple_type(std::uint32_t bt) {
+        clear();
+        type_flags_ = bt;
+    }
     void create_ptr(const tinfo_t& pointed) {
+        const auto target = std::make_shared<tinfo_t>(pointed);
+        clear();
         is_ptr_ = true;
-        pointed_type_ = std::make_shared<tinfo_t>(pointed);
+        pointed_type_ = target;
     }
     void create_array(const tinfo_t& elem, size_t count) {
+        const auto element = std::make_shared<tinfo_t>(elem);
+        clear();
         is_array_ = true;
         array_count_ = count;
-        pointed_type_ = std::make_shared<tinfo_t>(elem);
+        pointed_type_ = element;
     }
     bool create_func(const struct func_type_data_t& ftd);
+    bool create_udt(const udt_type_data_t& udt, std::uint32_t kind);
+    bool get_udt_details(udt_type_data_t* out) const;
 
     bool is_ptr() const { return is_ptr_; }
-    bool is_funcptr() const { return is_ptr_ && is_func_; }
+    bool is_funcptr() const {
+        return is_ptr_ && pointed_type_ && pointed_type_->is_func();
+    }
     bool is_floating() const { return type_flags_ & (BTF_FLOAT | BTF_DOUBLE); }
     bool is_struct() const { return is_struct_; }
     bool is_array() const { return is_array_; }
     bool is_func() const { return is_func_; }
+    bool is_decl_bitfield() const { return false; }
     bool is_void() const { return type_flags_ == BTF_VOID; }
     bool is_union() const { return is_union_; }
+    bool is_partial() const { return type_flags_ == BT_UNK_QWORD; }
     bool is_signed() const { 
-        return (type_flags_ & (BTF_INT8 | BTF_INT16 | BTF_INT32 | BTF_INT64)) != 0;
+        return !(type_flags_ & BTMT_UNSIGNED) &&
+               (type_flags_ & (BTF_INT8 | BTF_INT16 | BTF_INT32 | BTF_INT64)) != 0;
+    }
+    bool is_unsigned() const {
+        return (type_flags_ & (BTF_UINT8 | BTF_UINT16 | BTF_UINT32 | BTF_UINT64)) != 0 ||
+               ((type_flags_ & BTMT_UNSIGNED) &&
+                (type_flags_ & (BTF_INT8 | BTF_INT16 | BTF_INT32 | BTF_INT64)) != 0);
     }
 
     size_t get_size() const {
         if (is_ptr_) return 8;  // Assume 64-bit
         if (is_array_) return array_count_ * (pointed_type_ ? pointed_type_->get_size() : 1);
+        if (is_struct_ || is_union_) return udt_size_;
+        if (type_flags_ == BT_UNK_QWORD) return 8;
         if (type_flags_ & (BTF_INT8 | BTF_UINT8 | BTF_BOOL)) return 1;
         if (type_flags_ & (BTF_INT16 | BTF_UINT16)) return 2;
         if (type_flags_ & (BTF_INT32 | BTF_UINT32 | BTF_FLOAT)) return 4;
@@ -204,6 +239,9 @@ public:
 
     bool get_type_by_tid(tid_t tid) { struct_tid_ = tid; return tid != BADADDR; }
     bool get_named_type(void*, const char* name) { return name != nullptr; }
+    bool compare_with(const tinfo_t& other, int) const {
+        return equals_to(other);
+    }
     bool equals_to(const tinfo_t& other) const {
         if (type_flags_ != other.type_flags_ || is_ptr_ != other.is_ptr_ ||
             is_func_ != other.is_func_ || is_struct_ != other.is_struct_ ||
@@ -216,7 +254,8 @@ public:
             static_cast<bool>(other.pointed_type_)) {
             return false;
         }
-        return !pointed_type_ || pointed_type_->equals_to(*other.pointed_type_);
+        return (!pointed_type_ || pointed_type_->equals_to(*other.pointed_type_)) &&
+               udt_equals(other) && function_equals(other);
     }
 
     void print(qstring* out) const {
@@ -239,9 +278,63 @@ private:
     bool is_union_ = false;
     size_t array_count_ = 0;
     std::shared_ptr<tinfo_t> pointed_type_;
-    size_t pointed_size_ = 0;
     tid_t struct_tid_ = BADADDR;
+    size_t udt_size_ = 0;
+    std::shared_ptr<udt_type_data_t> udt_;
+    std::shared_ptr<func_type_data_t> function_;
+    bool udt_equals(const tinfo_t& other) const;
+    bool function_equals(const tinfo_t& other) const;
 };
+
+struct udm_t {
+    qstring name;
+    std::uint64_t offset = 0;  // bits, as in the IDA SDK
+    std::uint64_t size = 0;    // bits
+    tinfo_t type;
+    bool bitfield = false;
+    bool is_bitfield() const { return bitfield; }
+};
+
+struct udt_type_data_t : public qvector<udm_t> {
+    bool is_union = false;
+    size_t total_size = 0;  // bytes
+    unsigned pack = 0;
+};
+
+inline bool tinfo_t::create_udt(const udt_type_data_t& udt, std::uint32_t kind) {
+    if (kind != BTF_STRUCT && kind != BTF_UNION) return false;
+    *this = tinfo_t();
+    is_struct_ = kind == BTF_STRUCT;
+    is_union_ = kind == BTF_UNION;
+    udt_ = std::make_shared<udt_type_data_t>(udt);
+    udt_->is_union = is_union_;
+    udt_size_ = udt.total_size;
+    for (const auto& member : udt) {
+        udt_size_ = std::max(udt_size_,
+            static_cast<size_t>((member.offset + member.size + 7) / 8));
+    }
+    udt_->total_size = udt_size_;
+    return true;
+}
+
+inline bool tinfo_t::get_udt_details(udt_type_data_t* out) const {
+    if (!out || !udt_) return false;
+    *out = *udt_;
+    return true;
+}
+
+inline bool tinfo_t::udt_equals(const tinfo_t& other) const {
+    if (static_cast<bool>(udt_) != static_cast<bool>(other.udt_)) return false;
+    if (!udt_) return true;
+    if (udt_size_ != other.udt_size_ || udt_->size() != other.udt_->size()) return false;
+    for (size_t i = 0; i < udt_->size(); ++i) {
+        const auto& lhs = (*udt_)[i];
+        const auto& rhs = (*other.udt_)[i];
+        if (lhs.offset != rhs.offset || lhs.size != rhs.size ||
+            !lhs.type.equals_to(rhs.type)) return false;
+    }
+    return true;
+}
 
 // ============================================================================
 // Function Type Data
@@ -266,14 +359,35 @@ struct array_type_data_t {
 };
 
 // Inline implementations that depend on func_type_data_t
-inline bool tinfo_t::create_func(const func_type_data_t& ftd) { 
-    is_func_ = true; 
-    return true; 
+inline bool tinfo_t::create_func(const func_type_data_t& ftd) {
+    const auto signature = std::make_shared<func_type_data_t>(ftd);
+    clear();
+    is_func_ = true;
+    function_ = signature;
+    return true;
 }
 
 inline bool tinfo_t::get_func_details(func_type_data_t* ftd) const {
-    if (!is_func_ || !ftd) return false;
-    // Return empty function details for mock
+    if (!is_func_ || !function_ || !ftd) return false;
+    *ftd = *function_;
+    return true;
+}
+
+inline bool tinfo_t::function_equals(const tinfo_t& other) const {
+    if (static_cast<bool>(function_) != static_cast<bool>(other.function_)) {
+        return false;
+    }
+    if (!function_) return true;
+    if (function_->cc != other.function_->cc ||
+        !function_->rettype.equals_to(other.function_->rettype) ||
+        function_->size() != other.function_->size()) {
+        return false;
+    }
+    for (size_t i = 0; i < function_->size(); ++i) {
+        if (!function_->at(i).type.equals_to(other.function_->at(i).type)) {
+            return false;
+        }
+    }
     return true;
 }
 

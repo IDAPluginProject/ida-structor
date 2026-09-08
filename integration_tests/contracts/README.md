@@ -25,3 +25,19 @@ Assumption: these exact snapshots describe this runtime and fixture toolchain.
 Falsification probe: rebuild the unchanged baseline and changed plugin against
 the same SDK, run each in a fresh database, and compare both outputs. Cross-SDK
 equivalence is not established by these snapshots.
+
+## Accuracy-change comparisons
+
+- The recursive-constructor snapshots retain their unsigned 64-bit tail-field
+  requirement. Their pseudocode and recorded root provenance were refreshed
+  only where the unchanged baseline already produced the same difference.
+- `test_linked_list / traverse_list` retains its existing field layout. Both
+  the unchanged and changed plugins preserve the count limit present in the
+  machine code but missing from the old pseudocode snapshot. A collector-only
+  comparison attributes the removed pointer-union alternative to an address
+  alias compared with zero, rather than a pointer-typed memory access.
+- `test_flags_union / inspect_header` preserves every field and changes only
+  the solver status to `success_relaxed`. Typed-run recovery retains an optional
+  array interpretation whose aggregate preferences lose to the observed
+  scalar/union layout. A separate live interior-conflict check verifies the
+  exact retained storage and dropped-preference diagnostics.

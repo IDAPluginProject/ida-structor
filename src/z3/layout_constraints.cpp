@@ -698,7 +698,14 @@ void LayoutConstraintBuilder::add_coverage_constraints() {
 
     auto covers_by_shape = [&](const FieldCandidate& cand,
                                const FieldAccess& access,
-                               TypeCategory access_cat) {
+                               TypeCategory access_cat,
+                               size_t access_index) {
+        if (cand.kind == FieldCandidate::Kind::ArrayField &&
+            cand.type_category != TypeCategory::Struct &&
+            std::find(cand.source_access_indices.begin(), cand.source_access_indices.end(),
+                      static_cast<int>(access_index)) == cand.source_access_indices.end()) {
+            return false;
+        }
         if ((cand.type_category == TypeCategory::Array ||
              cand.type_category == TypeCategory::Struct ||
              cand.type_category == TypeCategory::Union) &&
@@ -707,6 +714,7 @@ void LayoutConstraintBuilder::add_coverage_constraints() {
         }
 
         if ((cand.kind == FieldCandidate::Kind::DirectAccess ||
+             cand.kind == FieldCandidate::Kind::ArrayElement ||
              cand.kind == FieldCandidate::Kind::UnionAlternative) &&
             cand.offset == access.offset && cand.size == access.size &&
             cand.type_category != TypeCategory::RawBytes) {
@@ -724,8 +732,9 @@ void LayoutConstraintBuilder::add_coverage_constraints() {
 
     auto candidate_covers_access_fast = [&](const FieldCandidate& candidate,
                                             const FieldAccess& access,
-                                            TypeCategory access_cat) {
-        if (!covers_by_shape(candidate, access, access_cat)) {
+                                            TypeCategory access_cat,
+                                            size_t access_index) {
+        if (!covers_by_shape(candidate, access, access_cat, access_index)) {
             return false;
         }
 
@@ -742,7 +751,7 @@ void LayoutConstraintBuilder::add_coverage_constraints() {
             if (is_padding_like_candidate(other)) {
                 continue;
             }
-            if (covers_by_shape(other, access, access_cat)) {
+            if (covers_by_shape(other, access, access_cat, access_index)) {
                 return false;
             }
         }
@@ -761,7 +770,7 @@ void LayoutConstraintBuilder::add_coverage_constraints() {
 
             for (size_t j = 0; j < num_candidates; ++j) {
                 const auto& cand = candidates_[field_vars_[j].candidate_id];
-                if (candidate_covers_access_fast(cand, access, access_categories[i])) {
+                if (candidate_covers_access_fast(cand, access, access_categories[i], i)) {
                     covering.push_back(static_cast<int32_t>(j));
                 }
             }
@@ -1024,6 +1033,29 @@ void LayoutConstraintBuilder::add_type_constraints() {
     auto& ctx = ctx_.ctx();
     int type_constraint_count = 0;
 
+    // Preserve an observed type interpretation through either its scalar
+    // candidate or an array carrying every source observation for that view.
+    // Requiring the scalar itself prevents equivalent array-union layouts.
+    std::unordered_map<std::size_t, ::z3::expr> storage_view_cache;
+    const auto selected_storage_view = [&](std::size_t scalar_index) {
+        if (const auto found = storage_view_cache.find(scalar_index);
+            found != storage_view_cache.end()) {
+            return found->second;
+        }
+        ::z3::expr_vector alternatives(ctx);
+        alternatives.push_back(field_vars_[scalar_index].selected);
+        const auto& scalar = candidates_[field_vars_[scalar_index].candidate_id];
+        for (std::size_t i = 0; i < field_vars_.size(); ++i) {
+            const auto& candidate = candidates_[field_vars_[i].candidate_id];
+            if (candidate.replaces_scalar_evidence(scalar)) {
+                alternatives.push_back(field_vars_[i].selected);
+            }
+        }
+        auto selected = ::z3::mk_or(alternatives);
+        storage_view_cache.emplace(scalar_index, selected);
+        return selected;
+    };
+
     std::vector<size_t> by_offset(field_vars_.size());
     for (size_t i = 0; i < by_offset.size(); ++i) {
         by_offset[i] = i;
@@ -1085,8 +1117,10 @@ void LayoutConstraintBuilder::add_type_constraints() {
                         !c1.source_access_indices.empty() &&
                         !c2.source_access_indices.empty() &&
                         (c1.kind == FieldCandidate::Kind::DirectAccess ||
+                         c1.kind == FieldCandidate::Kind::ArrayElement ||
                          c1.kind == FieldCandidate::Kind::UnionAlternative) &&
                         (c2.kind == FieldCandidate::Kind::DirectAccess ||
+                         c2.kind == FieldCandidate::Kind::ArrayElement ||
                          c2.kind == FieldCandidate::Kind::UnionAlternative);
 
                     if (direct_evidence_alternatives) {
@@ -1103,14 +1137,10 @@ void LayoutConstraintBuilder::add_type_constraints() {
                             constraint_tracker_.add_hard(
                                 solver_, ctx.bool_val(false), prov);
                         } else {
+                            // The hard non-overlap constraints require the
+                            // selected overlapping views to share a union.
                             const ::z3::expr mandatory_union =
-                                field_vars_[i].selected &&
-                                field_vars_[j].selected &&
-                                field_vars_[i].is_union_member &&
-                                field_vars_[j].is_union_member &&
-                                field_vars_[i].union_group >= 0 &&
-                                field_vars_[i].union_group ==
-                                    field_vars_[j].union_group;
+                                selected_storage_view(i) && selected_storage_view(j);
                             constraint_tracker_.add_hard(
                                 solver_, mandatory_union, prov);
                         }
@@ -1355,39 +1385,25 @@ void LayoutConstraintBuilder::add_size_bound_constraints() {
 }
 
 void LayoutConstraintBuilder::add_array_constraints() {
-    // For each detected array, prefer selecting the array field over individual elements
-    for (const auto& array : arrays_) {
-        // Find the array field candidate (if any)
-        int array_field_idx = -1;
-        qvector<int> element_indices;
-
-        for (size_t i = 0; i < candidates_.size(); ++i) {
-            const auto& cand = candidates_[i];
-
-            if (cand.kind == FieldCandidate::Kind::ArrayField &&
-                cand.offset == array.base_offset &&
-                cand.array_element_count == array.element_count) {
-                array_field_idx = static_cast<int>(i);
-            }
-            else if (array.contains_offset(cand.offset) &&
-                     cand.kind == FieldCandidate::Kind::ArrayElement) {
-                element_indices.push_back(static_cast<int>(i));
-            }
-        }
-
-        if (array_field_idx >= 0 && !element_indices.empty()) {
-            // Soft constraint: if array field selected, don't select individual elements
-            ::z3::expr array_selected = field_vars_[array_field_idx].selected;
-
-            for (int elem_idx : element_indices) {
+    // Bind preferences to the actual typed candidate and its source evidence.
+    // Distinct views can have identical base offsets, strides, and lengths.
+    for (std::size_t i = 0; i < field_vars_.size(); ++i) {
+        const auto& array = candidates_[field_vars_[i].candidate_id];
+        if (array.kind != FieldCandidate::Kind::ArrayField) continue;
+        for (std::size_t j = 0; j < field_vars_.size(); ++j) {
+            const auto& element = candidates_[field_vars_[j].candidate_id];
+            if (array.replaces_scalar_evidence(element) ||
+                (array.type_category == TypeCategory::Struct &&
+                 element.kind == FieldCandidate::Kind::ArrayElement &&
+                 array.covers_source_evidence(element))) {
                 ::z3::expr constraint = ::z3::implies(
-                    array_selected,
-                    !field_vars_[elem_idx].selected
+                    field_vars_[i].selected,
+                    !field_vars_[j].selected
                 );
 
                 ConstraintProvenance prov;
                 prov.description.sprnt("Prefer array over elements at 0x%llX",
-                    static_cast<unsigned long long>(array.base_offset));
+                    static_cast<unsigned long long>(array.offset));
                 prov.is_soft = true;
                 prov.kind = ConstraintProvenance::Kind::ArrayDetection;
                 prov.weight = config_.weight_prefer_arrays;
@@ -1595,8 +1611,8 @@ Z3Result LayoutConstraintBuilder::solve_weighted_maxsmt(
     auto optimizer = ctx_.make_optimizer();
     optimizer.add(solver_.assertions());
 
-    const ::z3::expr_vector hard_literals = constraint_tracker_.get_hard_literals();
-    optimizer.add(hard_literals);
+    const ::z3::expr_vector hard_literals =
+        constraint_tracker_.add_hard_literals_to_optimizer(optimizer);
 
     const ::z3::expr_vector soft_literals = constraint_tracker_.get_soft_literals();
     for (unsigned i = 0; i < soft_literals.size(); ++i) {
@@ -1645,7 +1661,7 @@ Z3Result LayoutConstraintBuilder::solve_weighted_maxsmt(
             elapsed);
     }
     if (check == ::z3::unsat) {
-        qvector<ConstraintProvenance> core;
+        auto core = constraint_tracker_.analyze_unsat_core(optimizer.unsat_core());
         return Z3Result::make_unsat(std::move(core), elapsed);
     }
 
@@ -2336,6 +2352,20 @@ bool LayoutConstraintBuilder::candidate_covers_access(
     };
 
     const auto covers_by_shape = [&](const FieldCandidate& cand) {
+        if (cand.kind == FieldCandidate::Kind::ArrayField &&
+            cand.type_category != TypeCategory::Struct) {
+            const bool supported = pattern_ && std::any_of(
+                cand.source_access_indices.begin(), cand.source_access_indices.end(),
+                [&](int index) {
+                    if (index < 0 || static_cast<size_t>(index) >= pattern_->all_accesses.size()) {
+                        return false;
+                    }
+                    const auto& source = pattern_->all_accesses[static_cast<size_t>(index)];
+                    return ArrayAccessEvidence{source.offset, source.size,
+                        source.inferred_type, source.semantic_type}.matches(access);
+                });
+            if (!supported) return false;
+        }
         if ((cand.type_category == TypeCategory::Array ||
              cand.type_category == TypeCategory::Struct ||
              cand.type_category == TypeCategory::Union) &&
@@ -2344,6 +2374,7 @@ bool LayoutConstraintBuilder::candidate_covers_access(
         }
 
         if ((cand.kind == FieldCandidate::Kind::DirectAccess ||
+             cand.kind == FieldCandidate::Kind::ArrayElement ||
              cand.kind == FieldCandidate::Kind::UnionAlternative) &&
             cand.offset == access.offset && cand.size == access.size &&
             cand.type_category != TypeCategory::RawBytes) {

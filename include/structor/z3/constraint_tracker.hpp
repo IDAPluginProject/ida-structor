@@ -1,7 +1,11 @@
 #pragma once
 
 #include <z3++.h>
+#ifdef STRUCTOR_TESTING
+#include "mock_ida.hpp"
+#else
 #include <pro.h>
+#endif
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -30,6 +34,20 @@ struct ConstraintProvenance {
         Other
     };
     Kind kind = Kind::Other;
+
+    /// Export diagnostic metadata without borrowing the solver's context.
+    /// Tracking literals are required only while solving/relaxing constraints.
+    [[nodiscard]] ConstraintProvenance diagnostic_copy() const {
+        ConstraintProvenance copy;
+        copy.func_ea = func_ea;
+        copy.insn_ea = insn_ea;
+        copy.access_idx = access_idx;
+        copy.description = description;
+        copy.is_soft = is_soft;
+        copy.weight = weight;
+        copy.kind = kind;
+        return copy;
+    }
 
     /// Create from basic info
     static ConstraintProvenance make(
@@ -67,6 +85,19 @@ struct ConstraintProvenance {
         return p;
     }
 };
+
+/// Copy diagnostics at the synthesis boundary while their Z3 context is alive.
+/// Returned records remain valid after the solver and context are destroyed.
+[[nodiscard]] inline qvector<ConstraintProvenance> copy_constraint_diagnostics(
+    const qvector<ConstraintProvenance>& provenance)
+{
+    qvector<ConstraintProvenance> diagnostics;
+    diagnostics.reserve(provenance.size());
+    for (const auto& entry : provenance) {
+        diagnostics.push_back(entry.diagnostic_copy());
+    }
+    return diagnostics;
+}
 
 /// Tracks constraints for UNSAT core analysis
 class ConstraintTracker {
@@ -121,6 +152,12 @@ public:
 
     /// Get all hard constraint tracking literals
     [[nodiscard]] ::z3::expr_vector get_hard_literals() const;
+
+    /// Activate hard guarded constraints in Optimize with provenance tracking.
+    /// The caller first imports its solver assertions. Returns the activated
+    /// literals for later model checks and UNSAT-core attribution.
+    [[nodiscard]] ::z3::expr_vector add_hard_literals_to_optimizer(
+        ::z3::optimize& optimizer) const;
 
     /// Get all tracking literals (hard + soft) for use as assumptions
     [[nodiscard]] ::z3::expr_vector get_all_literals() const;

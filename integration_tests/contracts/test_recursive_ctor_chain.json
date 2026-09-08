@@ -43,9 +43,7 @@
           "source_var": "a1",
           "field_count": 5,
           "non_padding_field_count": 4,
-          "provenance": [
-            "_child_init"
-          ],
+          "provenance": [],
           "fields": [
             {
               "name": "u32_0",
@@ -131,7 +129,7 @@
           "vtable": null
         }
       },
-      "golden_pseudocode": ">>> root_init\n__int64 __fastcall root_init(auto_root_init *a1) {\n    __int64 result; // x0\n    auto_child *p_child; // [xsp-20h] [xbp-30h]\n\n    a1->u32_0 = 1380929364;\n    p_child = &a1->child;\n    a1->child.u32_0 = 1128810828;\n    result = leaf_init(result: &a1->child.leaf);\n    p_child->u64_20 = 0xAAAABBBBCCCCDDDDLL;\n    a1->u64_30 = 0x123456789ABCDEFLL;\n    a1->u32_38 = 9;\n    return result;\n}\n<<<\n\n>>> child_init\nauto_leaf *__fastcall child_init(auto_child *a1) {\n    auto_leaf *result; // x0\n\n    a1->u32_0 = 1128810828;\n    result = leaf_init(result: &a1->leaf);\n    a1->u64_20 = 0xAAAABBBBCCCCDDDDLL;\n    return result;\n}\n<<<\n\n>>> leaf_init\nauto_leaf *__fastcall leaf_init(auto_leaf *result) {\n    result->u32_0 = 3;\n    result->u32_4 = 7;\n    result->u64_8 = 0x1111222233334444LL;\n    return result;\n}\n<<<\n\n>>> use_root\nunsigned __int32 *__fastcall use_root(unsigned __int32 *result) {\n    sink ^= *result;\n    sink ^= result[2];\n    sink ^= result[4];\n    sink ^= result[5];\n    sink ^= *((_QWORD *)result + 3);\n    sink ^= *((_QWORD *)result + 5);\n    sink ^= *((_QWORD *)result + 6);\n    sink ^= result[14];\n    return result;\n}\n<<<\n"
+      "golden_pseudocode": ">>> root_init\n__int64 __fastcall root_init(auto_root_init *a1) {\n    __int64 result; // x0\n\n    a1->u32_0 = 1380929364;\n    result = child_init(a1: &a1->child);\n    a1->u64_30 = 0x123456789ABCDEFLL;\n    a1->u32_38 = 9;\n    return result;\n}\n<<<\n\n>>> child_init\nauto_leaf *__fastcall child_init(auto_child *a1) {\n    auto_leaf *result; // x0\n\n    a1->u32_0 = 1128810828;\n    result = leaf_init(result: &a1->leaf);\n    a1->u64_20 = 0xAAAABBBBCCCCDDDDLL;\n    return result;\n}\n<<<\n\n>>> leaf_init\nauto_leaf *__fastcall leaf_init(auto_leaf *result) {\n    result->u32_0 = 3;\n    result->u32_4 = 7;\n    result->u64_8 = 0x1111222233334444LL;\n    return result;\n}\n<<<\n\n>>> use_root\nunsigned __int32 *__fastcall use_root(unsigned __int32 *result) {\n    sink ^= *result;\n    sink ^= result[2];\n    sink ^= result[4];\n    sink ^= result[5];\n    sink ^= *((_QWORD *)result + 3);\n    sink ^= *((_QWORD *)result + 5);\n    sink ^= *((_QWORD *)result + 6);\n    sink ^= result[14];\n    return result;\n}\n<<<\n"
     }
   ]
 }

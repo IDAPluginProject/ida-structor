@@ -13,6 +13,7 @@ struct ExistingTypeField {
     tinfo_t type;
     qstring type_decl;
     bool is_padding = false;
+    bool is_bitfield = false;  // Bit storage cannot be overlaid as a byte field.
 };
 
 /// Ranked overlap between a provisional synthesized struct and an existing type.

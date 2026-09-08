@@ -74,6 +74,7 @@ def main() -> int:
             str(repo_root),
         ],
         [sys.executable, "integration_tests/check_cpp_api_surface.py", *common],
+        [sys.executable, "integration_tests/check_index_guard_regressions.py", *common],
         [sys.executable, "integration_tests/check_fixture_contracts.py", *common],
         [sys.executable, "integration_tests/check_determinism_regressions.py", *common],
         [sys.executable, "integration_tests/check_persistence_regressions.py", *common],
@@ -81,11 +82,15 @@ def main() -> int:
         [sys.executable, "integration_tests/check_weaponstats_regressions.py", *common],
         [sys.executable, "integration_tests/check_vtable_regressions.py", *common],
         [sys.executable, "integration_tests/check_type_fixer_regressions.py", *common],
+        [sys.executable, "integration_tests/check_type_matcher_regressions.py", *common],
+        [sys.executable, "integration_tests/check_array_regressions.py", *common],
+        [sys.executable, "integration_tests/check_type_application_regressions.py", *common],
     ]
 
     labels = [
         "external CMake consumer",
         "C++ API surface",
+        "index guard regressions",
         "exact fixture contracts",
         "fresh-database determinism regressions",
         "structure-persistence regressions",
@@ -93,6 +98,9 @@ def main() -> int:
         "WeaponStats regressions",
         "vtable regressions",
         "type-fixer regressions",
+        "existing-type matcher regressions",
+        "typed-array solver regressions",
+        "type-application identity regressions",
     ]
 
     for cmd, label in zip(suites, labels, strict=True):

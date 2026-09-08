@@ -29,7 +29,7 @@
         ],
         "failed_sites": [],
         "z3": {
-          "status": "success",
+          "status": "success_relaxed",
           "used_z3": true,
           "used_fallback": false
         },

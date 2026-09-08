@@ -94,11 +94,289 @@ bool checked_mul_sval(sval_t lhs, sval_t rhs, sval_t& out) {
     return true;
 }
 
+struct BaseConversionInfo {
+    bool has_base = false;
+    bool lossy = false;
+};
+
+BaseConversionInfo inspect_base_conversions(const cexpr_t* expr, int target_var,
+        const std::unordered_set<int>& address_aliases, int depth = 0) {
+    if (!expr || depth > 64) return {false, true};
+    if (expr->op == cot_var) {
+        return {expr->v.idx == target_var || address_aliases.contains(expr->v.idx), false};
+    }
+    switch (expr->op) {
+        case cot_num: return {};
+        case cot_cast: {
+            auto inner = inspect_base_conversions(expr->x, target_var, address_aliases, depth + 1);
+            if (inner.has_base) {
+                const auto preserves_address = [](const tinfo_t& type) {
+                    return (type.is_ptr() || type.is_integral()) && type.get_size() == get_ptr_size();
+                };
+                inner.lossy |= !preserves_address(expr->type) || !preserves_address(expr->x->type);
+            }
+            return inner;
+        }
+        case cot_ref:
+            if (expr->x && (expr->x->op == cot_ptr || expr->x->op == cot_idx ||
+                           expr->x->op == cot_memptr || expr->x->op == cot_memref)) {
+                return inspect_base_conversions(expr->x->x, target_var, address_aliases, depth + 1);
+            }
+            return {};
+        case cot_ptr: case cot_memptr: case cot_memref: {
+            const auto inner = inspect_base_conversions(expr->x, target_var, address_aliases, depth + 1);
+            return {false, inner.lossy}; // A loaded value is not the object's base address.
+        }
+        case cot_add: case cot_sub: case cot_mul: case cot_idx: {
+            const auto lhs = inspect_base_conversions(expr->x, target_var, address_aliases, depth + 1);
+            const auto rhs = inspect_base_conversions(expr->y, target_var, address_aliases, depth + 1);
+            return {expr->op != cot_idx && (lhs.has_base || rhs.has_base), lhs.lossy || rhs.lossy};
+        }
+        default: return {};
+    }
+}
+
+// Evaluate bounded integer expressions in their declared bit width. Discarding
+// casts changes addresses for truncation, sign extension, and wraparound.
+std::optional<sval_t> normalize_integer_value(std::uint64_t raw, const tinfo_t& type) {
+    if (!type.is_integral()) return std::nullopt;
+    if (type.is_bool()) return raw != 0 ? 1 : 0;
+    const auto size = type.get_size();
+    if (size == 0 || size == BADSIZE || size > sizeof(sval_t)) return std::nullopt;
+    const unsigned bits = static_cast<unsigned>(size * 8);
+    const std::uint64_t mask = bits == 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+    raw &= mask;
+    const std::uint64_t sign_bit = UINT64_C(1) << (bits - 1);
+    if (type.is_signed() && (raw & sign_bit) != 0) {
+        raw |= ~mask;
+    } else if (!type.is_unsigned() && !type.is_signed() && (raw & sign_bit) != 0) {
+        // An unspecified integer sign cannot establish a signed byte delta.
+        return std::nullopt;
+    } else if (raw > static_cast<std::uint64_t>(std::numeric_limits<sval_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<sval_t>(raw);
+}
+
+bool find_symbolic_index(const cexpr_t* expr, int target_var, int& index_var) {
+    unsigned references = 0;
+    unsigned updates = 0;
+    std::function<bool(const cexpr_t*, int)> walk = [&](const cexpr_t* item, int depth) {
+        if (!item || depth > 64) return false;
+        if (item->op == cot_var) {
+            if (item->v.idx == target_var) return true;
+            if (!item->type.is_integral() || (index_var >= 0 && index_var != item->v.idx)) return false;
+            index_var = item->v.idx;
+            ++references;
+            return true;
+        }
+        switch (item->op) {
+            case cot_num: return true;
+            case cot_preinc: case cot_predec: case cot_postinc: case cot_postdec:
+                if (!item->x || item->x->op != cot_var || item->x->v.idx == target_var) return false;
+                ++updates;
+                return walk(item->x, depth + 1);
+            case cot_cast: case cot_neg: case cot_bnot:
+                return walk(item->x, depth + 1);
+            case cot_add: case cot_sub: case cot_mul:
+            case cot_shl: case cot_sshr: case cot_ushr:
+            case cot_band: case cot_bor: case cot_xor:
+                return walk(item->x, depth + 1) && walk(item->y, depth + 1);
+            default: return false;
+        }
+    };
+    // A single increment/decrement can be evaluated using its old/new value.
+    // Multiple references around a mutation need explicit sequencing analysis.
+    return walk(expr, 0) && (updates == 0 || (updates == 1 && references == 1));
+}
+
+std::optional<sval_t> evaluate_integer_unary(const cexpr_t* expr, sval_t lhs) {
+    const auto raw = static_cast<std::uint64_t>(lhs);
+    switch (expr->op) {
+        case cot_cast: return normalize_integer_value(raw, expr->type);
+        case cot_neg: return normalize_integer_value(UINT64_C(0) - raw, expr->type);
+        case cot_bnot: return normalize_integer_value(~raw, expr->type);
+        case cot_postinc: case cot_postdec: return normalize_integer_value(raw, expr->type);
+        case cot_preinc: return normalize_integer_value(raw + 1, expr->type);
+        case cot_predec: return normalize_integer_value(raw - 1, expr->type);
+        default: return std::nullopt;
+    }
+}
+
+std::optional<sval_t> evaluate_integer_binary(const cexpr_t* expr, sval_t lhs, sval_t rhs) {
+    const auto unsigned_lhs = static_cast<std::uint64_t>(lhs);
+    const auto unsigned_rhs = static_cast<std::uint64_t>(rhs);
+    std::uint64_t value;
+    switch (expr->op) {
+        case cot_add: value = unsigned_lhs + unsigned_rhs; break;
+        case cot_sub: value = unsigned_lhs - unsigned_rhs; break;
+        case cot_mul: value = unsigned_lhs * unsigned_rhs; break;
+        case cot_band: value = unsigned_lhs & unsigned_rhs; break;
+        case cot_bor: value = unsigned_lhs | unsigned_rhs; break;
+        case cot_xor: value = unsigned_lhs ^ unsigned_rhs; break;
+        case cot_shl: case cot_sshr: case cot_ushr: {
+            const auto lhs_size = expr->x->type.get_size();
+            if (lhs_size == 0 || lhs_size == BADSIZE || lhs_size > sizeof(sval_t) ||
+                rhs < 0 || static_cast<std::uint64_t>(rhs) >= lhs_size * 8) {
+                return std::nullopt;
+            }
+            if (expr->op == cot_shl) {
+                value = unsigned_lhs << unsigned_rhs;
+            } else if (expr->op == cot_sshr) {
+                value = static_cast<std::uint64_t>(lhs >> unsigned_rhs);
+            } else {
+                const auto mask = lhs_size == 8 ? UINT64_MAX : (UINT64_C(1) << (lhs_size * 8)) - 1;
+                value = (unsigned_lhs & mask) >> unsigned_rhs;
+            }
+            break;
+        }
+        default: return std::nullopt;
+    }
+    return normalize_integer_value(value, expr->type);
+}
+
+std::optional<sval_t> evaluate_index_expression(
+        const cexpr_t* expr, int index_var, sval_t index_value, int depth = 0) {
+    if (!expr || depth > 64 || !expr->type.is_integral()) return std::nullopt;
+    if (expr->op == cot_num) {
+        return normalize_integer_value(expr->numval(), expr->type);
+    }
+    if (expr->op == cot_var) {
+        return expr->v.idx == index_var
+            ? normalize_integer_value(static_cast<std::uint64_t>(index_value), expr->type)
+            : std::nullopt;
+    }
+    const auto lhs = evaluate_index_expression(expr->x, index_var, index_value, depth + 1);
+    if (!lhs.has_value()) return std::nullopt;
+    if (expr->op == cot_cast || expr->op == cot_neg || expr->op == cot_bnot ||
+        expr->op == cot_preinc || expr->op == cot_predec ||
+        expr->op == cot_postinc || expr->op == cot_postdec) {
+        return evaluate_integer_unary(expr, *lhs);
+    }
+    const auto rhs = evaluate_index_expression(expr->y, index_var, index_value, depth + 1);
+    return rhs.has_value() ? evaluate_integer_binary(expr, *lhs, *rhs) : std::nullopt;
+}
+
+struct SymbolicPointerValue {
+    bool has_base = false;
+    sval_t offset = 0;
+};
+
+std::optional<SymbolicPointerValue> evaluate_symbolic_pointer(
+        const cexpr_t* expr, int target_var, int index_var, sval_t index_value, int depth = 0) {
+    if (!expr || depth > 64) return std::nullopt;
+    if (expr->op == cot_var && expr->v.idx == target_var) {
+        return SymbolicPointerValue{true, 0};
+    }
+    if (expr->op == cot_var || expr->op == cot_num) {
+        const auto scalar = evaluate_index_expression(expr, index_var, index_value, depth);
+        return scalar.has_value()
+            ? std::optional<SymbolicPointerValue>({false, *scalar}) : std::nullopt;
+    }
+    const auto lhs = evaluate_symbolic_pointer(expr->x, target_var, index_var, index_value, depth + 1);
+    if (!lhs.has_value()) return std::nullopt;
+    auto address_width = [](const tinfo_t& type) {
+        return (type.is_integral() || type.is_ptr()) && type.get_size() == get_ptr_size();
+    };
+    if (expr->op == cot_cast || expr->op == cot_neg || expr->op == cot_bnot ||
+        expr->op == cot_preinc || expr->op == cot_predec ||
+        expr->op == cot_postinc || expr->op == cot_postdec) {
+        if (!lhs->has_base) {
+            const auto scalar = evaluate_integer_unary(expr, lhs->offset);
+            return scalar.has_value()
+                ? std::optional<SymbolicPointerValue>({false, *scalar}) : std::nullopt;
+        }
+        if (expr->op != cot_cast || !address_width(expr->type) || !address_width(expr->x->type)) {
+            return std::nullopt;
+        }
+        return lhs;
+    }
+    const auto rhs = evaluate_symbolic_pointer(expr->y, target_var, index_var, index_value, depth + 1);
+    if (!rhs.has_value()) return std::nullopt;
+    if (!lhs->has_base && !rhs->has_base) {
+        const auto scalar = evaluate_integer_binary(expr, lhs->offset, rhs->offset);
+        return scalar.has_value()
+            ? std::optional<SymbolicPointerValue>({false, *scalar}) : std::nullopt;
+    }
+    if ((expr->op != cot_add && expr->op != cot_sub) || !address_width(expr->type)) {
+        return std::nullopt;
+    }
+    // A structure-relative address contains exactly one positive base term.
+    if (lhs->has_base == rhs->has_base || (expr->op == cot_sub && rhs->has_base)) {
+        return std::nullopt;
+    }
+    const auto& base = lhs->has_base ? *lhs : *rhs;
+    const auto& scalar = lhs->has_base ? *rhs : *lhs;
+    const auto* base_expr = lhs->has_base ? expr->x : expr->y;
+    sval_t scale = 1;
+    if (base_expr->type.is_ptr()) {
+        const auto size = base_expr->type.get_pointed_object().get_size();
+        if (size == 0 || size == BADSIZE || size > static_cast<std::size_t>(
+                std::numeric_limits<sval_t>::max())) return std::nullopt;
+        scale = static_cast<sval_t>(size);
+    }
+    sval_t delta = 0;
+    if (!checked_mul_sval(scalar.offset, scale, delta)) return std::nullopt;
+    if (expr->op == cot_sub && !checked_mul_sval(delta, -1, delta)) return std::nullopt;
+    sval_t offset = 0;
+    if (!checked_add_sval(base.offset, delta, offset)) return std::nullopt;
+    return SymbolicPointerValue{true, offset};
+}
+
+std::optional<std::uint32_t> regular_offset_stride(const qvector<sval_t>& offsets) {
+    if (offsets.size() < 2) return std::nullopt;
+    const auto first_delta = checked_sval_sub(offsets[1], offsets[0]);
+    if (!first_delta.has_value() || *first_delta == 0) return std::nullopt;
+    for (std::size_t i = 2; i < offsets.size(); ++i) {
+        if (checked_sval_sub(offsets[i], offsets[i - 1]) != first_delta) return std::nullopt;
+    }
+    const auto magnitude = *first_delta > 0 ? first_delta : checked_sval_mul(*first_delta, -1);
+    if (!magnitude.has_value() || *magnitude > std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint32_t>(*magnitude);
+}
+
 } // namespace
 
 // ============================================================================
 // AccessPatternVisitor Implementation
 // ============================================================================
+
+AccessPatternVisitor::AccessPatternVisitor(cfunc_t* cfunc, int target_var_idx)
+    : ctree_visitor_t(CV_PARENTS)
+    , cfunc_(cfunc)
+    , target_var_idx_(target_var_idx)
+    , has_unstructured_control_flow_(cfunc && cfunc->body.contains_insn(cit_goto)) {}
+
+int AccessPatternVisitor::visit_insn(cinsn_t* insn) {
+    if (!insn) return 0;
+    // The SDK's default ctree walk visits branch/loop bodies before their
+    // conditions, and a for-loop step before its body. Bounds and local value
+    // versions require execution order, so enumerate these children explicitly
+    // while retaining the SDK-maintained parent stack.
+    auto visit_children = [&](std::initializer_list<citem_t*> children) {
+        for (citem_t* child : children) {
+            if (child) {
+                const int code = apply_to(child, insn);
+                if (code != 0) return code;
+            }
+        }
+        prune_now();
+        return 0;
+    };
+    switch (insn->op) {
+        case cit_if:
+            return visit_children({&insn->cif->expr, insn->cif->ithen, insn->cif->ielse});
+        case cit_while:
+            return visit_children({&insn->cwhile->expr, insn->cwhile->body});
+        case cit_for:
+            return visit_children({&insn->cfor->init, &insn->cfor->expr,
+                                   insn->cfor->body, &insn->cfor->step});
+        default:
+            return 0;
+    }
+}
 
 int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
     if (!expr) return 0;
@@ -175,7 +453,8 @@ int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
                 bool resolved = extract_access(base_expr, offset, size, &base_indirection);
                 if (!resolved && base_expr && base_expr->op == cot_var) {
                     auto it = local_aliases_.find(base_expr->v.idx);
-                    if (it != local_aliases_.end()) {
+                    if (it != local_aliases_.end() &&
+                        !address_aliases_.contains(base_expr->v.idx)) {
                         offset = it->second.offset;
                         size = it->second.size;
                         base_indirection = it->second.base_indirection;
@@ -197,16 +476,40 @@ int AccessPatternVisitor::visit_expr(cexpr_t* expr) {
         case cot_eq:
         case cot_ne:
             process_constant_comparison(expr);
+            process_index_bound(expr);
             break;
 
         case cot_ult:
         case cot_ule:
         case cot_slt:
         case cot_sle:
+        case cot_ugt:
+        case cot_uge:
+        case cot_sgt:
+        case cot_sge:
             process_index_bound(expr);
             break;
 
+        case cot_preinc:
+        case cot_predec:
+        case cot_postinc:
+        case cot_postdec:
+            if (expr->x && expr->x->op == cot_var) {
+                invalidate_local_var_state(expr->x->v.idx, true);
+            }
+            break;
+
+        case cot_ref:
+            if (expr->x && expr->x->op == cot_var) {
+                escaped_local_vars_.insert(expr->x->v.idx);
+                invalidate_local_var_state(expr->x->v.idx, true);
+            }
+            break;
+
         case cot_call:
+            for (int var_idx : escaped_local_vars_) {
+                invalidate_local_var_state(var_idx, true);
+            }
             process_call_argument_uses(expr);
             // Check for indirect calls through our variable
             process_call_through_ptr(expr);
@@ -236,6 +539,10 @@ void AccessPatternVisitor::process_assignment(cexpr_t* expr) {
     }
 
     cexpr_t* rhs = expr->y;
+    if (inspect_base_conversions(rhs, target_var_idx_, address_aliases_).lossy) {
+        invalidate_local_var_state(lhs->v.idx, true);
+        return;
+    }
     while (rhs && rhs->op == cot_cast) {
         rhs = rhs->x;
     }
@@ -248,6 +555,7 @@ void AccessPatternVisitor::process_assignment(cexpr_t* expr) {
 
     FieldAccess alias;
     bool resolved = false;
+    bool address_only = false;
 
     sval_t offset = 0;
     uint32_t size = 0;
@@ -267,6 +575,7 @@ void AccessPatternVisitor::process_assignment(cexpr_t* expr) {
         auto it = local_aliases_.find(rhs->v.idx);
         if (it != local_aliases_.end()) {
             alias = it->second;
+            address_only = address_aliases_.contains(rhs->v.idx);
             resolved = true;
         } else if (rhs->v.idx == target_var_idx_) {
             alias.insn_ea = expr->ea;
@@ -277,6 +586,7 @@ void AccessPatternVisitor::process_assignment(cexpr_t* expr) {
             alias.semantic_type = infer_semantic_from_usage(rhs, parent_expr());
             alias.context_expr = utils::expr_to_string(rhs, cfunc_);
             alias.inferred_type = rhs->type;
+            address_only = true;
             resolved = true;
         }
     }
@@ -286,14 +596,19 @@ void AccessPatternVisitor::process_assignment(cexpr_t* expr) {
     if (resolved) {
         auto pending_it = pending_constants_.find(lhs->v.idx);
         if (pending_it != pending_constants_.end()) {
-            msg("Structor:   Applying %zu pending constants to local v%d\n",
-                pending_it->second.size(), lhs->v.idx);
-            for (auto value : pending_it->second) {
-                alias.add_observed_constant(value);
+            if (!address_only) {
+                msg("Structor:   Applying %zu pending constants to local v%d\n",
+                    pending_it->second.size(), lhs->v.idx);
+                for (auto value : pending_it->second) {
+                    alias.add_observed_constant(value);
+                }
             }
             pending_constants_.erase(pending_it);
         }
         local_aliases_[lhs->v.idx] = std::move(alias);
+        if (address_only) {
+            address_aliases_.insert(lhs->v.idx);
+        }
         return;
     }
 
@@ -304,14 +619,17 @@ void AccessPatternVisitor::process_assignment(cexpr_t* expr) {
 void AccessPatternVisitor::invalidate_local_var_state(int var_idx,
                                                       bool clear_pending_constants) {
     local_aliases_.erase(var_idx);
-    local_index_bounds_.erase(var_idx);
-    pending_symbolic_accesses_.erase(var_idx);
+    address_aliases_.erase(var_idx);
+    ++local_var_versions_[var_idx];
     if (clear_pending_constants) {
         pending_constants_.erase(var_idx);
     }
 }
 
 utils::PtrArithInfo AccessPatternVisitor::resolve_ptr_arith(const cexpr_t* expr) const {
+    if (inspect_base_conversions(expr, target_var_idx_, address_aliases_).lossy) {
+        return {};
+    }
     utils::PtrArithInfo info = utils::extract_ptr_arith(expr);
     if (!info.valid) {
         return info;
@@ -327,6 +645,7 @@ utils::PtrArithInfo AccessPatternVisitor::resolve_ptr_arith(const cexpr_t* expr)
     }
 
     const FieldAccess& alias = it->second;
+    const bool is_loaded_value = !address_aliases_.contains(info.var_idx);
     info.var_idx = target_var_idx_;
     const auto rebased = checked_sval_add(info.offset, alias.offset);
     if (!rebased.has_value()) {
@@ -339,6 +658,7 @@ utils::PtrArithInfo AccessPatternVisitor::resolve_ptr_arith(const cexpr_t* expr)
             std::min<int>(0xFF, info.base_indirection + *alias.base_indirection));
         info.through_pointer_alias = true;
     }
+    info.through_pointer_alias = info.through_pointer_alias || is_loaded_value;
     return info;
 }
 
@@ -381,6 +701,9 @@ void AccessPatternVisitor::process_constant_comparison(cexpr_t* expr) {
             pending_constants_[value_expr->v.idx].push_back(constant);
             return;
         }
+        if (address_aliases_.contains(value_expr->v.idx)) {
+            return;
+        }
         access = it->second;
         resolved = true;
     }
@@ -413,255 +736,337 @@ void AccessPatternVisitor::process_index_bound(cexpr_t* expr) {
         return;
     }
 
-    const cexpr_t* var_expr = nullptr;
-    std::uint32_t bound = 0;
-
-    // Only a variable on the left and a constant on the right establishes an
-    // upper bound.  `constant < variable` is a lower bound and must not be
-    // materialized as a finite array extent.
-    if (expr->y->op == cot_num && expr->x->op == cot_var) {
-        bound = static_cast<std::uint32_t>(expr->y->numval());
-        var_expr = expr->x;
-    } else if (expr->y->op == cot_num && expr->x->op == cot_cast && expr->x->x && expr->x->x->op == cot_var) {
-        bound = static_cast<std::uint32_t>(expr->y->numval());
-        var_expr = expr->x->x;
-    } else {
+    const cexpr_t* variable = expr->x;
+    const cexpr_t* number = expr->y;
+    bool reversed = false;
+    if (variable->op == cot_num) {
+        std::swap(variable, number);
+        reversed = true;
+    }
+    if (number->op != cot_num) {
+        return;
+    }
+    if ((expr->op == cot_eq || expr->op == cot_ne) && number->numval() == 0 &&
+        variable->op == cot_band && variable->x && variable->y) {
+        const cexpr_t* value = variable->x;
+        const cexpr_t* mask = variable->y;
+        if (value->op == cot_num) std::swap(value, mask);
+        if (mask->op != cot_num) return;
+        while (value && value->op == cot_cast) {
+            if (!value->x || !value->type.is_integral() || !value->x->type.is_integral() ||
+                value->type.get_size() != value->x->type.get_size()) return;
+            value = value->x;
+        }
+        if (!value || value->op != cot_var || !value->type.is_integral()) return;
+        const auto size = value->type.get_size();
+        if (size == 0 || size == BADSIZE || size > sizeof(sval_t) ||
+            variable->type.get_size() != size) return;
+        const auto sign_bit = UINT64_C(1) << (size * 8 - 1);
+        const auto width_mask = size == 8 ? UINT64_MAX : (UINT64_C(1) << (size * 8)) - 1;
+        if ((mask->numval() & width_mask) != sign_bit) return;
+        const auto signed_max = static_cast<sval_t>(sign_bit - 1);
+        IndexRange clear{0, signed_max, true, true};
+        IndexRange set;
+        if (value->type.is_signed()) {
+            const auto signed_min = size == 8 ? std::numeric_limits<sval_t>::min()
+                                              : -static_cast<sval_t>(sign_bit);
+            set = {signed_min, -1, true, true};
+        } else if (value->type.is_unsigned() && size < 8) {
+            set = {static_cast<sval_t>(sign_bit), static_cast<sval_t>(width_mask), true, true};
+        }
+        const bool zero_when_true = expr->op == cot_eq;
+        const int var_idx = value->v.idx;
+        index_comparisons_[expr] = {var_idx, local_var_versions_[var_idx],
+            zero_when_true ? clear : set, zero_when_true ? set : clear};
+        return;
+    }
+    // A narrowing cast constrains only the truncated value, not the index.
+    // Require every cast to preserve the variable's storage width.
+    const tinfo_t compared_type = variable->type;
+    while (variable && variable->op == cot_cast) {
+        if (!variable->x || !variable->type.is_integral() || !variable->x->type.is_integral() ||
+            variable->type.is_bool() != variable->x->type.is_bool() ||
+            variable->type.get_size() == BADSIZE || variable->type.get_size() == 0 ||
+            variable->type.get_size() != variable->x->type.get_size()) {
+            return;
+        }
+        variable = variable->x;
+    }
+    if (!variable || variable->op != cot_var || !variable->type.is_integral()) {
         return;
     }
 
-    if ((expr->op == cot_ule || expr->op == cot_sle) && bound < 32) {
-        ++bound;
+    const bool unsigned_comparison = expr->op == cot_ult || expr->op == cot_ule ||
+        expr->op == cot_ugt || expr->op == cot_uge;
+    const bool signed_comparison = expr->op == cot_slt || expr->op == cot_sle ||
+        expr->op == cot_sgt || expr->op == cot_sge;
+    // A signed comparison of unsigned storage may admit the high half of its
+    // bit patterns as negative numbers. A single numeric interval cannot map
+    // that discontinuity back to the unsigned index without losing values.
+    if (signed_comparison && variable->type.is_unsigned()) return;
+    const auto variable_size = compared_type.get_size();
+    const auto number_size = number->type.get_size();
+    if (variable_size == 0 || variable_size == BADSIZE || variable_size > sizeof(sval_t) ||
+        number_size == 0 || number_size == BADSIZE || number_size > sizeof(sval_t)) return;
+    const auto operand_size = std::max(variable_size, number_size);
+    const auto width_mask = operand_size == 8 ? UINT64_MAX : (UINT64_C(1) << (operand_size * 8)) - 1;
+    auto raw_constant = static_cast<std::uint64_t>(number->numval()) & width_mask;
+    if (signed_comparison && (raw_constant & (UINT64_C(1) << (operand_size * 8 - 1))) != 0) {
+        raw_constant |= ~width_mask;
     }
-
-    if (!var_expr || var_expr->op != cot_var || bound == 0 || bound > 32) {
-        return;
+    // Preserve wider constants (e.g. 0x100000004); never reduce their width
+    // merely because the variable is narrower.
+    if (unsigned_comparison && raw_constant > static_cast<std::uint64_t>(std::numeric_limits<sval_t>::max())) return;
+    sval_t constant = static_cast<sval_t>(raw_constant);
+    if (expr->op == cot_eq || expr->op == cot_ne) {
+        const auto candidate = normalize_integer_value(raw_constant, variable->type);
+        const auto compared = candidate.has_value()
+            ? normalize_integer_value(static_cast<std::uint64_t>(*candidate), compared_type)
+            : std::nullopt;
+        if (!compared.has_value() ||
+            (static_cast<std::uint64_t>(*compared) & width_mask) != (raw_constant & width_mask)) return;
+        constant = *candidate;
     }
-
-    local_index_bounds_[var_expr->v.idx] = bound;
-    flush_pending_symbolic_accesses(var_expr->v.idx, bound);
-}
-
-void AccessPatternVisitor::flush_pending_symbolic_accesses(int index_var, std::uint32_t bound) {
-    if (bound == 0 || bound > 32) {
-        return;
+    enum class Relation { Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual };
+    Relation relation;
+    switch (expr->op) {
+        case cot_ult: case cot_slt: relation = Relation::Less; break;
+        case cot_ule: case cot_sle: relation = Relation::LessEqual; break;
+        case cot_ugt: case cot_sgt: relation = Relation::Greater; break;
+        case cot_uge: case cot_sge: relation = Relation::GreaterEqual; break;
+        case cot_eq: relation = Relation::Equal; break;
+        case cot_ne: relation = Relation::NotEqual; break;
+        default: return;
     }
-
-    auto it = pending_symbolic_accesses_.find(index_var);
-    if (it == pending_symbolic_accesses_.end()) {
-        return;
-    }
-
-    msg("Structor:   Materializing %zu deferred symbolic accesses for idx=v%d bound=%u\n",
-        it->second.size(), index_var, bound);
-
-    for (const auto& pending : it->second) {
-        for (std::uint32_t idx = 0; idx < bound; ++idx) {
-            sval_t index_delta = 0;
-            sval_t materialized_offset = 0;
-            if (!checked_mul_sval(
-                    static_cast<sval_t>(idx),
-                    static_cast<sval_t>(pending.stride), index_delta) ||
-                !checked_add_sval(
-                    pending.base_offset, index_delta, materialized_offset)) {
-                continue;
-            }
-            FieldAccess access;
-            access.insn_ea = pending.insn_ea;
-            access.offset = materialized_offset;
-            access.size = pending.size;
-            access.access_type = pending.access_type;
-            access.semantic_type = pending.semantic_type;
-            access.context_expr = pending.context_expr;
-            access.inferred_type = pending.inferred_type;
-            access.source_func_ea = cfunc_->entry_ea;
-            access.array_stride_hint = pending.stride;
-            access.is_call_argument = pending.is_call_argument;
-            if (pending.base_indirection.has_value()) {
-                access.base_indirection = pending.base_indirection;
-            }
-            accesses_.push_back(std::move(access));
+    if (reversed) {
+        switch (relation) {
+            case Relation::Less: relation = Relation::Greater; break;
+            case Relation::LessEqual: relation = Relation::GreaterEqual; break;
+            case Relation::Greater: relation = Relation::Less; break;
+            case Relation::GreaterEqual: relation = Relation::LessEqual; break;
+            default: break;
         }
     }
 
-    pending_symbolic_accesses_.erase(it);
+    auto range_for = [&](bool truth) {
+        IndexRange range;
+        if (unsigned_comparison) {
+            range.first = 0;
+            range.first_known = true;
+        }
+        Relation effective = relation;
+        if (!truth) {
+            switch (effective) {
+                case Relation::Less: effective = Relation::GreaterEqual; break;
+                case Relation::LessEqual: effective = Relation::Greater; break;
+                case Relation::Greater: effective = Relation::LessEqual; break;
+                case Relation::GreaterEqual: effective = Relation::Less; break;
+                case Relation::Equal: effective = Relation::NotEqual; break;
+                case Relation::NotEqual: effective = Relation::Equal; break;
+            }
+        }
+        switch (effective) {
+            case Relation::Less:
+                if (constant == std::numeric_limits<sval_t>::min()) {
+                    range = {1, 0, true, true};
+                } else {
+                    range.last = constant - 1;
+                    range.last_known = true;
+                }
+                break;
+            case Relation::LessEqual:
+                range.last = constant;
+                range.last_known = true;
+                break;
+            case Relation::Greater:
+                if (constant == std::numeric_limits<sval_t>::max()) {
+                    // For unsigned comparisons this may still admit large
+                    // values. Keep an unbounded range instead of inventing one.
+                    if (!unsigned_comparison) {
+                        range = {1, 0, true, true};
+                    }
+                } else {
+                    range.first = constant + 1;
+                    range.first_known = true;
+                }
+                break;
+            case Relation::GreaterEqual:
+                range.first = constant;
+                range.first_known = true;
+                break;
+            case Relation::Equal: range = {constant, constant, true, true}; break;
+            case Relation::NotEqual: break; // an interval cannot represent the hole
+        }
+        if (unsigned_comparison && variable->type.is_signed()) {
+            const auto size = variable->type.get_size();
+            if (size == 0 || size == BADSIZE || size > sizeof(sval_t)) return IndexRange{};
+            const auto signed_max = size == sizeof(sval_t)
+                ? std::numeric_limits<sval_t>::max()
+                : static_cast<sval_t>((UINT64_C(1) << (size * 8 - 1)) - 1);
+            // An unsigned upper bound below the sign bit proves the original
+            // signed index is nonnegative. An unsigned lower bound alone does
+            // not: it can also admit every negative signed bit pattern.
+            if (!range.last_known || range.last < 0 || range.last > signed_max) {
+                return IndexRange{};
+            }
+        }
+        return range;
+    };
+
+    const int var_idx = variable->v.idx;
+    index_comparisons_[expr] = {
+        var_idx, local_var_versions_[var_idx], range_for(true), range_for(false)};
+}
+
+AccessPatternVisitor::IndexRange AccessPatternVisitor::condition_index_range(
+        const cexpr_t* condition, int var_idx, bool truth, int depth) const {
+    if (!condition || depth > 64) {
+        return {};
+    }
+    if (condition->op == cot_lnot) {
+        return condition_index_range(condition->x, var_idx, !truth, depth + 1);
+    }
+    if (condition->op == cot_land || condition->op == cot_lor) {
+        const auto lhs = condition_index_range(condition->x, var_idx, truth, depth + 1);
+        const auto rhs = condition_index_range(condition->y, var_idx, truth, depth + 1);
+        const bool intersection = (condition->op == cot_land) == truth;
+        return intersection ? lhs.intersect(rhs) : lhs.unite(rhs);
+    }
+    const auto it = index_comparisons_.find(condition);
+    if (it == index_comparisons_.end() || it->second.var_idx != var_idx) {
+        return {};
+    }
+    const auto version = local_var_versions_.find(var_idx);
+    if (version == local_var_versions_.end() || version->second != it->second.version) {
+        return {};
+    }
+    return truth ? it->second.when_true : it->second.when_false;
+}
+
+bool AccessPatternVisitor::loop_may_change_index(const cinsn_t* loop, int var_idx) const {
+    auto it = loop_index_effects_.find(loop);
+    if (it == loop_index_effects_.end()) {
+        struct EffectVisitor final : ctree_visitor_t {
+            LoopIndexEffects effects;
+            EffectVisitor() : ctree_visitor_t(CV_FAST) {}
+            int idaapi visit_expr(cexpr_t* expr) override {
+                if (expr->op == cot_call) effects.has_call = true;
+                const bool may_write = is_assignment_op(expr->op) ||
+                    expr->op == cot_preinc || expr->op == cot_predec ||
+                    expr->op == cot_postinc || expr->op == cot_postdec ||
+                    expr->op == cot_ref;
+                if (may_write && expr->x && expr->x->op == cot_var) {
+                    effects.written_or_referenced_vars.insert(expr->x->v.idx);
+                }
+                return 0;
+            }
+        } visitor;
+        visitor.apply_to(const_cast<cinsn_t*>(loop), nullptr);
+        it = loop_index_effects_.emplace(loop, std::move(visitor.effects)).first;
+    }
+    return it->second.written_or_referenced_vars.contains(var_idx) ||
+        (it->second.has_call && escaped_local_vars_.contains(var_idx));
+}
+
+std::optional<AccessPatternVisitor::IndexRange> AccessPatternVisitor::bounded_index_range(
+        const cexpr_t* access_expr, int var_idx) const {
+    // Lexical ancestry alone cannot prove dominance when a goto may enter a
+    // guarded region. Such functions need a CFG-based proof before expansion.
+    if (has_unstructured_control_flow_) {
+        return std::nullopt;
+    }
+    IndexRange result;
+    auto constrain = [&](const cexpr_t* condition, bool truth) {
+        const auto range = condition_index_range(condition, var_idx, truth);
+        result = result.intersect(range);
+    };
+
+    const citem_t* child = access_expr;
+    for (std::size_t i = parents.size(); i > 0; --i) {
+        const citem_t* parent = parents[i - 1];
+        // apply_to(..., nullptr) retains a null sentinel for the tree root.
+        if (!parent) continue;
+        if (parent->is_expr()) {
+            const auto* expression = static_cast<const cexpr_t*>(parent);
+            if (expression->op == cot_land && child == expression->y) {
+                constrain(expression->x, true);
+            } else if (expression->op == cot_lor && child == expression->y) {
+                constrain(expression->x, false);
+            } else if (expression->op == cot_tern) {
+                if (child == expression->y) constrain(expression->x, true);
+                if (child == expression->z) constrain(expression->x, false);
+            }
+        } else {
+            const auto* instruction = static_cast<const cinsn_t*>(parent);
+            if (instruction->op == cit_if && instruction->cif) {
+                if (child == instruction->cif->ithen) constrain(&instruction->cif->expr, true);
+                if (child == instruction->cif->ielse) constrain(&instruction->cif->expr, false);
+            } else if (instruction->op == cit_while && instruction->cwhile &&
+                       child == instruction->cwhile->body) {
+                constrain(&instruction->cwhile->expr, true);
+            } else if (instruction->op == cit_for && instruction->cfor &&
+                       child == instruction->cfor->body) {
+                constrain(&instruction->cfor->expr, true);
+            }
+            // A do-loop condition does not guard the first body execution.
+            // A guard outside a loop must also hold after every backedge. A
+            // single lexical traversal cannot establish that if the loop can
+            // modify the index after this access, so retain only inner guards.
+            if ((instruction->op == cit_for || instruction->op == cit_while ||
+                 instruction->op == cit_do) && loop_may_change_index(instruction, var_idx)) {
+                break;
+            }
+        }
+        child = parent;
+    }
+    const auto span = checked_sval_sub(result.last, result.first);
+    if (!result.first_known || !result.last_known || !span.has_value() ||
+        *span < 0 || *span >= 32) {
+        return std::nullopt;
+    }
+    return result;
 }
 
 void AccessPatternVisitor::process_dereference(cexpr_t* expr, const cexpr_t* ptr_expr) {
     auto arith = resolve_ptr_arith(expr);
 
     if (!arith.valid && ptr_expr) {
-        struct SymbolicPtrInfo {
-            bool has_base = false;
-            int index_var = -1;
-            sval_t constant = 0;
-            sval_t index_scale = 0;
-            bool valid = true;
-        } info;
-
-        std::function<bool(const cexpr_t*, sval_t)> walk =
-                [&](const cexpr_t* e, sval_t factor) {
-            if (!e || !info.valid) {
-                return false;
-            }
-            switch (e->op) {
-                case cot_var:
-                    if (e->v.idx == target_var_idx_) {
-                        if (factor != 1) {
-                            info.valid = false;
-                            return false;
-                        }
-                        info.has_base = true;
-                    } else {
-                        if (info.index_var >= 0 && info.index_var != e->v.idx) {
-                            info.valid = false;
-                            return false;
-                        }
-                        info.index_var = e->v.idx;
-                        sval_t updated = 0;
-                        if (!checked_add_sval(info.index_scale, factor, updated)) {
-                            info.valid = false;
-                            return false;
-                        }
-                        info.index_scale = updated;
-                    }
-                    return true;
-                case cot_num: {
-                    sval_t term = 0;
-                    sval_t updated = 0;
-                    if (!checked_mul_sval(
-                            factor, static_cast<sval_t>(e->numval()), term) ||
-                        !checked_add_sval(info.constant, term, updated)) {
-                        info.valid = false;
-                        return false;
-                    }
-                    info.constant = updated;
-                    return true;
-                }
-                case cot_cast:
-                case cot_ref:
-                    return walk(e->x, factor);
-                case cot_add:
-                    return walk(e->x, factor) && walk(e->y, factor);
-                case cot_sub: {
-                    if (!walk(e->x, factor)) {
-                        return false;
-                    }
-                    sval_t negative_factor = 0;
-                    if (!checked_mul_sval(factor, -1, negative_factor)) {
-                        info.valid = false;
-                        return false;
-                    }
-                    return walk(e->y, negative_factor);
-                }
-                case cot_mul: {
-                    const cexpr_t* value = nullptr;
-                    const cexpr_t* multiplier = nullptr;
-                    if (e->x && e->x->op == cot_num) {
-                        multiplier = e->x;
-                        value = e->y;
-                    } else if (e->y && e->y->op == cot_num) {
-                        multiplier = e->y;
-                        value = e->x;
-                    } else {
-                        info.valid = false;
-                        return false;
-                    }
-                    sval_t scaled_factor = 0;
-                    if (!checked_mul_sval(
-                            factor,
-                            static_cast<sval_t>(multiplier->numval()),
-                            scaled_factor)) {
-                        info.valid = false;
-                        return false;
-                    }
-                    return walk(value, scaled_factor);
-                }
-                default:
-                    info.valid = false;
-                    return false;
-            }
-        };
-
-        (void)walk(ptr_expr, 1);
-
-        if (info.valid && info.has_base && info.index_var >= 0 &&
-                info.index_scale != 0) {
-            msg("Structor:   Symbolic deref candidate in 0x%llX base=v%d idx=v%d "
-                "constant=%lld scale=%lld\n",
-                static_cast<unsigned long long>(expr->ea),
-                target_var_idx_, info.index_var,
-                static_cast<long long>(info.constant),
-                static_cast<long long>(info.index_scale));
-            auto bound_it = local_index_bounds_.find(info.index_var);
-
-            sval_t base_offset = 0;
-            sval_t signed_stride = 0;
-            // Hex-Rays cot_add/cot_mul address expressions are already in byte
-            // units even when the final dereference gives the expression a
-            // wider pointer type. cot_idx is handled by process_array_access().
-            if (checked_mul_sval(
-                    info.constant, 1, base_offset) &&
-                checked_mul_sval(
-                    info.index_scale, 1, signed_stride) &&
-                signed_stride > 0 &&
-                static_cast<std::uint64_t>(signed_stride) <=
-                    std::numeric_limits<std::uint32_t>::max()) {
-                const auto stride = static_cast<std::uint32_t>(signed_stride);
-                if (bound_it != local_index_bounds_.end() && bound_it->second > 0 && bound_it->second <= 32) {
-                    msg("Structor:   Expanding bounded symbolic deref with bound=%u stride=%u\n",
-                        bound_it->second, stride);
-                    for (std::uint32_t idx = 0; idx < bound_it->second; ++idx) {
-                        FieldAccess access;
-                        access.insn_ea = expr->ea;
-                        sval_t index_term = 0;
-                        if (!checked_mul_sval(
-                                static_cast<sval_t>(idx),
-                                static_cast<sval_t>(stride), index_term) ||
-                            !checked_add_sval(base_offset, index_term, access.offset)) {
-                            continue;
-                        }
-                        access.size = !expr->type.empty()
-                            ? utils::get_type_size(expr->type, get_ptr_size())
-                            : get_ptr_size();
-                        const cexpr_t* rhs = nullptr;
-                        access.access_type = determine_access_type(expr, &rhs);
-                        if (access.access_type == AccessType::Write) {
-                            extract_and_add_rhs_constant(access, rhs);
-                        }
-                        const cexpr_t* parent = parent_expr();
-                        access.semantic_type = infer_semantic_from_usage(expr, parent);
-                        access.context_expr = utils::expr_to_string(expr, cfunc_);
-                        access.inferred_type = expr->type;
-                        access.source_func_ea = cfunc_->entry_ea;
-                        access.array_stride_hint = static_cast<std::uint32_t>(stride);
-                        accesses_.push_back(std::move(access));
-                    }
-                    return;
-                } else {
-                    msg("Structor:   Deferring symbolic deref for idx=v%d stride=%u\n",
-                        info.index_var, stride);
-                    PendingSymbolicAccess pending;
-                    pending.insn_ea = expr->ea;
-                    pending.base_offset = base_offset;
-                    pending.stride = stride;
-                    pending.size = !expr->type.empty()
-                        ? utils::get_type_size(expr->type, get_ptr_size())
-                        : get_ptr_size();
-                    const cexpr_t* rhs = nullptr;
-                    pending.access_type = determine_access_type(expr, &rhs);
-                    // extract_and_add_rhs_constant does not work on PendingSymbolicAccess directly
-                    const cexpr_t* parent = parent_expr();
-                    pending.semantic_type = infer_semantic_from_usage(expr, parent);
-                    pending.context_expr = utils::expr_to_string(expr, cfunc_);
-                    pending.inferred_type = expr->type;
-                    pending.is_call_argument = is_call_argument_use(expr);
-                    if (arith.base_indirection > 0) {
-                        pending.base_indirection = arith.base_indirection;
-                    }
-                    pending_symbolic_accesses_[info.index_var].push_back(std::move(pending));
-                }
-            }
+        int index_var = -1;
+        if (!find_symbolic_index(ptr_expr, target_var_idx_, index_var) || index_var < 0) {
+            return;
         }
+        const auto range = bounded_index_range(expr, index_var);
+        if (!range.has_value()) return;
+        qvector<sval_t> offsets;
+        const auto count = static_cast<std::uint32_t>(range->last - range->first) + 1;
+        for (std::uint32_t item = 0; item < count; ++item) {
+            const sval_t idx = range->first + item;
+            const auto value = evaluate_symbolic_pointer(ptr_expr, target_var_idx_, index_var, idx);
+            if (!value.has_value() || !value->has_base) return;
+            offsets.push_back(value->offset);
+        }
+        const auto stride = regular_offset_stride(offsets);
+        for (sval_t offset : offsets) {
+            FieldAccess access;
+            access.insn_ea = expr->ea;
+            access.offset = offset;
+            access.size = !expr->type.empty()
+                ? utils::get_type_size(expr->type, get_ptr_size()) : get_ptr_size();
+            const cexpr_t* rhs = nullptr;
+            access.access_type = determine_access_type(expr, &rhs);
+            if (access.access_type == AccessType::Write) {
+                extract_and_add_rhs_constant(access, rhs);
+                access.is_zero_init = is_zero_initialization(expr);
+            }
+            access.semantic_type = infer_semantic_from_usage(expr, parent_expr());
+            access.context_expr = utils::expr_to_string(expr, cfunc_);
+            access.inferred_type = expr->type;
+            access.source_func_ea = cfunc_->entry_ea;
+            access.array_stride_hint = stride;
+            access.is_call_argument = is_call_argument_use(expr);
+            accesses_.push_back(std::move(access));
+        }
+        return;
     }
 
     if (!arith.valid || arith.var_idx != target_var_idx_) {
@@ -856,60 +1261,61 @@ void AccessPatternVisitor::process_array_access(cexpr_t* expr) {
         }
     }
 
-    if (expr->y->op == cot_var && stride_hint.has_value()) {
-        auto it = local_index_bounds_.find(expr->y->v.idx);
-        if (it != local_index_bounds_.end()) {
-            if (is_pointee_access(arith) && !function_slot_like) {
-                return;
-            }
-            const std::uint32_t bound = it->second;
-            for (std::uint32_t idx = 0; idx < bound; ++idx) {
-                sval_t index_delta = 0;
-                sval_t bounded_offset = 0;
-                if (!checked_mul_sval(
-                        static_cast<sval_t>(idx),
-                        static_cast<sval_t>(*stride_hint), index_delta) ||
-                    !checked_add_sval(offset, index_delta, bounded_offset)) {
-                    continue;
-                }
-                FieldAccess bounded;
-                bounded.insn_ea = expr->ea;
-                bounded.offset = bounded_offset;
-                bounded.size = !expr->type.empty()
-                    ? utils::get_type_size(expr->type, get_ptr_size())
-                    : get_ptr_size();
-                const cexpr_t* rhs = nullptr;
-                bounded.access_type = determine_access_type(expr, &rhs);
-                if (bounded.access_type == AccessType::Write) {
-                    extract_and_add_rhs_constant(bounded, rhs);
-                }
-                const cexpr_t* parent = parent_expr();
-                bounded.semantic_type = infer_semantic_from_usage(expr, parent);
-                bounded.is_call_argument = is_call_argument_use(expr);
-                if (function_slot_like && arith.base_indirection > 0 &&
-                    stride_hint.has_value() && *stride_hint == get_ptr_size()) {
-                    bounded.offset = base_offset;
-                    bounded.semantic_type = SemanticType::VTablePointer;
-                    bounded.is_vtable_access = true;
-                    bounded.vtable_slot = idx;
-                    (void)bounded.set_vtable_nested_access(
-                        base_offset,
-                        static_cast<sval_t>(idx) * static_cast<sval_t>(*stride_hint),
-                        expr->type);
-                }
-                if (arith.base_indirection > 0) {
-                    if (!bounded.is_vtable_access) {
-                        bounded.base_indirection = arith.base_indirection;
-                    }
-                }
-                bounded.context_expr = utils::expr_to_string(expr, cfunc_);
-                bounded.inferred_type = expr->type;
-                bounded.source_func_ea = cfunc_->entry_ea;
-                bounded.array_stride_hint = stride_hint;
-                accesses_.push_back(std::move(bounded));
-            }
-            return;
+    if (expr->y->op != cot_num && stride_hint.has_value()) {
+        int index_var = -1;
+        if (!find_symbolic_index(expr->y, target_var_idx_, index_var) || index_var < 0) return;
+        const auto range = bounded_index_range(expr, index_var);
+        if (!range.has_value() || (is_pointee_access(arith) && !function_slot_like)) return;
+        qvector<sval_t> offsets;
+        const auto count = static_cast<std::uint32_t>(range->last - range->first) + 1;
+        for (std::uint32_t item = 0; item < count; ++item) {
+            const sval_t idx = range->first + item;
+            const auto index = evaluate_index_expression(expr->y, index_var, idx);
+            sval_t delta = 0;
+            sval_t bounded_offset = 0;
+            if (!index.has_value() ||
+                !checked_mul_sval(*index, static_cast<sval_t>(*stride_hint), delta) ||
+                !checked_add_sval(offset, delta, bounded_offset)) return;
+            offsets.push_back(bounded_offset);
         }
+        const auto observed_stride = regular_offset_stride(offsets);
+        for (sval_t bounded_offset : offsets) {
+            FieldAccess bounded;
+            bounded.insn_ea = expr->ea;
+            bounded.offset = bounded_offset;
+            bounded.size = !expr->type.empty()
+                ? utils::get_type_size(expr->type, get_ptr_size()) : get_ptr_size();
+            const cexpr_t* rhs = nullptr;
+            bounded.access_type = determine_access_type(expr, &rhs);
+            if (bounded.access_type == AccessType::Write) {
+                extract_and_add_rhs_constant(bounded, rhs);
+                bounded.is_zero_init = is_zero_initialization(expr);
+            }
+            bounded.semantic_type = infer_semantic_from_usage(expr, parent_expr());
+            bounded.is_call_argument = is_call_argument_use(expr);
+            if (function_slot_like && arith.base_indirection > 0 && *stride_hint == get_ptr_size()) {
+                const auto slot_offset = checked_sval_sub(bounded_offset, base_offset);
+                if (!slot_offset.has_value() || !is_valid_vtable_slot_offset(*slot_offset)) continue;
+                bounded.offset = base_offset;
+                bounded.semantic_type = SemanticType::VTablePointer;
+                bounded.is_vtable_access = true;
+                bounded.vtable_slot = *slot_offset / get_ptr_size();
+                (void)bounded.set_vtable_nested_access(base_offset, *slot_offset, expr->type);
+            }
+            if (arith.base_indirection > 0 && !bounded.is_vtable_access) {
+                bounded.base_indirection = arith.base_indirection;
+            }
+            bounded.context_expr = utils::expr_to_string(expr, cfunc_);
+            bounded.inferred_type = expr->type;
+            bounded.source_func_ea = cfunc_->entry_ea;
+            bounded.array_stride_hint = observed_stride;
+            accesses_.push_back(std::move(bounded));
+        }
+        return;
+    }
+
+    if (expr->y->op != cot_num) {
+        return;
     }
 
     FieldAccess access;
@@ -995,7 +1401,8 @@ void AccessPatternVisitor::process_call_argument_uses(cexpr_t* call_expr) {
             resolved = true;
         } else if (arg_expr->op == cot_var) {
             auto it = local_aliases_.find(arg_expr->v.idx);
-            if (it != local_aliases_.end()) {
+            if (it != local_aliases_.end() &&
+                !address_aliases_.contains(arg_expr->v.idx)) {
                 access = it->second;
                 access.insn_ea = call_expr->ea;
                 access.source_func_ea = cfunc_->entry_ea;
@@ -1117,6 +1524,10 @@ void AccessPatternVisitor::process_call_through_ptr(cexpr_t* call_expr) {
 
     // Indexed function pointer call: fp_array[idx](args)
     if (callee->op == cot_idx) {
+        if (!callee->y || callee->y->op != cot_num) {
+            // The normal array visitor handles proven finite index ranges.
+            return;
+        }
         auto arith = utils::extract_ptr_arith(callee->x);
         if (arith.valid && arith.var_idx == target_var_idx_) {
             sval_t offset = arith.offset;

@@ -345,6 +345,9 @@ set(STRUCTOR_CORE_HEADERS
     include/structor/host_integration.hpp
     include/structor/host_lifecycle.hpp
     include/structor/access_collector.hpp
+    include/structor/access_type_inference.hpp
+    include/structor/function_variable_key.hpp
+    include/structor/field_fragment_type.hpp
     include/structor/layout_synthesizer.hpp
     include/structor/vtable_detector.hpp
     include/structor/global_object_analyzer.hpp
@@ -383,6 +386,8 @@ set(STRUCTOR_PLUGIN_SOURCES
 
 set(STRUCTOR_PLUGIN_HEADERS
     include/structor/ui_integration.hpp
+    src/ui/type_matcher_live_checks.hpp
+    src/ui/type_application_live_checks.hpp
 )
 
 # Embeddable Structor core library

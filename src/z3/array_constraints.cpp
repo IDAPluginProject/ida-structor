@@ -1,11 +1,32 @@
 #include "structor/z3/array_constraints.hpp"
 #include <algorithm>
 #include <numeric>
+#include <string>
 #include <unordered_set>
 
 namespace structor::z3 {
 
 namespace {
+
+bool array_candidate_less(const ArrayCandidate& a, const ArrayCandidate& b,
+                          TypeEncoder& encoder) {
+    if (a.base_offset != b.base_offset) return a.base_offset < b.base_offset;
+    if (a.stride != b.stride) return a.stride < b.stride;
+    if (a.element_count != b.element_count) return a.element_count < b.element_count;
+    if (a.needs_element_struct != b.needs_element_struct) {
+        return a.needs_element_struct < b.needs_element_struct;
+    }
+    const auto a_category = encoder.categorize(a.element_type);
+    const auto b_category = encoder.categorize(b.element_type);
+    if (a_category != b_category) return a_category < b_category;
+    const auto a_pointee = encoder.categorize(a.element_type.get_pointed_object());
+    const auto b_pointee = encoder.categorize(b.element_type.get_pointed_object());
+    if (a_pointee != b_pointee) return a_pointee < b_pointee;
+    qstring a_decl, b_decl;
+    a.element_type.print(&a_decl);
+    b.element_type.print(&b_decl);
+    return std::string(a_decl.c_str()) < std::string(b_decl.c_str());
+}
 
 std::optional<uint32_t> checked_element_count(
     sval_t base,
@@ -68,48 +89,6 @@ bool has_excessive_gap(const qvector<sval_t>& offsets, uint32_t stride, int max_
     return false;
 }
 
-bool categories_compatible_for_array(TypeCategory a, TypeCategory b) {
-    if (a == b) {
-        return true;
-    }
-
-    const bool a_ptr_like = a == TypeCategory::Pointer || a == TypeCategory::FuncPtr;
-    const bool b_ptr_like = b == TypeCategory::Pointer || b == TypeCategory::FuncPtr;
-    if (a_ptr_like && b_ptr_like) {
-        return true;
-    }
-
-    if (TypeEncoder::is_integer(a) && TypeEncoder::is_integer(b)) {
-        return true;
-    }
-
-    return false;
-}
-
-bool semantics_compatible_for_array(SemanticType a, SemanticType b) {
-    if (a == b || a == SemanticType::Unknown || b == SemanticType::Unknown) {
-        return true;
-    }
-
-    const bool a_int = a == SemanticType::Integer || a == SemanticType::UnsignedInteger;
-    const bool b_int = b == SemanticType::Integer || b == SemanticType::UnsignedInteger;
-    if (a_int && b_int) {
-        return true;
-    }
-
-    const bool a_ptr_like = a == SemanticType::Pointer ||
-                            a == SemanticType::FunctionPointer ||
-                            a == SemanticType::VTablePointer;
-    const bool b_ptr_like = b == SemanticType::Pointer ||
-                            b == SemanticType::FunctionPointer ||
-                            b == SemanticType::VTablePointer;
-    if (a_ptr_like && b_ptr_like) {
-        return true;
-    }
-
-    return false;
-}
-
 bool is_weak_single_field_struct_array(const ArrayCandidate& candidate,
                                        const qvector<const FieldAccess*>& accesses) {
     if (!candidate.needs_element_struct || candidate.element_count >= 4 || accesses.empty()) {
@@ -139,6 +118,8 @@ ArrayConstraintBuilder::ArrayConstraintBuilder(
     const ArrayDetectionConfig& config)
     : ctx_(ctx)
     , config_(config) {
+    config_.min_elements = std::max(config_.min_elements, uint32_t{2});
+    config_.max_gap_ratio = std::max(config_.max_gap_ratio, 1);
     config_.max_elements = std::min(
         config_.max_elements, ctx_.config().max_array_elements);
 }
@@ -156,19 +137,12 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
     // Group accesses by size
     auto size_groups = group_by_size(accesses);
 
-    struct ExactStrideRun {
-        uint32_t stride = 0;
-        size_t begin = 0;
-        size_t end = 0;
-    };
-
     struct SizeGroupPlan {
         uint32_t size = 0;
         qvector<const FieldAccess*> group;
         qvector<sval_t> offsets;
         std::optional<std::pair<sval_t, uint32_t>> hinted_result;
         std::optional<std::pair<sval_t, uint32_t>> ap_result;
-        qvector<ExactStrideRun> exact_runs;
         bool eligible = false;
     };
 
@@ -209,46 +183,8 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
             }
             plan.ap_result = find_arithmetic_progression(plan.offsets);
 
-            const uint32_t stride = plan.size;
-            if (stride == 0 || stride > config_.max_stride || plan.offsets.size() < 2) {
-                continue;
-            }
-
-            size_t run_start = 0;
-            while (run_start + 1 < plan.offsets.size()) {
-                size_t run_end = run_start + 1;
-                while (run_end < plan.offsets.size()) {
-                    const auto gap = checked_interval_span(
-                        plan.offsets[run_end - 1], plan.offsets[run_end]);
-                    if (!gap || *gap != stride) {
-                        break;
-                    }
-                    ++run_end;
-                }
-
-                const size_t run_len = run_end - run_start;
-                if (run_len >= config_.min_elements) {
-                    plan.exact_runs.push_back(ExactStrideRun{stride, run_start, run_end});
-                }
-                run_start = run_end;
-            }
         }
     });
-
-    auto make_run_group = [](const SizeGroupPlan& plan, const ExactStrideRun& run) {
-        qvector<const FieldAccess*> run_group;
-        std::unordered_set<sval_t> run_offsets;
-        for (size_t i = run.begin; i < run.end; ++i) {
-            run_offsets.insert(plan.offsets[i]);
-        }
-
-        for (const auto* access : plan.group) {
-            if (run_offsets.count(access->offset) > 0) {
-                run_group.push_back(access);
-            }
-        }
-        return run_group;
-    };
 
     // Materialize candidates serially: this updates stats and may create IDA types.
     for (const auto& plan : plans) {
@@ -256,84 +192,45 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
             continue;
         }
 
-        // Honor stride hints from index expressions when available
-        if (plan.hinted_result.has_value()) {
-            auto [base, stride] = *plan.hinted_result;
-
-                // Verify type consistency if required
-                if (config_.require_consistent_types && !verify_type_consistency(plan.group)) {
-                    continue;
-                }
-
-                const auto count = checked_element_count(
-                    base, plan.offsets.back(), stride, config_.max_elements);
-                if (!count) {
-                    continue;
-                }
-                ArrayCandidate candidate = create_candidate(base, stride, *count, plan.group);
-
-                if (is_weak_single_field_struct_array(candidate, plan.group)) {
-                    continue;
-                }
-
-                candidates.push_back(std::move(candidate));
-                stats_.arrays_found++;
-                stats_.elements_covered += static_cast<int>(plan.offsets.size());
-                continue;
-        }
-
-        auto append_exact_stride_runs = [&]() {
-            for (const auto& run : plan.exact_runs) {
-                qvector<const FieldAccess*> run_group = make_run_group(plan, run);
-                if (!config_.require_consistent_types || verify_type_consistency(run_group)) {
-                    ArrayCandidate candidate = create_candidate(
-                        plan.offsets[run.begin],
-                        run.stride,
-                        static_cast<uint32_t>(run.end - run.begin),
-                        run_group);
-                    if (is_weak_single_field_struct_array(candidate, run_group)) {
-                        continue;
-                    }
-                    candidates.push_back(std::move(candidate));
-                    stats_.arrays_found++;
-                    stats_.elements_covered += static_cast<int>(run.end - run.begin);
-                }
+        const auto append_progression = [&](
+            const std::optional<std::pair<sval_t, uint32_t>>& progression) {
+            if (!progression) return false;
+            const auto [base, stride] = *progression;
+            const auto count = checked_element_count(
+                base, plan.offsets.back(), stride, config_.max_elements);
+            if (!count) return false;
+            auto candidate = create_candidate(base, stride, *count, plan.group);
+            if (!candidate || is_weak_single_field_struct_array(*candidate, plan.group)) {
+                return false;
             }
-        };
-
-        // Try simple arithmetic progression detection first
-        if (plan.ap_result.has_value()) {
-            auto [base, stride] = *plan.ap_result;
-
-            // Verify type consistency if required
-            if (config_.require_consistent_types && !verify_type_consistency(plan.group)) {
-                continue;
-            }
-
-            // Create candidate
-            ArrayCandidate candidate = create_candidate(
-                base, stride, static_cast<uint32_t>(plan.offsets.size()), plan.group);
-
-            if (is_weak_single_field_struct_array(candidate, plan.group)) {
-                continue;
-            }
-
-            candidates.push_back(std::move(candidate));
+            candidates.push_back(std::move(*candidate));
             stats_.arrays_found++;
             stats_.elements_covered += static_cast<int>(plan.offsets.size());
+            return true;
+        };
+
+        // Whole-group hypotheses retain precedence when valid. A failed type
+        // or extent hypothesis must not discard independent observed runs.
+        if (append_progression(plan.hinted_result) ||
+            append_progression(plan.ap_result)) {
+            continue;
         }
-        // Try symbolic detection if simple AP failed
-        else if (config_.use_symbolic_indices) {
+
+        if (config_.use_symbolic_indices) {
             auto symbolic_result = detect_symbolic_array(plan.group);
             if (symbolic_result.has_value()) {
                 candidates.push_back(std::move(*symbolic_result));
                 stats_.arrays_found++;
                 stats_.symbolic_detections++;
-            } else {
-                append_exact_stride_runs();
+                continue;
             }
-        } else {
-            append_exact_stride_runs();
+        }
+
+        auto runs = detect_contiguous_typed_runs(plan.group, plan.size);
+        for (auto& candidate : runs) {
+            stats_.arrays_found++;
+            stats_.elements_covered += static_cast<int>(candidate.member_offsets.size());
+            candidates.push_back(std::move(candidate));
         }
     }
 
@@ -342,8 +239,8 @@ qvector<ArrayCandidate> ArrayConstraintBuilder::detect_arrays(
 
     // Sort by base offset
     std::sort(candidates.begin(), candidates.end(),
-        [](const ArrayCandidate& a, const ArrayCandidate& b) {
-            return a.base_offset < b.base_offset;
+        [&](const ArrayCandidate& a, const ArrayCandidate& b) {
+            return array_candidate_less(a, b, ctx_.type_encoder());
         });
 
     return candidates;
@@ -494,36 +391,100 @@ bool ArrayConstraintBuilder::verify_type_consistency(
 {
     if (accesses.empty()) return true;
 
-    uint32_t first_size = accesses[0]->size;
-    SemanticType seen_semantic = SemanticType::Unknown;
-    TypeCategory seen_category = TypeCategory::Unknown;
+    const uint32_t first_size = accesses[0]->size;
+    tinfo_t seen_type;
 
     for (const auto* access : accesses) {
         if (access->size != first_size) {
             return false;
         }
 
-        if (!semantics_compatible_for_array(seen_semantic, access->semantic_type)) {
-            return false;
-        }
-        if (seen_semantic == SemanticType::Unknown && access->semantic_type != SemanticType::Unknown) {
-            seen_semantic = access->semantic_type;
-        }
-
-        if (!accesses[0]->inferred_type.empty() && !access->inferred_type.empty()) {
-            TypeCategory this_cat = ctx_.type_encoder().categorize(access->inferred_type);
-            if (seen_category != TypeCategory::Unknown &&
-                this_cat != TypeCategory::Unknown &&
-                !categories_compatible_for_array(seen_category, this_cat)) {
-                return false;
-            }
-            if (seen_category == TypeCategory::Unknown && this_cat != TypeCategory::Unknown) {
-                seen_category = this_cat;
-            }
-        }
+        const tinfo_t type = normalized_element_type(*access);
+        if (type.empty()) continue;
+        if (type.get_size() != first_size) return false;
+        if (!seen_type.empty() && !seen_type.equals_to(type)) return false;
+        seen_type = type;
     }
 
     return true;
+}
+
+tinfo_t ArrayConstraintBuilder::normalized_element_type(const FieldAccess& access) {
+    if (access.inferred_type.empty()) {
+        if (access.semantic_type == SemanticType::Unknown) return tinfo_t();
+        return ctx_.type_encoder().decode(
+            semantic_to_category(static_cast<int>(access.semantic_type)), access.size);
+    }
+    if (access.inferred_type.get_size() == access.size) return access.inferred_type;
+
+    // Ctree expression promotion does not change a memory access's width.
+    const auto extended = ctx_.type_encoder().extract_extended_info(access.inferred_type);
+    auto category = ctx_.type_encoder().categorize(access.inferred_type);
+    if (TypeEncoder::is_integer(category) &&
+        (access.semantic_type == SemanticType::Integer ||
+         access.semantic_type == SemanticType::UnsignedInteger)) {
+        // Integer promotion can turn an unsigned narrow load into signed int.
+        // Recover its storage signedness from the access semantics; a concrete
+        // exact-width type above remains authoritative when views conflict.
+        category = semantic_to_category(static_cast<int>(access.semantic_type));
+    }
+    return ctx_.type_encoder().decode(
+        category, access.size, &extended);
+}
+
+qvector<ArrayCandidate> ArrayConstraintBuilder::detect_contiguous_typed_runs(
+    const qvector<const FieldAccess*>& accesses,
+    uint32_t stride)
+{
+    qvector<ArrayCandidate> result;
+    if (stride == 0 || stride > config_.max_stride) return result;
+
+    struct TypeRunGroup {
+        tinfo_t type;
+        qvector<const FieldAccess*> accesses;
+    };
+    std::vector<TypeRunGroup> groups;
+    for (const auto* access : accesses) {
+        const tinfo_t type = normalized_element_type(*access);
+        auto group = std::find_if(groups.begin(), groups.end(), [&](const auto& item) {
+            return !config_.require_consistent_types ||
+                (type.empty() ? item.type.empty()
+                              : !item.type.empty() && type.equals_to(item.type));
+        });
+        if (group == groups.end()) {
+            groups.push_back(TypeRunGroup{type, {}});
+            group = std::prev(groups.end());
+        }
+        group->accesses.push_back(access);
+    }
+
+    for (auto& group : groups) {
+        if (group.accesses.size() < config_.min_elements) continue;
+        std::sort(group.accesses.begin(), group.accesses.end(), [](const auto* a, const auto* b) {
+            return a->offset < b->offset;
+        });
+        size_t begin = 0;
+        while (begin < group.accesses.size()) {
+            size_t end = begin + 1;
+            uint32_t count = 1;
+            while (end < group.accesses.size()) {
+                const auto gap = checked_interval_span(
+                    group.accesses[end - 1]->offset, group.accesses[end]->offset);
+                if (!gap || (*gap != 0 && *gap != stride)) break;
+                count += *gap != 0;
+                ++end;
+            }
+            if (count >= config_.min_elements && count <= config_.max_elements) {
+                qvector<const FieldAccess*> run;
+                run.reserve(end - begin);
+                for (size_t i = begin; i < end; ++i) run.push_back(group.accesses[i]);
+                auto candidate = create_candidate(run.front()->offset, stride, count, run);
+                if (candidate) result.push_back(std::move(*candidate));
+            }
+            begin = end;
+        }
+    }
+    return result;
 }
 
 void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& candidates) {
@@ -531,8 +492,8 @@ void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& c
 
     // Sort by base offset
     std::sort(candidates.begin(), candidates.end(),
-        [](const ArrayCandidate& a, const ArrayCandidate& b) {
-            return a.base_offset < b.base_offset;
+        [&](const ArrayCandidate& a, const ArrayCandidate& b) {
+            return array_candidate_less(a, b, ctx_.type_encoder());
         });
 
     qvector<ArrayCandidate> merged;
@@ -547,13 +508,21 @@ void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& c
         const auto last_end = last.checked_end_offset();
         const auto curr_end = curr.checked_end_offset();
 
-        if (last_end && curr_end && curr.base_offset < *last_end &&
-            curr.stride == last.stride && last.stride != 0) {
+        const auto origin_delta = checked_interval_span(last.base_offset, curr.base_offset);
+        if (last_end && curr_end && origin_delta && curr.base_offset < *last_end &&
+            curr.stride == last.stride && last.stride != 0 &&
+            *origin_delta % last.stride == 0 &&
+            curr.needs_element_struct == last.needs_element_struct &&
+            curr.inner_access_offset == last.inner_access_offset &&
+            curr.inner_access_size == last.inner_access_size &&
+            curr.element_type.equals_to(last.element_type)) {
             // Merge: extend the last array
             const sval_t new_end = std::max(*last_end, *curr_end);
             const auto merged_span = checked_interval_span(
                 last.base_offset, new_end);
-            if (!merged_span || *merged_span % last.stride != 0 ||
+            if (!merged_span ||
+                *merged_span > std::numeric_limits<uint32_t>::max() ||
+                *merged_span % last.stride != 0 ||
                 *merged_span / last.stride > config_.max_elements) {
                 merged.push_back(curr);
                 continue;
@@ -574,6 +543,12 @@ void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& c
                     last.member_offsets.push_back(off);
                 }
             }
+            std::sort(last.member_offsets.begin(), last.member_offsets.end());
+            for (const auto& evidence : curr.member_evidence) {
+                last.member_evidence.push_back(evidence);
+            }
+            std::stable_sort(last.member_evidence.begin(), last.member_evidence.end(),
+                [](const auto& a, const auto& b) { return a.offset < b.offset; });
         } else {
             // No overlap, keep separate
             merged.push_back(curr);
@@ -583,33 +558,80 @@ void ArrayConstraintBuilder::merge_overlapping_arrays(qvector<ArrayCandidate>& c
     candidates = std::move(merged);
 }
 
-ArrayCandidate ArrayConstraintBuilder::create_candidate(
+std::optional<ArrayCandidate> ArrayConstraintBuilder::create_candidate(
     sval_t base,
     uint32_t stride,
     uint32_t count,
     const qvector<const FieldAccess*>& accesses)
 {
+    if (accesses.empty() || stride == 0 || stride > config_.max_stride ||
+        count < config_.min_elements || count > config_.max_elements) {
+        return std::nullopt;
+    }
+
     ArrayCandidate candidate;
     candidate.base_offset = base;
     candidate.stride = stride;
     candidate.element_count = count;
 
-    // Collect member offsets
-    for (const auto* access : accesses) {
-        candidate.member_offsets.push_back(access->offset);
+    const auto candidate_end = candidate.checked_end_offset();
+    if (!candidate_end) {
+        return std::nullopt;
     }
 
-    // Get element type from first access
+    // Each observed access must fit completely within one element and within
+    // the emitted array. Deduplicate observation addresses before applying the
+    // evidence threshold: repeated reads do not imply additional elements.
+    std::unordered_set<sval_t> observed_offsets;
+    for (const auto* access : accesses) {
+        if (!access || access->size == 0 || access->size > stride) {
+            return std::nullopt;
+        }
+        const auto relative = checked_interval_span(base, access->offset);
+        const auto access_end = checked_interval_end(access->offset, access->size);
+        if (!relative || *relative % stride != 0 ||
+            !access_end || *access_end > *candidate_end) {
+            return std::nullopt;
+        }
+        observed_offsets.insert(access->offset);
+    }
+    if (observed_offsets.size() < config_.min_elements ||
+        (config_.require_consistent_types && !verify_type_consistency(accesses))) {
+        return std::nullopt;
+    }
+
+    for (const auto offset : observed_offsets) candidate.member_offsets.push_back(offset);
+    std::sort(candidate.member_offsets.begin(), candidate.member_offsets.end());
+    for (const auto* access : accesses) {
+        candidate.member_evidence.push_back(ArrayAccessEvidence{
+            access->offset, access->size, access->inferred_type, access->semantic_type});
+    }
+    std::stable_sort(candidate.member_evidence.begin(), candidate.member_evidence.end(),
+        [](const auto& a, const auto& b) { return a.offset < b.offset; });
+
+    // Prefer actual type evidence when the first observation was untyped.
     if (!accesses.empty()) {
         const FieldAccess* first = accesses[0];
-        candidate.element_type = first->inferred_type;
+        for (const auto* access : accesses) {
+            const tinfo_t type = normalized_element_type(*access);
+            if (!type.empty()) {
+                first = access;
+                candidate.element_type = type;
+                break;
+            }
+        }
+        if (candidate.element_type.empty()) {
+            candidate.element_type = ctx_.type_encoder().decode(
+                TypeCategory::Unknown,
+                first->size);
+        }
 
         // Check if stride > access_size (struct element pattern)
         if (stride > first->size) {
             candidate.needs_element_struct = true;
             const auto relative = checked_interval_span(base, first->offset);
             if (!relative) {
-                return candidate;
+                return std::nullopt;
             }
             candidate.inner_access_offset = static_cast<uint32_t>(
                 *relative % stride);
@@ -621,10 +643,14 @@ ArrayCandidate ArrayConstraintBuilder::create_candidate(
                 candidate.element_type = create_element_struct_type(
                     stride,
                     candidate.inner_access_offset,
-                    first->inferred_type
+                    candidate.element_type
                 );
             }
         }
+    }
+
+    if (!candidate.is_valid_c_array()) {
+        return std::nullopt;
     }
 
     // Determine confidence
@@ -661,9 +687,14 @@ std::optional<ArrayCandidate> ArrayConstraintBuilder::solve_stride_z3(
     // Extract offsets
     qvector<sval_t> offsets;
     for (const auto* access : accesses) {
+        if (!access) return std::nullopt;
         offsets.push_back(access->offset);
     }
     std::sort(offsets.begin(), offsets.end());
+    offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+    if (offsets.size() < config_.min_elements) {
+        return std::nullopt;
+    }
 
     auto stride_hint = extract_stride_hint(accesses);
     if (stride_hint.has_value()) {
@@ -673,8 +704,8 @@ std::optional<ArrayCandidate> ArrayConstraintBuilder::solve_stride_z3(
             const auto count = checked_element_count(
                 base, offsets.back(), stride, config_.max_elements);
             if (count && *count >= static_cast<uint32_t>(config_.min_elements)) {
-                ArrayCandidate candidate = create_candidate(base, stride, *count, accesses);
-                if (!is_weak_single_field_struct_array(candidate, accesses)) {
+                auto candidate = create_candidate(base, stride, *count, accesses);
+                if (candidate && !is_weak_single_field_struct_array(*candidate, accesses)) {
                     return candidate;
                 }
             }
@@ -716,8 +747,8 @@ std::optional<ArrayCandidate> ArrayConstraintBuilder::solve_stride_z3(
         return std::nullopt;
     }
 
-    ArrayCandidate candidate = create_candidate(base, stride, *count, accesses);
-    if (is_weak_single_field_struct_array(candidate, accesses)) {
+    auto candidate = create_candidate(base, stride, *count, accesses);
+    if (!candidate || is_weak_single_field_struct_array(*candidate, accesses)) {
         return std::nullopt;
     }
 

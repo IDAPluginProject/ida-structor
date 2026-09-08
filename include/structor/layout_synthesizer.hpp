@@ -56,7 +56,8 @@ struct SynthesisResult {
     bool fell_back_to_heuristic = false;
     qstring fallback_reason;
 
-    // Constraint satisfaction info
+    // Context-independent diagnostics. Returned records never retain a
+    // tracking_literal from the temporary synthesis solver.
     bool had_relaxation = false;
     qvector<z3::ConstraintProvenance> dropped_constraints;
     qvector<z3::ConstraintProvenance> unsat_core;  // If truly unsatisfiable

@@ -211,7 +211,11 @@ jobs:
           for marker in \
             STRUCTOR_INTEGRATION_TESTING \
             STRUCTOR_TEST_PERSISTENCE_FAULT \
-            fault_global_tinfo_rollback; do
+            fault_global_tinfo_rollback \
+            inspect_base_inference \
+            inspect_existing_type_matcher \
+            inspect_array_layout \
+            inspect_type_application_identity; do
             if strings "$PLUGIN_FILE" | grep -F -- "$marker"; then
               echo "ERROR: production plugin contains live-test marker: $marker"
               exit 1
@@ -290,7 +294,11 @@ jobs:
           foreach ($marker in @(
               "STRUCTOR_INTEGRATION_TESTING",
               "STRUCTOR_TEST_PERSISTENCE_FAULT",
-              "fault_global_tinfo_rollback")) {
+              "fault_global_tinfo_rollback",
+              "inspect_base_inference",
+              "inspect_existing_type_matcher",
+              "inspect_array_layout",
+              "inspect_type_application_identity")) {
             if ($ascii.Contains($marker)) {
               Write-Error "Production plugin contains live-test marker: $marker"
               exit 1

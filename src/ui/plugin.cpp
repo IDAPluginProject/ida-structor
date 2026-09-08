@@ -7,6 +7,10 @@
 #include <structor/ui_integration.hpp>
 #include <structor/api.hpp>
 #include <structor/type_fixer.hpp>
+#if defined(STRUCTOR_LIVE_TEST_HOOKS)
+#include "type_matcher_live_checks.hpp"
+#include "type_application_live_checks.hpp"
+#endif
 #include <expr.hpp>
 #include <auto.hpp>
 #include <name.hpp>
@@ -1303,6 +1307,344 @@ static bool run_pending_api_command_impl(const qstring& command_text) {
     }
 
 #if defined(STRUCTOR_LIVE_TEST_HOOKS)
+    if (command == "inspect_array_layout") {
+        if (parts.size() != 2 ||
+            (parts[1] != "independent" && parts[1] != "overlay" &&
+             parts[1] != "overlay_reverse" && parts[1] != "sparse" &&
+             parts[1] != "interior_conflict" &&
+             parts[1] != "unsat" && parts[1] != "unsat_relaxation")) {
+            export_api_error(command.c_str(), "Expected independent, overlay, overlay_reverse, sparse, interior_conflict, unsat, or unsat_relaxation");
+            return false;
+        }
+        UnifiedAccessPattern pattern;
+        const auto add_access = [&](sval_t offset, bool floating) {
+            FieldAccess access;
+            access.offset = offset;
+            access.size = 4;
+            access.access_type = AccessType::Read;
+            access.semantic_type = floating ? SemanticType::Float : SemanticType::Integer;
+            access.inferred_type.create_simple_type(floating ? BTF_FLOAT : BTF_INT32);
+            pattern.all_accesses.push_back(access);
+            pattern.global_max_offset = std::max(pattern.global_max_offset, offset + 4);
+        };
+        const bool expect_unsat = parts[1] == "unsat" || parts[1] == "unsat_relaxation";
+        if (expect_unsat) {
+            add_access(0, false);
+            add_access(0, true);
+        } else if (parts[1] == "sparse") {
+            for (const sval_t offset : {0, 4, 12}) add_access(offset, false);
+        } else if (parts[1] == "interior_conflict") {
+            for (const sval_t offset : {0, 4, 8}) add_access(offset, false);
+            add_access(8, true);
+        } else {
+            for (const sval_t offset : {0, 4, 8}) add_access(offset, false);
+            const sval_t base = parts[1] == "independent" ? 12 : 0;
+            for (const sval_t offset : {0, 4, 8}) add_access(base + offset, true);
+        }
+        if (parts[1] == "overlay_reverse") {
+            std::reverse(pattern.all_accesses.begin(), pattern.all_accesses.end());
+        }
+        opts.z3.mode = Z3SynthesisMode::Required;
+        opts.z3.detect_arrays = true;
+        opts.z3.allow_unions = true;
+        opts.z3.cross_function = false;
+        opts.vtable_detection = false;
+        if (expect_unsat) {
+            opts.z3.detect_arrays = false;
+            opts.z3.allow_unions = false;
+            opts.z3.relax_on_unsat = parts[1] == "unsat_relaxation";
+        }
+        const auto synthesis = api.synthesize_layout(pattern, &opts);
+        const auto detached = [](const auto& diagnostics) {
+            return std::all_of(diagnostics.begin(), diagnostics.end(), [](const auto& diagnostic) {
+                return !diagnostic.tracking_literal.has_value();
+            });
+        };
+        const bool diagnostics_detached =
+            detached(synthesis.unsat_core) && detached(synthesis.dropped_constraints);
+        if (parts[1] == "interior_conflict") {
+            bool first_integer = false, second_integer = false;
+            bool union_integer = false, union_float = false;
+            std::size_t storage_fields = 0;
+            for (const auto& field : synthesis.structure.fields) {
+                if (field.is_padding) continue;
+                ++storage_fields;
+                if (field.size != 4) continue;
+                if (field.offset == 0 && field.type.is_integral()) first_integer = true;
+                if (field.offset == 4 && field.type.is_integral()) second_integer = true;
+                if (field.offset == 8 && field.is_union_candidate) {
+                    for (const auto& member : field.union_members) {
+                        if (member.offset != 0 || member.size != 4) continue;
+                        union_integer |= member.type.is_integral();
+                        union_float |= member.type.is_floating();
+                    }
+                }
+            }
+            const bool shape_valid = storage_fields == 3 && first_integer &&
+                second_integer && union_integer && union_float;
+            const bool success = diagnostics_detached && synthesis.success() &&
+                synthesis.used_z3 && !synthesis.fell_back_to_heuristic && shape_valid;
+            std::string payload = "\"success\":";
+            append_json_bool(payload, success);
+            payload += ",\"layout_shape_valid\":";
+            append_json_bool(payload, shape_valid);
+            payload += ",\"diagnostics_detached\":";
+            append_json_bool(payload, diagnostics_detached);
+            payload += ",\"dropped_constraints\":[";
+            bool first = true;
+            for (const auto& diagnostic : synthesis.dropped_constraints) {
+                if (!first) payload += ',';
+                first = false;
+                append_json_string(payload, diagnostic.description.c_str());
+            }
+            payload += "],\"result\":";
+            append_synth_result_json(payload, make_result_from_synthesis(synthesis));
+            export_api_json(command.c_str(), payload);
+            return success;
+        }
+        if (expect_unsat) {
+            // The temporary API-owned synthesizer/context is already gone.
+            // Copies and destruction must be safe for actual UNSAT diagnostics.
+            const auto copy = synthesis;
+            const bool success = diagnostics_detached &&
+                copy.error == SynthError::Z3Unsat && !copy.unsat_core.empty() &&
+                !copy.unsat_core[0].description.empty() && !copy.success();
+            std::string payload = "\"success\":";
+            append_json_bool(payload, success);
+            payload += ",\"diagnostics_detached\":";
+            append_json_bool(payload, diagnostics_detached);
+            payload += ",\"unsat_core_count\":" + std::to_string(copy.unsat_core.size());
+            payload += ",\"result\":";
+            append_synth_result_json(payload, make_result_from_synthesis(copy));
+            export_api_json(command.c_str(), payload);
+            return success;
+        }
+        const auto array_view = [](const tinfo_t& type, uint32_t count, bool floating) {
+            array_type_data_t array;
+            return type.get_array_details(&array) && array.nelems == count &&
+                array.elem_type.get_size() == 4 &&
+                array.elem_type.is_floating() == floating &&
+                (floating || array.elem_type.is_integral());
+        };
+        bool integer_array = false, float_array = false;
+        const uint32_t count = parts[1] == "sparse" ? 4 : 3;
+        for (const auto& field : synthesis.structure.fields) {
+            if (field.is_padding) continue;
+            if (field.offset == 0 && field.size == count * 4 &&
+                field.is_array && field.array_count == count &&
+                array_view(field.type, count, false)) integer_array = true;
+            if (field.offset == 12 && field.size == 12 &&
+                field.is_array && field.array_count == 3 &&
+                array_view(field.type, 3, true)) float_array = true;
+            if (field.offset == 0 && field.size == 12 && field.is_union_candidate) {
+                for (const auto& member : field.union_members) {
+                    if (member.offset != 0 || member.size != 12) continue;
+                    integer_array |= array_view(member.type, 3, false);
+                    float_array |= array_view(member.type, 3, true);
+                }
+            }
+        }
+        const bool shape_valid = integer_array && (parts[1] == "sparse" || float_array);
+        const bool success = diagnostics_detached && synthesis.success() && synthesis.used_z3 &&
+            !synthesis.fell_back_to_heuristic && shape_valid;
+        std::string payload = "\"success\":";
+        append_json_bool(payload, success);
+        payload += ",\"layout_shape_valid\":";
+        append_json_bool(payload, shape_valid);
+        payload += ",\"diagnostics_detached\":";
+        append_json_bool(payload, diagnostics_detached);
+        payload += ",\"result\":";
+        append_synth_result_json(payload, make_result_from_synthesis(synthesis));
+        export_api_json(command.c_str(), payload);
+        return success;
+    }
+
+    if (command == "inspect_type_application_identity") {
+        if (parts.size() != 4) {
+            export_api_error(command.c_str(), "Expected target function, source function, and case");
+            return false;
+        }
+        ea_t target_ea = BADADDR;
+        ea_t source_ea = BADADDR;
+        if (!resolve_function_spec(qstring(parts[1].c_str()), target_ea) ||
+            !resolve_function_spec(qstring(parts[2].c_str()), source_ea) ||
+            target_ea == source_ea) {
+            export_api_error(command.c_str(), "Expected two distinct functions");
+            return false;
+        }
+        cfuncptr_t cfunc = utils::get_cfunc(target_ea);
+        const auto checks = detail::run_live_type_application_check(cfunc, source_ea, parts[3]);
+        const bool success = !checks.empty() &&
+            std::all_of(checks.begin(), checks.end(), [](const auto& check) { return check.second; });
+        std::string payload = "\"success\":";
+        append_json_bool(payload, success);
+        payload += ",\"checks\":{";
+        bool first = true;
+        for (const auto& [name, passed] : checks) {
+            if (!first) payload += ',';
+            first = false;
+            append_json_string(payload, name);
+            payload += ':';
+            append_json_bool(payload, passed);
+        }
+        payload += '}';
+        export_api_json(command.c_str(), payload);
+        return success;
+    }
+
+    if (command == "inspect_existing_type_matcher") {
+        const auto checks = detail::run_live_existing_type_checks();
+        const bool success = !checks.empty() &&
+            std::all_of(checks.begin(), checks.end(), [](const auto& check) {
+                return check.second;
+            });
+        std::string payload = "\"success\":";
+        append_json_bool(payload, success);
+        payload += ",\"checks\":{";
+        bool first = true;
+        for (const auto& [name, passed] : checks) {
+            if (!first) payload += ',';
+            first = false;
+            append_json_string(payload, name);
+            payload += ':';
+            append_json_bool(payload, passed);
+        }
+        payload += '}';
+        export_api_json(command.c_str(), payload);
+        return success;
+    }
+#endif
+
+#if defined(STRUCTOR_LIVE_TEST_HOOKS)
+    if (command == "inspect_base_inference") {
+        if (parts.size() < 3 || parts.size() > 4 ||
+            (parts.size() == 4 && parts[3] != "ctree")) {
+            export_api_error(command.c_str(), "Expected function and parameter index");
+            return false;
+        }
+        ea_t func_ea = BADADDR;
+        if (!resolve_function_spec(qstring(parts[1].c_str()), func_ea)) {
+            export_api_error(command.c_str(), "Function not found");
+            return false;
+        }
+        cfuncptr_t cfunc = utils::get_cfunc(func_ea);
+        char* end = nullptr;
+        const long parameter = std::strtol(parts[2].c_str(), &end, 10);
+        if (!cfunc || parts[2].empty() || !end || *end != '\0' ||
+            parameter < 0 || static_cast<size_t>(parameter) >= cfunc->argidx.size()) {
+            export_api_error(command.c_str(), "Invalid parameter index");
+            return false;
+        }
+        const int var_idx = cfunc->argidx[parameter];
+        TypeFixerConfig fix_config;
+        fix_config.dry_run = true;
+        fix_config.synthesize_structures = false;
+        fix_config.propagate_fixes = false;
+        TypeFixer fixer(fix_config);
+        const TypeComparisonResult comparison = fixer.analyze_variable(cfunc, var_idx);
+        const AccessPattern pattern = api.collect_accesses(func_ea, var_idx);
+        const auto pointer_depth = [](tinfo_t type) {
+            unsigned depth = 0;
+            while (type.is_ptr()) {
+                ++depth;
+                type = type.get_pointed_object();
+            }
+            return depth;
+        };
+        std::string payload = "\"success\":";
+        append_json_bool(payload, !comparison.inferred_type.empty());
+        payload += ",\"original_type\":";
+        append_json_string(payload, render_type_decl(comparison.original_type));
+        payload += ",\"inferred_type\":";
+        append_json_string(payload, render_type_decl(comparison.inferred_type));
+        payload += ",\"original_pointer_depth\":" +
+            std::to_string(pointer_depth(comparison.original_type));
+        payload += ",\"inferred_pointer_depth\":" +
+            std::to_string(pointer_depth(comparison.inferred_type));
+        payload += ",\"inferred_pointee_size\":" + std::to_string(
+            comparison.inferred_type.is_ptr()
+                ? comparison.inferred_type.get_pointed_object().get_size() : BADSIZE);
+        payload += ",\"preserves_original\":";
+        append_json_bool(payload,
+            comparison.inferred_type.equals_to(comparison.original_type));
+        payload += ",\"confidence\":";
+        append_json_string(payload, type_confidence_str(comparison.confidence));
+        payload += ",\"pattern\":";
+        append_access_pattern_json(payload, pattern);
+        if (parts.size() == 4) {
+            // Optional diagnostic evidence for alias/data-flow witnesses.
+            // Record actual ctree identities and parents; pseudocode alone
+            // does not show whether Hex-Rays split two source-level locals.
+            struct TreeEvidenceVisitor final : ctree_visitor_t {
+                cfunc_t* owner;
+                std::string nodes;
+                std::unordered_map<const citem_t*, size_t> ids;
+                bool truncated = false;
+
+                explicit TreeEvidenceVisitor(cfunc_t* function)
+                    : ctree_visitor_t(CV_PARENTS), owner(function) {}
+
+                int record(citem_t* item, cexpr_t* expression) {
+                    if (ids.size() >= 4096) {
+                        truncated = true;
+                        return 1;
+                    }
+                    const size_t id = ids.size();
+                    ids.emplace(item, id);
+                    if (!nodes.empty()) nodes += ',';
+                    nodes += "{\"id\":" + std::to_string(id);
+                    nodes += ",\"parent\":";
+                    const auto parent = ids.find(parent_item());
+                    nodes += parent == ids.end() ? "null" : std::to_string(parent->second);
+                    nodes += ",\"opcode\":" + std::to_string(item->op);
+                    nodes += ",\"expression\":";
+                    append_json_bool(nodes, expression != nullptr);
+                    if (expression != nullptr) {
+                        nodes += ",\"operation\":";
+                        append_json_string(nodes, utils::cot_name(expression->op));
+                        nodes += ",\"text\":";
+                        append_json_string(nodes, utils::expr_to_string(expression, owner));
+                        nodes += ",\"type\":";
+                        append_json_string(nodes, render_type_decl(expression->type));
+                        if (expression->op == cot_var) {
+                            nodes += ",\"var_idx\":" + std::to_string(expression->v.idx);
+                        }
+                        if (expression->op == cot_call && expression->a) {
+                            nodes += ",\"arguments\":[";
+                            bool first = true;
+                            for (const auto& argument : *expression->a) {
+                                if (!first) nodes += ',';
+                                first = false;
+                                nodes += "{\"text\":";
+                                append_json_string(nodes, utils::expr_to_string(&argument, owner));
+                                nodes += ",\"type\":";
+                                append_json_string(nodes, render_type_decl(argument.type));
+                                nodes += ",\"formal_type\":";
+                                append_json_string(nodes, render_type_decl(argument.formal_type));
+                                nodes += '}';
+                            }
+                            nodes += ']';
+                        }
+                    }
+                    nodes += '}';
+                    return 0;
+                }
+                int idaapi visit_expr(cexpr_t* expression) override {
+                    return record(expression, expression);
+                }
+                int idaapi visit_insn(cinsn_t* instruction) override {
+                    return record(instruction, nullptr);
+                }
+            } tree(cfunc);
+            tree.apply_to(&cfunc->body, nullptr);
+            payload += ",\"ctree\":[" + tree.nodes + ']';
+            payload += ",\"ctree_truncated\":";
+            append_json_bool(payload, tree.truncated);
+        }
+        export_api_json(command.c_str(), payload);
+        return !comparison.inferred_type.empty();
+    }
+
     if (command == "fault_global_tinfo_rollback") {
         qstring global_name;
         ea_t global_ea = BADADDR;

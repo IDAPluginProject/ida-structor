@@ -115,6 +115,11 @@ TypeApplicationResult TypeApplicator::apply(
     }
     
     result.func_ea = cfunc->entry_ea;
+    if (result.func_ea == BADADDR ||
+        inference_result.func_ea != result.func_ea) {
+        result.error_message = "type inference result belongs to a different or unknown function";
+        return result;
+    }
     
     lvars_t* lvars = cfunc->get_lvars();
     if (!lvars) {
@@ -388,7 +393,12 @@ bool TypeApplicator::apply_signature(
     cfunc_t* cfunc,
     const FunctionTypeInferenceResult& inference_result)
 {
-    if (!cfunc) return false;
+    last_signature_rollback_failed_ = false;
+    if (!cfunc || cfunc->entry_ea == BADADDR ||
+        !inference_result.success ||
+        inference_result.func_ea != cfunc->entry_ea) {
+        return false;
+    }
     
     // Build new function type
     tinfo_t func_type;

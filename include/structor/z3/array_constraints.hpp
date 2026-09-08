@@ -3,12 +3,32 @@
 #include <z3++.h>
 #include <optional>
 #include <limits>
+#ifdef STRUCTOR_TESTING
+#include "mock_ida.hpp"
+#endif
 #include "structor/synth_types.hpp"
 #include "structor/z3/context.hpp"
 #include "structor/z3/type_encoding.hpp"
 #include "structor/optimized_algorithms.hpp"
 
 namespace structor::z3 {
+
+/// Owned identity of an observation supporting an array view. Keeping the
+/// original type (including promoted expression types) allows the candidate
+/// generator to recover its source indices without borrowing input pointers.
+struct ArrayAccessEvidence {
+    sval_t offset = 0;
+    uint32_t size = 0;
+    tinfo_t observed_type;
+    SemanticType semantic = SemanticType::Unknown;
+
+    [[nodiscard]] bool matches(const FieldAccess& access) const {
+        return offset == access.offset && size == access.size &&
+            semantic == access.semantic_type &&
+            (observed_type.empty() ? access.inferred_type.empty()
+                                  : observed_type.equals_to(access.inferred_type));
+    }
+};
 
 /// Represents a detected array pattern
 struct ArrayCandidate {
@@ -17,6 +37,7 @@ struct ArrayCandidate {
     uint32_t element_count;       // Number of elements
     tinfo_t element_type;         // Type of each element
     qvector<sval_t> member_offsets;  // Original offsets covered by this array
+    qvector<ArrayAccessEvidence> member_evidence;  // Sorted by byte offset
 
     // For stride > access_size cases: synthetic element struct
     bool needs_element_struct = false;
@@ -61,6 +82,18 @@ struct ArrayCandidate {
     [[nodiscard]] bool contains_offset(sval_t offset) const noexcept {
         const auto end = checked_end_offset();
         return end.has_value() && offset >= base_offset && offset < *end;
+    }
+
+    /// Match only observations belonging to this typed view, not other types
+    /// observed at the same address. O(log A+V) for A keys and V views at the
+    /// queried offset. The keys remain valid after the input vector is gone.
+    [[nodiscard]] bool has_member_evidence(const FieldAccess& access) const {
+        auto it = std::lower_bound(member_evidence.begin(), member_evidence.end(), access.offset,
+            [](const auto& evidence, sval_t offset) { return evidence.offset < offset; });
+        for (; it != member_evidence.end() && it->offset == access.offset; ++it) {
+            if (it->matches(access)) return true;
+        }
+        return false;
     }
 
     /// Get the element index for an offset
@@ -189,11 +222,26 @@ private:
         const qvector<const FieldAccess*>& accesses
     );
 
+    /// Interpret concrete type evidence at the observed storage width. An
+    /// empty result denotes an observation without type or semantic evidence.
+    [[nodiscard]] tinfo_t normalized_element_type(const FieldAccess& access);
+
+    /// Recover exact-stride runs for each distinct C storage type. Unknown
+    /// observations are a separate class, so they cannot bridge conflicting
+    /// typed runs. O(A*T + A log A) time and O(A+T) space for A observations
+    /// and T distinct normalized types; type comparisons are SDK operations.
+    [[nodiscard]] qvector<ArrayCandidate> detect_contiguous_typed_runs(
+        const qvector<const FieldAccess*>& accesses,
+        uint32_t stride);
+
     /// Merge compatible array candidates (overlapping ranges)
     void merge_overlapping_arrays(qvector<ArrayCandidate>& candidates);
 
-    /// Create array candidate from detected parameters
-    [[nodiscard]] ArrayCandidate create_candidate(
+    /// Create a bounded C array covering each complete observation. Reject
+    /// overlapping elements, insufficient distinct observations, and invalid
+    /// type/extent representations. O(A log A) time and O(A) space for A
+    /// accesses, including deterministic ordering of owned evidence.
+    [[nodiscard]] std::optional<ArrayCandidate> create_candidate(
         sval_t base,
         uint32_t stride,
         uint32_t count,

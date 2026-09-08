@@ -4,6 +4,8 @@
 #include "config.hpp"
 #include "type_propagator.hpp"
 #include "access_collector.hpp"
+#include "access_type_inference.hpp"
+#include "function_variable_key.hpp"
 #include "layout_synthesizer.hpp"
 #include "structure_persistence.hpp"
 
@@ -1714,72 +1716,7 @@ inline tinfo_t TypeFixer::infer_variable_type_direct(cfunc_t* cfunc, int var_idx
     AccessCollector collector(opts);
     AccessPattern pattern = collector.collect(cfunc, var_idx);
     
-    if (pattern.accesses.empty()) {
-        return result;
-    }
-    
-    // Analyze access patterns to determine type
-    bool has_pointer_access = false;
-    bool has_struct_access = false;
-    bool has_vtable_access = false;
-    
-    tinfo_t best_type;
-    int best_priority = 0;
-    
-    for (const auto& access : pattern.accesses) {
-        // Check for vtable pattern
-        if (access.is_vtable_access) {
-            has_vtable_access = true;
-        }
-        
-        // Check for function pointer access
-        // Check for pointer dereferences (indicates this is a pointer)
-        if (access.offset >= 0) {
-            has_pointer_access = true;
-        }
-        
-        // Use access inferred type if available
-        if (!access.inferred_type.empty()) {
-            int priority = type_priority_score(access.inferred_type);
-            if (priority > best_priority) {
-                best_priority = priority;
-                best_type = access.inferred_type;
-            }
-        }
-    }
-    
-    // Determine confidence based on access count and patterns
-    if (pattern.accesses.size() >= 5) {
-        out_confidence = TypeConfidence::High;
-    } else if (pattern.accesses.size() >= 2) {
-        out_confidence = TypeConfidence::Medium;
-    } else {
-        out_confidence = TypeConfidence::Low;
-    }
-    
-    // If we have multiple field accesses, this is likely a structure pointer
-    if (has_pointer_access && pattern.accesses.size() >= 2) {
-        has_struct_access = true;
-        out_confidence = TypeConfidence::High;
-    }
-    
-    // Return inferred type
-    if (has_struct_access || has_vtable_access) {
-        // Return void* as a placeholder - actual struct will be synthesized
-        tinfo_t void_type;
-        void_type.create_simple_type(BTF_VOID);
-        result.create_ptr(void_type);
-        out_confidence = TypeConfidence::High;
-    } else if (!best_type.empty()) {
-        result = best_type;
-    } else if (has_pointer_access) {
-        // Generic pointer
-        tinfo_t void_type;
-        void_type.create_simple_type(BTF_VOID);
-        result.create_ptr(void_type);
-    }
-    
-    return result;
+    return detail::infer_base_type_from_accesses(pattern, out_confidence);
 }
 
 inline tinfo_t TypeFixer::infer_overlapped_variable_type(cfunc_t* cfunc, int var_idx, TypeConfidence& out_confidence) {
@@ -1922,7 +1859,8 @@ inline qvector<qstring> TypeFixer::collect_missing_argument_warnings(cfunc_t* cf
     };
 
     std::unordered_map<ea_t, cfuncptr_t> cfunc_cache;
-    std::unordered_map<uint64_t, std::pair<tinfo_t, TypeConfidence>> type_cache;
+    std::unordered_map<detail::FunctionVariableKey,
+        std::pair<tinfo_t, TypeConfidence>, detail::FunctionVariableKeyHash> type_cache;
 
     auto get_cached_cfunc = [&cfunc_cache](ea_t func_ea) -> cfuncptr_t {
         auto it = cfunc_cache.find(func_ea);
@@ -1941,8 +1879,9 @@ inline qvector<qstring> TypeFixer::collect_missing_argument_warnings(cfunc_t* cf
             return std::make_pair(tinfo_t(), confidence);
         }
 
-        uint64_t key = (static_cast<uint64_t>(owner->entry_ea) << 32)
-                     | static_cast<uint32_t>(owner_var_idx);
+        // Preserve the full function address: packing it into the upper
+        // 32 bits aliases functions whose addresses differ by 2^32 bytes.
+        const detail::FunctionVariableKey key{owner->entry_ea, owner_var_idx};
         auto it = type_cache.find(key);
         if (it != type_cache.end()) {
             return it->second;

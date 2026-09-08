@@ -78,7 +78,9 @@ install:
 	@cmake --install $(BUILD_DIR) --config $(BUILD_TYPE) --component Runtime \
 		--prefix "$(CURDIR)/$(INSTALL_STAGE_DIR)"
 	@for marker in STRUCTOR_INTEGRATION_TESTING \
-		STRUCTOR_TEST_PERSISTENCE_FAULT fault_global_tinfo_rollback; do \
+		STRUCTOR_TEST_PERSISTENCE_FAULT fault_global_tinfo_rollback \
+		inspect_base_inference inspect_existing_type_matcher \
+		inspect_array_layout inspect_type_application_identity; do \
 		if strings "$(INSTALL_STAGE_DIR)/plugins/structor$(PLUGIN_EXT)" | \
 			grep -F -- "$$marker" >/dev/null; then \
 			echo "Production plugin contains live-test marker: $$marker"; \

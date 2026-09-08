@@ -1370,14 +1370,17 @@ void FieldCandidateGenerator::generate_array_candidates(
         return;
     }
 
-    std::unordered_map<uint64_t, int> direct_index;
+    std::unordered_map<int, qvector<int>> direct_candidates_by_access;
     for (size_t i = 0; i < candidates.size(); ++i) {
+        // Observed union alternatives retain their evidence classification
+        // and its non-union preference exemption. Array substitution and
+        // preferences already identify them through complete source evidence.
         if (candidates[i].kind != FieldCandidate::Kind::DirectAccess) {
             continue;
         }
-        uint64_t key = (static_cast<uint64_t>(candidates[i].offset) << 32) |
-                       static_cast<uint64_t>(candidates[i].size);
-        direct_index[key] = static_cast<int>(i);
+        for (const int access_index : candidates[i].source_access_indices) {
+            direct_candidates_by_access[access_index].push_back(static_cast<int>(i));
+        }
     }
 
         for (const auto& detected_array : arrays) {
@@ -1514,23 +1517,34 @@ void FieldCandidateGenerator::generate_array_candidates(
             if (member_offsets.count(access.offset) == 0) {
                 continue;
             }
-            if (access.size == access_size) {
+            if (access.size == access_size &&
+                (array.needs_element_struct || array.has_member_evidence(access))) {
                 array_candidate.source_access_indices.push_back(static_cast<int>(i));
-            }
-        }
-
-        for (sval_t off : array.member_offsets) {
-            uint64_t key = (static_cast<uint64_t>(off) << 32) |
-                           static_cast<uint64_t>(access_size);
-            auto it = direct_index.find(key);
-            if (it != direct_index.end()) {
-                candidates[it->second].kind = FieldCandidate::Kind::ArrayElement;
             }
         }
 
         if (!array.needs_element_struct &&
             has_mixed_scalar_array_semantics(pattern, array_candidate.source_access_indices)) {
             continue;
+        }
+
+        // A typed array can replace only scalar candidates whose complete
+        // evidence belongs to that view. An offset/size lookup alone selects
+        // an arbitrary conflicting alternative at shared storage addresses.
+        std::unordered_set<int> matched_direct_candidates;
+        for (const int access_index : array_candidate.source_access_indices) {
+            const auto it = direct_candidates_by_access.find(access_index);
+            if (it == direct_candidates_by_access.end()) continue;
+            matched_direct_candidates.insert(it->second.begin(), it->second.end());
+        }
+        for (const int index : matched_direct_candidates) {
+            auto& direct = candidates[index];
+            if (array_candidate.replaces_scalar_evidence(direct) ||
+                (array.needs_element_struct &&
+                 direct.kind == FieldCandidate::Kind::DirectAccess &&
+                 array_candidate.covers_source_evidence(direct))) {
+                direct.kind = FieldCandidate::Kind::ArrayElement;
+            }
         }
 
         candidates.push_back(std::move(array_candidate));

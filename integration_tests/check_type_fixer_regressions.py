@@ -11,6 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from check_cpp_api_surface import run_api_command
+
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 COMMAND_TIMEOUT_SECONDS = 300
@@ -262,6 +264,101 @@ def run_overlap_regression(repo_root: Path, plugin_path: Path, idump_path: str) 
         raise RuntimeError("unexpected missing-argument warning for overlap_scope")
 
 
+def run_base_inference_regression(
+    repo_root: Path, plugin_path: Path, idump_path: str
+) -> None:
+    proc = run(
+        ["sh", str(repo_root / "integration_tests" / "build_fixtures.sh"),
+         "test_typefix_base"],
+        cwd=repo_root,
+    )
+    require_success(proc, "building test_typefix_base")
+
+    for function, expected_pointee_size in [
+        ("typefix_scalar", 4),
+        ("typefix_repeated", 4),
+        ("typefix_pointer", 8),
+        ("typefix_loaded_call", 8),
+    ]:
+        data = run_api_command(
+            repo_root, plugin_path, idump_path,
+            binary="test_typefix_base", functions=[function],
+            command=f"inspect_base_inference|{function}|0",
+        )
+        if not data.get("success") or data.get("inferred_pointer_depth", 0) < 1:
+            raise RuntimeError(f"{function}: base was not inferred as a pointer: {data}")
+        if data.get("inferred_pointee_size") != expected_pointee_size:
+            raise RuntimeError(f"{function}: incorrect pointee width: {data}")
+
+    for function in ("typefix_callback", "typefix_loaded_known_pointer_call"):
+        data = run_api_command(
+            repo_root, plugin_path, idump_path,
+            binary="test_typefix_base", functions=[function],
+            command=f"inspect_base_inference|{function}|0|ctree",
+        )
+        if not data.get("success") or data.get("inferred_pointer_depth") != 2:
+            raise RuntimeError(f"{function}: loaded pointer lost an indirection: {data}")
+        if function == "typefix_loaded_known_pointer_call":
+            arguments = [
+                argument
+                for node in data.get("ctree", [])
+                if node.get("operation") == "cot_call"
+                for argument in node.get("arguments", [])
+            ]
+            if data.get("ctree_truncated") or not any(
+                argument.get("formal_type", "").rstrip().endswith("*") or
+                argument.get("type", "").rstrip().endswith("*")
+                for argument in arguments
+            ):
+                raise RuntimeError(f"{function}: missing actual pointer call evidence: {data}")
+
+    # This local callee has not yet been decompiled. Its observed prototype
+    # contains only _QWORD, so source-level pointer knowledge is unavailable.
+    # Preserve the observed base; bounded callee-body inference is separate.
+    function = "typefix_loaded_pointer_call"
+    data = run_api_command(
+        repo_root, plugin_path, idump_path,
+        binary="test_typefix_base", functions=[function],
+        command=f"inspect_base_inference|{function}|0|ctree",
+    )
+    arguments = [
+        argument
+        for node in data.get("ctree", [])
+        if node.get("operation") == "cot_call"
+        for argument in node.get("arguments", [])
+    ]
+    if data.get("ctree_truncated") or not arguments or any(
+        argument.get("formal_type", "").rstrip().endswith("*") or
+        argument.get("type", "").rstrip().endswith("*")
+        for argument in arguments
+    ):
+        raise RuntimeError(f"{function}: unknown-prototype fixture acquired pointer evidence: {data}")
+    if (not data.get("success") or not data.get("preserves_original") or
+            data.get("original_pointer_depth") != 1 or
+            data.get("inferred_pointer_depth") != 1):
+        raise RuntimeError(f"{function}: incomplete call evidence changed the base type: {data}")
+
+    for function in ("typefix_alias_call", "typefix_alias_compare"):
+        data = run_api_command(
+            repo_root, plugin_path, idump_path,
+            binary="test_typefix_base", functions=[function],
+            command=f"inspect_base_inference|{function}|0",
+        )
+        if data.get("pattern", {}).get("access_count") != 0:
+            raise RuntimeError(f"{function}: address-only alias became a field access: {data}")
+
+    for function in ("typefix_displaced", "typefix_negative"):
+        data = run_api_command(
+            repo_root, plugin_path, idump_path,
+            binary="test_typefix_base", functions=[function],
+            command=f"inspect_base_inference|{function}|0",
+        )
+        if not data.get("success") or data.get("inferred_pointer_depth", 0) < 1:
+            raise RuntimeError(f"{function}: displaced access lost pointer evidence: {data}")
+        if data.get("original_pointer_depth", 0) > 0 and not data.get("preserves_original"):
+            raise RuntimeError(f"{function}: partial evidence overwrote the base type: {data}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run live type-fixer regressions with idump"
@@ -287,6 +384,11 @@ def main() -> int:
     log(hr())
     log("Regression: overlap recovery")
     run_overlap_regression(repo_root, plugin_path, args.idump)
+    log("Status: PASS")
+
+    log(hr())
+    log("Regression: field-load versus base-pointer type inference")
+    run_base_inference_regression(repo_root, plugin_path, args.idump)
     log("Status: PASS")
 
     elapsed = time.monotonic() - start

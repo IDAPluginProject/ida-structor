@@ -2,6 +2,7 @@
 /// @brief Structure layout synthesis implementation
 
 #include <structor/layout_synthesizer.hpp>
+#include <structor/field_fragment_type.hpp>
 #include <structor/naming.hpp>
 
 #include <limits>
@@ -1434,7 +1435,8 @@ LayoutSynthesizer::synthesize_z3(const UnifiedAccessPattern &pattern) {
             // Handle relaxed constraints
             if (z3_result.has_dropped_constraints()) {
                 result.had_relaxation = true;
-                result.dropped_constraints = z3_result.dropped_constraints;
+                result.dropped_constraints =
+                    z3::copy_constraint_diagnostics(z3_result.dropped_constraints);
                 detail::synth_log(
                         "[Structor] Z3 synthesis completed with %zu relaxed constraints\n",
                         z3_result.dropped_constraints.size());
@@ -1477,7 +1479,7 @@ LayoutSynthesizer::synthesize_z3(const UnifiedAccessPattern &pattern) {
                 return try_relaxed_solve(builder, z3_result, result);
             }
 
-            result.unsat_core = z3_result.unsat_core;
+            result.unsat_core = z3::copy_constraint_diagnostics(z3_result.unsat_core);
             result.fallback_reason = "Z3 UNSAT: ";
             if (!z3_result.unsat_core.empty()) {
                 result.fallback_reason.append(
@@ -1577,11 +1579,12 @@ LayoutSynthesizer::try_relaxed_solve(z3::LayoutConstraintBuilder &builder,
         dropped_info.sprnt("Relaxed %zu constraints but still UNSAT",
                                              initial_result.dropped_constraints.size());
         result.fallback_reason = dropped_info;
-        result.dropped_constraints = initial_result.dropped_constraints;
+        result.dropped_constraints =
+            z3::copy_constraint_diagnostics(initial_result.dropped_constraints);
     }
 
     // Record the UNSAT core for diagnostics
-    result.unsat_core = initial_result.unsat_core;
+    result.unsat_core = z3::copy_constraint_diagnostics(initial_result.unsat_core);
 
     // If use_raw_bytes_fallback is enabled, we could try creating raw byte fields
     // for the problematic regions identified in the UNSAT core
@@ -2963,6 +2966,7 @@ void LayoutSynthesizer::detect_subobjects(const UnifiedAccessPattern &pattern,
                                 replacement.source_accesses = group_accesses;
                                 replacement.type = select_best_type(group_accesses);
                                 replacement.semantic = select_best_semantic(group_accesses);
+                                (void)detail::retain_array_fragment_type(field, replacement);
                                 replacement.confidence = TypeConfidence::Medium;
                                 replacement_fields.push_back(std::move(replacement));
                             }

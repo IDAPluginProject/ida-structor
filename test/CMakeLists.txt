@@ -32,12 +32,16 @@ endfunction()
 set(TEST_SOURCES
     test_synth_types.cpp
     test_access_patterns.cpp
+    test_access_type_inference.cpp
+    test_field_fragment_type.cpp
     test_optimized_algorithms.cpp
     test_persistence_invariants.cpp
     test_lifecycle_and_registry.cpp
     test_vtable_detection.cpp
     test_config.cpp
+    test_type_matcher.cpp
     ${PROJECT_SOURCE_DIR}/src/synthesis/naming.cpp
+    ${PROJECT_SOURCE_DIR}/src/synthesis/type_matcher.cpp
     mock_ida.cpp
 )
 
@@ -153,6 +157,14 @@ target_sources(test_z3_context PRIVATE
 target_include_directories(test_z3_context PRIVATE ${PROJECT_SOURCE_DIR}/test)
 add_test(NAME z3_context COMMAND test_z3_context)
 
+# Production UNSAT metadata must remain safe after the owning context expires.
+add_z3_test(test_constraint_diagnostics test_constraint_diagnostics.cpp)
+target_sources(test_constraint_diagnostics PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/z3/constraint_tracker.cpp
+)
+target_include_directories(test_constraint_diagnostics PRIVATE ${PROJECT_SOURCE_DIR}/test)
+add_test(NAME z3_constraint_diagnostics COMMAND test_constraint_diagnostics)
+
 # Z3 Type Encoding Tests
 add_z3_test(test_z3_type_encoding test_type_encoding.cpp)
 add_test(NAME z3_type_encoding COMMAND test_z3_type_encoding)
@@ -160,6 +172,16 @@ add_test(NAME z3_type_encoding COMMAND test_z3_type_encoding)
 # Z3 Array Detection Tests
 add_z3_test(test_z3_array_detection test_array_detection.cpp)
 add_test(NAME z3_array_detection COMMAND test_z3_array_detection)
+
+# Exercise the production detector, with only IDA's type-system boundary mocked.
+add_z3_test(test_production_array_detection test_production_array_detection.cpp)
+target_sources(test_production_array_detection PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/z3/array_constraints.cpp
+    ${PROJECT_SOURCE_DIR}/src/z3/context.cpp
+    ${PROJECT_SOURCE_DIR}/src/z3/type_encoding.cpp
+)
+target_include_directories(test_production_array_detection PRIVATE ${PROJECT_SOURCE_DIR}/test)
+add_test(NAME z3_production_array_detection COMMAND test_production_array_detection)
 
 # Z3 Layout Constraints Tests
 add_z3_test(test_z3_layout_constraints test_layout_constraints.cpp)
@@ -210,8 +232,10 @@ add_custom_target(check
             structor_embed_consumer_smoke
             ${STRUCTOR_LIVE_TEST_DEPS}
             test_z3_context
+            test_constraint_diagnostics
             test_z3_type_encoding
             test_z3_array_detection
+            test_production_array_detection
             test_z3_layout_constraints
             test_z3_union_constraints
             test_z3_resource_helpers
@@ -226,8 +250,10 @@ add_custom_target(check
 add_custom_target(check_z3
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --no-tests=error -R "^z3_|^e2e_|^type_"
     DEPENDS test_z3_context
+            test_constraint_diagnostics
             test_z3_type_encoding
             test_z3_array_detection
+            test_production_array_detection
             test_z3_layout_constraints
             test_z3_union_constraints
             test_z3_resource_helpers

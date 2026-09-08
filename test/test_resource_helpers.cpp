@@ -95,6 +95,52 @@ void test_array_detection_controls_are_mapped_without_default_fallback() {
     assert(config.max_stride == 96);
 }
 
+void test_array_substitutes_preserve_complete_typed_evidence() {
+    FieldCandidate integer_array;
+    integer_array.kind = FieldCandidate::Kind::ArrayField;
+    integer_array.type_category = structor::z3::TypeCategory::Int32;
+    integer_array.offset = 0;
+    integer_array.size = 12;
+    integer_array.array_stride = 4;
+    integer_array.array_element_count = 3;
+    integer_array.source_access_indices = {0, 1, 2};
+    FieldCandidate float_array = integer_array;
+    float_array.type_category = structor::z3::TypeCategory::Float32;
+    float_array.source_access_indices = {3, 4, 5};
+
+    FieldCandidate scalar;
+    scalar.kind = FieldCandidate::Kind::UnionAlternative;
+    scalar.offset = 4;
+    scalar.size = 4;
+    scalar.source_access_indices = {1};
+    assert(integer_array.replaces_scalar_evidence(scalar));
+    assert(!float_array.replaces_scalar_evidence(scalar));
+    scalar.source_access_indices = {4};
+    assert(!integer_array.replaces_scalar_evidence(scalar));
+    assert(float_array.replaces_scalar_evidence(scalar));
+
+    scalar.source_access_indices = {1, 4};
+    assert(!integer_array.replaces_scalar_evidence(scalar));
+    assert(!float_array.replaces_scalar_evidence(scalar));
+    scalar.source_access_indices.clear();
+    assert(!integer_array.replaces_scalar_evidence(scalar));
+    scalar.source_access_indices = {-1};
+    assert(!integer_array.replaces_scalar_evidence(scalar));
+    scalar.source_access_indices = {1};
+    scalar.offset = 12;
+    assert(!integer_array.replaces_scalar_evidence(scalar));
+
+    scalar.offset = 4;
+    for (const auto aggregate_category : {
+             structor::z3::TypeCategory::RawBytes,
+             structor::z3::TypeCategory::Struct,
+             structor::z3::TypeCategory::Union}) {
+        auto aggregate = integer_array;
+        aggregate.type_category = aggregate_category;
+        assert(!aggregate.replaces_scalar_evidence(scalar));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -103,6 +149,7 @@ int main() {
     test_optional_array_cap_preserves_scalar_eligibility();
     test_optional_confidence_threshold_has_explicit_percent_semantics();
     test_array_detection_controls_are_mapped_without_default_fallback();
+    test_array_substitutes_preserve_complete_typed_evidence();
     std::cout << "[PASS] production resource helper tests\n";
     return 0;
 }

@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "utils.hpp"
 #include <unordered_map>
+#include <unordered_set>
 
 namespace structor {
 
@@ -12,12 +13,10 @@ struct BitfieldInfo;
 /// Visitor that collects all access patterns for a specific variable
 class AccessPatternVisitor : public ctree_visitor_t {
 public:
-    AccessPatternVisitor(cfunc_t* cfunc, int target_var_idx)
-        : ctree_visitor_t(CV_PARENTS)
-        , cfunc_(cfunc)
-        , target_var_idx_(target_var_idx) {}
+    AccessPatternVisitor(cfunc_t* cfunc, int target_var_idx);
 
     int idaapi visit_expr(cexpr_t* expr) override;
+    int idaapi visit_insn(cinsn_t* insn) override;
 
     [[nodiscard]] const qvector<FieldAccess>& accesses() const noexcept {
         return accesses_;
@@ -28,17 +27,32 @@ public:
     }
 
 private:
-    struct PendingSymbolicAccess {
-        ea_t insn_ea = BADADDR;
-        sval_t base_offset = 0;
-        std::uint32_t stride = 0;
-        std::uint32_t size = 0;
-        AccessType access_type = AccessType::Unknown;
-        SemanticType semantic_type = SemanticType::Unknown;
-        tinfo_t inferred_type;
-        qstring context_expr;
-        bool is_call_argument = false;
-        std::optional<std::uint8_t> base_indirection;
+    struct IndexRange {
+        sval_t first = std::numeric_limits<sval_t>::min();
+        sval_t last = std::numeric_limits<sval_t>::max();
+        bool first_known = false;
+        bool last_known = false;
+
+        [[nodiscard]] IndexRange intersect(const IndexRange& other) const {
+            return {std::max(first, other.first), std::min(last, other.last),
+                    first_known || other.first_known, last_known || other.last_known};
+        }
+        [[nodiscard]] IndexRange unite(const IndexRange& other) const {
+            return {std::min(first, other.first), std::max(last, other.last),
+                    first_known && other.first_known, last_known && other.last_known};
+        }
+    };
+
+    struct LoopIndexEffects {
+        std::unordered_set<int> written_or_referenced_vars;
+        bool has_call = false;
+    };
+
+    struct IndexComparison {
+        int var_idx = -1;
+        std::size_t version = 0;
+        IndexRange when_true;
+        IndexRange when_false;
     };
 
     void process_dereference(cexpr_t* expr, const cexpr_t* ptr_expr);
@@ -49,7 +63,11 @@ private:
     void process_assignment(cexpr_t* expr);
     void process_constant_comparison(cexpr_t* expr);
     void process_index_bound(cexpr_t* expr);
-    void flush_pending_symbolic_accesses(int index_var, std::uint32_t bound);
+    [[nodiscard]] IndexRange condition_index_range(
+        const cexpr_t* condition, int var_idx, bool truth, int depth = 0) const;
+    [[nodiscard]] std::optional<IndexRange> bounded_index_range(
+        const cexpr_t* access_expr, int var_idx) const;
+    [[nodiscard]] bool loop_may_change_index(const cinsn_t* loop, int var_idx) const;
     void invalidate_local_var_state(int var_idx, bool clear_pending_constants);
 
     void record_bitfield_access(const cexpr_t* expr, sval_t offset, uint32_t size,
@@ -72,11 +90,19 @@ private:
 
     cfunc_t* cfunc_;
     int target_var_idx_;
+    bool has_unstructured_control_flow_;
     qvector<FieldAccess> accesses_;
     std::unordered_map<int, FieldAccess> local_aliases_;
+    // Distinguish copies of the base address from values loaded from a field.
+    // Address copies support later dereferences, but are not field reads.
+    std::unordered_set<int> address_aliases_;
     std::unordered_map<int, qvector<std::uint64_t>> pending_constants_;
-    std::unordered_map<int, std::uint32_t> local_index_bounds_;
-    std::unordered_map<int, qvector<PendingSymbolicAccess>> pending_symbolic_accesses_;
+    // A comparison is usable only on the control-flow edge where it holds and
+    // while the index still has the value tested by that comparison.
+    std::unordered_map<const cexpr_t*, IndexComparison> index_comparisons_;
+    std::unordered_map<int, std::size_t> local_var_versions_;
+    std::unordered_set<int> escaped_local_vars_;
+    mutable std::unordered_map<const cinsn_t*, LoopIndexEffects> loop_index_effects_;
 };
 
 /// Collects all access patterns for a variable in a function

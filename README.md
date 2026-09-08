@@ -23,6 +23,7 @@ The project now also includes a function type-fixing pipeline that runs on decom
 - `docs/Z3_SYNTHESIS_PLAN.md`: historical design plan for the Z3 synthesis path
 - `docs/Z3_TYPE_INFERENCE.md`: research notes for richer Z3-driven type inference
 - `docs/CROSS_FUNCTION_SIBLING_DISCOVERY.md`: focused note on one implemented cross-function analysis improvement
+- `docs/ENGINEERING_STATUS.md`: verification scope, assumptions, and remaining engineering work
 
 ## What Structor Does Today
 
@@ -462,26 +463,31 @@ Release test targets explicitly keep C/C++ assertions enabled. GitHub Actions
 builds and runs this suite for every configured platform and IDA SDK matrix
 entry.
 
-The standalone `z3_*` executables exercise IDA-independent solver models. They
-are useful solver checks, but the production synthesis pipeline is verified by
-production-linked tests and the live contract suite rather than inferred from
-those models alone.
+The suite includes both IDA-independent solver models and production code with
+the IDA boundary mocked. In particular, `z3_production_array_detection` compiles
+the production array detector. The complete synthesis pipeline is verified by
+the live contract suite; model-only tests do not establish production behavior.
 
 ### Convenience targets
 
 With `BUILD_TESTS=ON`, the test CMake project also provides:
 
 - `check` for every test available in the configured environment
-- `check_z3` for the standalone Z3-model subset
+- `check_z3` for the standalone Z3 and production solver-helper subset
 
 ### Live plugin regression tests
 
-On Apple arm64 hosts with `idump` available and a local `ida.reg`, `*.hexlic`,
-or `*.lic` license, CTest also registers the serial
+On Apple arm64 hosts configured with `STRUCTOR_ENABLE_LIVE_TEST_HOOKS=ON`,
+an available `idump`, and a local `ida.reg`, `*.hexlic`, or `*.lic` license,
+CTest also registers the serial
 `full_integrity_suite_live` test. It covers:
 
 - a clean external CMake consumer build
 - the public C++ API surface
+- guard-scoped index collection and integer-expression evaluation
+- existing-type merges using real IDA types
+- sparse and conflicting typed arrays through the production layout solver
+- rejection of foreign-function inference before local or prototype type writes
 - exact normalized result and pseudocode contracts
 - five-run, fresh-database determinism checks for local and global union recovery
 - global-object recovery
@@ -498,11 +504,19 @@ make test TEST_IDUMP=idump
 Or invoke the live suite directly:
 
 ```bash
+cmake -S . -B build -DIDA_SDK_DIR=/path/to/idasdk \
+  -DBUILD_TESTS=ON -DSTRUCTOR_ENABLE_LIVE_TEST_HOOKS=ON
+cmake --build build --parallel
 python3 integration_tests/check_full_integrity_suite.py \
   --repo-root /path/to/structor \
   --plugin /path/to/structor/build/structor.dylib \
   --idump idump
 ```
+
+Use an `idump` build compatible with the active IDA/Hex-Rays runtime. An
+incompatible executable can exit successfully after switching to assembly-only
+output; the fixture runner reports this explicitly. Production installs disable
+live-test hooks and verify that test command markers are absent.
 
 ### Building integration fixtures
 

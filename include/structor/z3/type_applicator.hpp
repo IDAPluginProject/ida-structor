@@ -106,7 +106,8 @@ class TypeApplicator {
 public:
     TypeApplicator(const TypeApplicationConfig& config = {});
     
-    /// Apply inferred types from a FunctionTypeInferenceResult
+    /// Apply successful inference belonging to this exact function address.
+    /// Unknown or foreign function identities are rejected before mutation.
     [[nodiscard]] TypeApplicationResult apply(
         cfunc_t* cfunc,
         const FunctionTypeInferenceResult& inference_result
@@ -142,7 +143,8 @@ public:
         const TypeInferenceConfig& inference_config = {}
     );
     
-    /// Apply inferred function signature (return type + parameters)
+    /// Apply inferred function signature (return type + parameters), requiring
+    /// a successful result belonging to this exact function address.
     [[nodiscard]] bool apply_signature(
         cfunc_t* cfunc,
         const FunctionTypeInferenceResult& inference_result

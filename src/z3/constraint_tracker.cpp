@@ -159,6 +159,18 @@ qvector<ConstraintProvenance> ConstraintTracker::analyze_unsat_core(
     return result;
 }
 
+::z3::expr_vector ConstraintTracker::add_hard_literals_to_optimizer(
+    ::z3::optimize& optimizer) const
+{
+    auto literals = get_hard_literals();
+    for (unsigned i = 0; i < literals.size(); ++i) {
+        // The assertion activates its existing guarded constraint, and the
+        // identical tracking name preserves the original provenance mapping.
+        optimizer.add(literals[i], literals[i]);
+    }
+    return literals;
+}
+
 ::z3::expr_vector ConstraintTracker::get_all_literals() const {
     ::z3::expr_vector result(ctx_);
 
